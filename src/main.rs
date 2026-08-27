@@ -1,4 +1,5 @@
 mod access;
+mod audit;
 mod config;
 mod crypto;
 mod dto;
@@ -7,6 +8,7 @@ mod identity;
 mod policy;
 mod registry_client;
 
+use audit::{AuditEvent, AuditLog};
 use config::Config;
 use heartbeat::HeartbeatClient;
 use policy::PolicyStore;
@@ -31,12 +33,19 @@ async fn main() -> anyhow::Result<()> {
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
     let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
     let policy_store = PolicyStore::new();
+    let audit_log = AuditLog::new(&config.audit_log_path);
 
     let mut interval = tokio::time::interval(config.heartbeat_interval);
     loop {
         interval.tick().await;
-        if let Err(error) =
-            run_heartbeat(&config, &registry_client, &heartbeat_client, &policy_store).await
+        if let Err(error) = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+        )
+        .await
         {
             error!(%error, "heartbeat cycle failed");
         }
@@ -48,6 +57,7 @@ async fn run_heartbeat(
     registry_client: &RegistryClient,
     heartbeat_client: &HeartbeatClient,
     policy_store: &PolicyStore,
+    audit_log: &AuditLog,
 ) -> anyhow::Result<()> {
     let agent_public_key = registry_client
         .get_agent_permitted_key(&config.agent_ip_address)
@@ -66,7 +76,25 @@ async fn run_heartbeat(
 
     // Applying can still reject the package (e.g. an already-expired one) even
     // though the signature verified - don't touch existing local state on that.
-    policy_store.apply(response)?;
+    let apply_result = policy_store.apply(response);
+
+    // Audited either way (TT-1820), and best-effort: a failure to *write* the
+    // audit entry must not itself change or hide the underlying apply outcome.
+    let audit_event = match &apply_result {
+        Ok(()) => AuditEvent::PolicyApplied {
+            connector_id: config.connector_id.clone(),
+            gateway_count: gateways,
+            node_count: nodes,
+        },
+        Err(error) => AuditEvent::PolicyRejected {
+            reason: error.to_string(),
+        },
+    };
+    if let Err(audit_error) = audit_log.record(audit_event) {
+        error!(error = %audit_error, "failed to write policy audit entry");
+    }
+
+    apply_result?;
 
     info!(gateways, nodes, "Applied verified heartbeat package");
     if nodes_without_key > 0 {
@@ -94,8 +122,20 @@ mod tests {
             agent_ip_address: "10.0.0.5".to_string(),
             registry_base_url,
             identity_key_path: "/tmp/unused-in-this-test".into(),
+            audit_log_path: "/tmp/unused-in-this-test-audit.log".into(),
             heartbeat_interval: Duration::from_secs(60),
         }
+    }
+
+    fn read_audit_lines(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.path().join("audit.log"))
+            .map(|contents| {
+                contents
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[tokio::test]
@@ -130,12 +170,24 @@ mod tests {
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
         let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
         let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
 
-        let result =
-            run_heartbeat(&config, &registry_client, &heartbeat_client, &policy_store).await;
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert_eq!(policy_store.current().unwrap().connector_id, "c-1");
+        let entries = read_audit_lines(&dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["event"], "policy_applied");
+        assert_eq!(entries[0]["gateway_count"], 0);
     }
 
     #[tokio::test]
@@ -152,12 +204,22 @@ mod tests {
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
         let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
         let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
 
-        let result =
-            run_heartbeat(&config, &registry_client, &heartbeat_client, &policy_store).await;
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(policy_store.current().is_none());
+        // Failed before ever reaching policy application - nothing to audit yet.
+        assert!(read_audit_lines(&dir).is_empty());
     }
 
     #[tokio::test]
@@ -194,12 +256,22 @@ mod tests {
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
         let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
         let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
 
-        let result =
-            run_heartbeat(&config, &registry_client, &heartbeat_client, &policy_store).await;
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(policy_store.current().is_none());
+        // Signature verification failed before policy application - nothing to audit yet.
+        assert!(read_audit_lines(&dir).is_empty());
     }
 
     #[tokio::test]
@@ -235,12 +307,23 @@ mod tests {
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
         let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
         let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
 
-        let result =
-            run_heartbeat(&config, &registry_client, &heartbeat_client, &policy_store).await;
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(policy_store.current().is_none());
+        let entries = read_audit_lines(&dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["event"], "policy_rejected");
     }
 
     #[tokio::test]
@@ -275,11 +358,19 @@ mod tests {
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
         let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
         let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
 
         // Nodes-without-key is only a warning, not a failure - the cycle still
         // succeeds (there's simply nothing to dial yet for that node).
-        let result =
-            run_heartbeat(&config, &registry_client, &heartbeat_client, &policy_store).await;
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert_eq!(policy_store.current().unwrap().node_list.len(), 1);

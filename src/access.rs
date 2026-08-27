@@ -9,6 +9,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::audit::{AuditEvent, AuditLog};
 use crate::dto::PolicyBundleEndpoint;
 use crate::policy::PolicyStore;
 
@@ -30,6 +31,17 @@ pub enum RefusalReason {
     NotEntitled,
 }
 
+impl RefusalReason {
+    fn as_audit_str(self) -> &'static str {
+        match self {
+            RefusalReason::NoPolicyApplied => "no_policy_applied",
+            RefusalReason::PolicyExpired => "policy_expired",
+            RefusalReason::UnknownGateway => "unknown_gateway",
+            RefusalReason::NotEntitled => "not_entitled",
+        }
+    }
+}
+
 /// Matches on both `user_id` and `device_public_key` - an `Entitlement` row
 /// authorizes a specific user's specific device, not the user account in
 /// general, so a user's device that isn't itself listed must be refused
@@ -42,6 +54,43 @@ pub fn decide_access(
     device_public_key: &str,
 ) -> AccessDecision {
     decide_access_at(store, gateway_id, user_id, device_public_key, Utc::now())
+}
+
+/// Pairs `decide_access` with TT-1820's audit trail - the acceptance
+/// criteria requires an audit entry for every allow/deny decision, not just
+/// the decision itself. Not called from `main` yet, same as `decide_access`:
+/// there's no real traffic path to call it from until the node-tunnel slice
+/// exists, but that slice's only job will be to call this instead of the
+/// plain `decide_access`, so it's built and tested against the real
+/// `AuditLog` now rather than guessed at later.
+#[allow(dead_code)]
+pub fn decide_access_and_audit(
+    store: &PolicyStore,
+    audit_log: &AuditLog,
+    gateway_id: &str,
+    user_id: &str,
+    device_public_key: &str,
+) -> AccessDecision {
+    let decision = decide_access(store, gateway_id, user_id, device_public_key);
+
+    let event = match &decision {
+        AccessDecision::Allowed { .. } => AuditEvent::AccessAllowed {
+            gateway_id: gateway_id.to_string(),
+            user_id: user_id.to_string(),
+        },
+        AccessDecision::Refused(reason) => AuditEvent::AccessRefused {
+            gateway_id: gateway_id.to_string(),
+            user_id: user_id.to_string(),
+            reason: reason.as_audit_str().to_string(),
+        },
+    };
+    // Best-effort: an audit-write failure must not itself block or flip an
+    // access decision that's already been made.
+    if let Err(error) = audit_log.record(event) {
+        tracing::error!(%error, "failed to write access-decision audit entry");
+    }
+
+    decision
 }
 
 fn decide_access_at(
@@ -300,6 +349,120 @@ mod tests {
             decision,
             AccessDecision::Refused(RefusalReason::PolicyExpired)
         );
+    }
+
+    #[test]
+    fn decide_access_and_audit_records_an_allowed_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let store = PolicyStore::new();
+        let entitled = Entitlement {
+            user_id: "u-1".to_string(),
+            device_public_key: "device-key-1".to_string(),
+        };
+        // decide_access_and_audit calls decide_access, which checks against the
+        // real Utc::now() (not an injectable one) - the applied package must
+        // stay valid regardless of when this test actually runs.
+        store
+            .apply(response(
+                "2099-01-01T00:00:00Z",
+                vec![bundle("gw-1", vec![entitled])],
+            ))
+            .unwrap();
+
+        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "u-1", "device-key-1");
+
+        assert!(matches!(decision, AccessDecision::Allowed { .. }));
+        let entry: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(dir.path().join("audit.log"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entry["event"], "access_allowed");
+        assert_eq!(entry["gateway_id"], "gw-1");
+        assert_eq!(entry["user_id"], "u-1");
+    }
+
+    #[test]
+    fn decide_access_and_audit_records_not_entitled_and_unknown_gateway_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let store = PolicyStore::new();
+        let entitled = Entitlement {
+            user_id: "u-1".to_string(),
+            device_public_key: "device-key-1".to_string(),
+        };
+        store
+            .apply(response(
+                "2099-01-01T00:00:00Z",
+                vec![bundle("gw-1", vec![entitled])],
+            ))
+            .unwrap();
+
+        let not_entitled =
+            decide_access_and_audit(&store, &audit_log, "gw-1", "u-ghost", "device-key-1");
+        let unknown_gateway =
+            decide_access_and_audit(&store, &audit_log, "gw-UNKNOWN", "u-1", "device-key-1");
+
+        assert_eq!(
+            not_entitled,
+            AccessDecision::Refused(RefusalReason::NotEntitled)
+        );
+        assert_eq!(
+            unknown_gateway,
+            AccessDecision::Refused(RefusalReason::UnknownGateway)
+        );
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries[0]["reason"], "not_entitled");
+        assert_eq!(entries[1]["reason"], "unknown_gateway");
+    }
+
+    #[test]
+    fn decide_access_and_audit_still_returns_the_decision_when_the_audit_write_fails() {
+        // Audit logging is best-effort (see the comment on decide_access_and_audit) -
+        // a write failure must not swallow or change the actual access decision.
+        let audit_log = AuditLog::new("/this/path/does/not/exist/and/cannot/be/created/audit.log");
+        let store = PolicyStore::new();
+
+        let decision =
+            decide_access_and_audit(&store, &audit_log, "gw-1", "u-ghost", "device-key-1");
+
+        assert_eq!(
+            decision,
+            AccessDecision::Refused(RefusalReason::NoPolicyApplied)
+        );
+    }
+
+    #[test]
+    fn decide_access_and_audit_records_a_refused_decision_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let store = PolicyStore::new();
+
+        let decision =
+            decide_access_and_audit(&store, &audit_log, "gw-1", "u-ghost", "device-key-1");
+
+        assert_eq!(
+            decision,
+            AccessDecision::Refused(RefusalReason::NoPolicyApplied)
+        );
+        let entry: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(dir.path().join("audit.log"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entry["event"], "access_refused");
+        assert_eq!(entry["reason"], "no_policy_applied");
     }
 
     #[test]

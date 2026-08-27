@@ -17,6 +17,7 @@ pub struct Config {
     pub agent_ip_address: String,
     pub registry_base_url: String,
     pub identity_key_path: PathBuf,
+    pub audit_log_path: PathBuf,
     /// Konyk's answer (TT-1732 comment thread): 60s default, must stay configurable
     /// and below Agent's 5-minute signature validity window.
     pub heartbeat_interval: Duration,
@@ -32,6 +33,10 @@ impl Config {
             identity_key_path: PathBuf::from(
                 env::var("CONNECTOR_IDENTITY_KEY_PATH")
                     .unwrap_or_else(|_| "/var/skipr/connector/.keys/identity.key".to_string()),
+            ),
+            audit_log_path: PathBuf::from(
+                env::var("CONNECTOR_AUDIT_LOG_PATH")
+                    .unwrap_or_else(|_| "/var/skipr/connector/audit/audit.log".to_string()),
             ),
             heartbeat_interval: Duration::from_secs(
                 env::var("HEARTBEAT_INTERVAL_SECONDS")
@@ -61,6 +66,7 @@ mod tests {
             "AGENT_IP_ADDRESS",
             "REGISTRY_BASE_URL",
             "CONNECTOR_IDENTITY_KEY_PATH",
+            "CONNECTOR_AUDIT_LOG_PATH",
             "HEARTBEAT_INTERVAL_SECONDS",
         ] {
             unsafe { env::remove_var(key) };
@@ -89,6 +95,47 @@ mod tests {
         let config = Config::from_env().unwrap();
 
         assert_eq!(config.heartbeat_interval, Duration::from_secs(60));
+        clear_all();
+    }
+
+    #[test]
+    fn defaults_the_audit_log_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(
+            config.audit_log_path,
+            PathBuf::from("/var/skipr/connector/audit/audit.log")
+        );
+        clear_all();
+    }
+
+    #[test]
+    fn reads_a_configured_audit_log_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+            env::set_var("CONNECTOR_AUDIT_LOG_PATH", "/tmp/custom-audit.log");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(
+            config.audit_log_path,
+            PathBuf::from("/tmp/custom-audit.log")
+        );
         clear_all();
     }
 
