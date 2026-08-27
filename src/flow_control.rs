@@ -104,6 +104,16 @@ fn handle_flow_admission(
         request.signed_data.as_bytes(),
         &request.signature,
     ) {
+        // This is itself a deny decision (acceptance criteria: "Connector...
+        // makes an allow/deny decision... a local audit entry is recorded"),
+        // not just an early exit - best-effort, same as decide_access_and_audit.
+        if let Err(error) = audit_log.record(AuditEvent::AccessRefused {
+            gateway_id: request.gateway_id.clone(),
+            device_public_key: request.user_public_key.clone(),
+            reason: "invalid_signature".to_string(),
+        }) {
+            tracing::error!(%error, "failed to write invalid-signature audit entry");
+        }
         return FlowAdmissionResponse {
             flow_id: request.flow_id,
             decision: "refuse".to_string(),
@@ -243,7 +253,8 @@ mod tests {
         // Store has this device entitled - proves the refusal is really about
         // the signature, not about entitlement.
         let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
-        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
         // Signed by a different key than the one presented as user_public_key.
         let mut request = admission_request(
             "gw-1",
@@ -263,6 +274,19 @@ mod tests {
                 reason: Some("invalid_signature".to_string()),
             }
         );
+        // A bad signature is itself a deny decision - it must be audited too,
+        // not just short-circuited silently.
+        let entry: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(dir.path().join("audit.log"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entry["event"], "access_refused");
+        assert_eq!(entry["reason"], "invalid_signature");
+        assert_eq!(entry["device_public_key"], device.public_key_hex);
     }
 
     #[test]
