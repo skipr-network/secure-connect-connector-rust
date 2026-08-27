@@ -3,16 +3,17 @@
 //! every currently-live EndpointNode in its Location over WireGuard
 //! (BoringTun, embedded)").
 //!
-//! Scoped to establishing and maintaining the WireGuard *session* with each
-//! node - the handshake - not routing arbitrary IP traffic through it. Real
-//! packet forwarding needs a TUN device, which needs OS privileges this
-//! doesn't assume (and this environment doesn't have); per the spec's own
-//! "first release scope: relay plus the control protocol specified here,
-//! nothing more" and matching `flow_control`'s precedent (there's nothing to
-//! forward yet either), that's explicitly out of scope here. What this
-//! proves instead: the actual Noise-protocol handshake completing, end to
-//! end, between two real `Tunn` instances configured the way this Connector
-//! configures them - not a mock of the protocol, the real thing.
+//! Handles both the WireGuard *session* (handshake) with each node and,
+//! since TT-1827, routing decrypted/outbound packets to the right node once
+//! a real TUN device (`tun_device.rs`) is wired in from `main`. Encryption
+//! itself is verified with a real, live two-sided handshake test below -
+//! not mocked: two genuine `Tunn` instances actually completing the
+//! Noise-protocol exchange against each other. Real end-to-end packet
+//! forwarding (TUN device + actual routed IP traffic) was proven separately,
+//! outside this crate, before this file wired it in: two Docker containers,
+//! each with a real TUN device and a real `Tunn`, exchanged genuine ICMP
+//! traffic through actual WireGuard encryption between two separate network
+//! namespaces (TT-1732 session notes, 2026-08-27).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -39,9 +40,8 @@ pub(crate) const WIREGUARD_PORT: u16 = 51820;
 pub enum TunnelEvent {
     /// Bytes that must be sent back out over the socket to this node.
     SendToNode(Vec<u8>),
-    /// Decrypted tunnel payload data - not acted on yet, see the module doc
-    /// comment; kept distinct from `Nothing` so a future forwarding slice
-    /// has something concrete to match on instead of silently dropping it.
+    /// Decrypted tunnel payload data - `main`'s receive loop learns a route
+    /// from its source address and writes it to the TUN device (TT-1827).
     DecryptedData(Vec<u8>),
     /// Nothing to send, nothing decoded - e.g. a keepalive, or a handshake
     /// already in progress.
@@ -66,10 +66,8 @@ impl From<TunnResult<'_>> for TunnelEvent {
 
 pub struct NodeTunnel {
     tunn: Tunn,
-    /// Not read back off `NodeTunnel` in production - callers already have
-    /// the originating `HeartbeatNode.node_id` from the same sync pass, so
-    /// this only gets read in tests confirming the right tunnel got built.
-    #[allow(dead_code)]
+    /// Read by `main`'s receive loop to learn which node a decrypted
+    /// packet's source address is reachable through (TT-1827).
     pub node_id: String,
     pub addr: SocketAddr,
 }
@@ -100,6 +98,28 @@ impl NodeTunnel {
     pub fn is_established(&self) -> bool {
         self.tunn.stats().0.is_some()
     }
+
+    /// Encrypts an outbound IP packet (read from the TUN device) for sending
+    /// to this node. If no session is established yet, boringtun queues the
+    /// packet internally and this produces a handshake-initiation instead -
+    /// the queued packet is sent automatically once the handshake completes.
+    pub fn encapsulate(&mut self, packet: &[u8]) -> TunnelEvent {
+        let mut buf = [0u8; 2048];
+        self.tunn.encapsulate(packet, &mut buf).into()
+    }
+}
+
+/// Parses the source address from a raw IPv4/IPv6 packet - the counterpart
+/// to `Tunn::dst_address` (which boringtun exposes publicly; there's no
+/// source-address equivalent), needed to learn which node a decrypted
+/// packet's sender is reachable through. Same header byte offsets
+/// boringtun's own (private) parsing uses internally.
+pub fn parse_source_address(packet: &[u8]) -> Option<IpAddr> {
+    match packet.first()? >> 4 {
+        4 if packet.len() >= 20 => Some(IpAddr::from(<[u8; 4]>::try_from(&packet[12..16]).ok()?)),
+        6 if packet.len() >= 40 => Some(IpAddr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?)),
+        _ => None,
+    }
 }
 
 /// Builds and maintains one `NodeTunnel` per node currently reachable in the
@@ -109,6 +129,14 @@ pub struct TunnelManager {
     rate_limiter: Arc<RateLimiter>,
     tunnels: HashMap<String, NodeTunnel>,
     next_index: u32,
+    /// Destination IP -> node_id, learned from the source IP of decrypted
+    /// packets actually received from that node's tunnel (TT-1827). Not a
+    /// statically configured AllowedIPs/addressing table: nothing in the
+    /// spec or the agreed Connector<->Gatekeeper contract defines a virtual
+    /// addressing scheme for the Connector<->Node leg, so routing return
+    /// traffic by "which node did we last hear this IP from" is the
+    /// defensible minimum rather than inventing an unagreed addressing plan.
+    routes: HashMap<IpAddr, String>,
 }
 
 impl TunnelManager {
@@ -119,6 +147,7 @@ impl TunnelManager {
             rate_limiter: Arc::new(RateLimiter::new(&identity_public, 10)),
             tunnels: HashMap::new(),
             next_index: 0,
+            routes: HashMap::new(),
         }
     }
 
@@ -201,6 +230,22 @@ impl TunnelManager {
     #[allow(dead_code)]
     pub fn node_count(&self) -> usize {
         self.tunnels.len()
+    }
+
+    /// Records that `source_ip` is reachable via `node_id`'s tunnel - called
+    /// after successfully decrypting a packet from that node, so return
+    /// traffic (or anything else destined to it) can be routed correctly.
+    pub fn learn_route(&mut self, node_id: &str, source_ip: IpAddr) {
+        self.routes.insert(source_ip, node_id.to_string());
+    }
+
+    /// Looks up which node's tunnel an outbound packet (by its destination
+    /// IP) should be routed through. `None` means we've never seen traffic
+    /// from that address, so there's genuinely nowhere defensible to send
+    /// it - the caller drops the packet rather than guessing.
+    pub fn route_for(&mut self, destination_ip: IpAddr) -> Option<&mut NodeTunnel> {
+        let node_id = self.routes.get(&destination_ip)?.clone();
+        self.tunnels.get_mut(&node_id)
     }
 }
 
@@ -334,6 +379,88 @@ mod tests {
     }
 
     #[test]
+    fn parse_source_address_reads_an_ipv4_header() {
+        // A minimal 20-byte IPv4 header: version/IHL, then bytes up to the
+        // source address field (offset 12-16), destination (16-20) unused
+        // here.
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45; // version 4, IHL 5
+        packet[12..16].copy_from_slice(&[10, 0, 0, 5]);
+
+        let source = parse_source_address(&packet);
+
+        assert_eq!(source, Some("10.0.0.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_source_address_reads_an_ipv6_header() {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x60; // version 6
+        packet[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let source = parse_source_address(&packet);
+
+        assert_eq!(source, Some("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_source_address_returns_none_for_a_truncated_or_empty_packet() {
+        assert_eq!(parse_source_address(&[]), None);
+        assert_eq!(parse_source_address(&[0x45, 0, 0]), None);
+    }
+
+    #[test]
+    fn route_for_returns_none_when_nothing_has_ever_been_learned() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+
+        let route = manager.route_for("10.0.0.5".parse().unwrap());
+
+        assert!(route.is_none());
+    }
+
+    #[test]
+    fn learn_route_then_route_for_finds_the_right_tunnel() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        let destination: IpAddr = "10.0.0.5".parse().unwrap();
+
+        manager.learn_route("n-1", destination);
+        let route = manager.route_for(destination);
+
+        assert!(route.is_some());
+    }
+
+    #[test]
+    fn route_for_returns_none_if_the_learned_nodes_tunnel_was_since_dropped() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        let destination: IpAddr = "10.0.0.5".parse().unwrap();
+        manager.learn_route("n-1", destination);
+
+        // The node disappears from a later heartbeat's node_list.
+        manager.sync_nodes(&[]);
+
+        assert!(manager.route_for(destination).is_none());
+    }
+
+    #[test]
+    fn encapsulate_without_an_established_session_starts_a_handshake_instead() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        let tunnel = manager.tunnel_for("n-1").unwrap();
+
+        // No handshake has happened yet, so encapsulating a data packet
+        // queues it internally and produces a handshake-initiation instead -
+        // boringtun's own behavior, not something this code decides.
+        let event = tunnel.encapsulate(b"not a real ip packet, just payload bytes");
+
+        assert!(matches!(event, TunnelEvent::SendToNode(_)));
+    }
+
+    #[test]
     fn a_real_handshake_completes_end_to_end_between_two_tunnels() {
         // Not a mock: two genuine Tunn instances, configured exactly the way
         // this Connector configures its side, actually completing the
@@ -375,5 +502,32 @@ mod tests {
 
         let final_event = node_side.decapsulate(None, &keepalive, &mut buf);
         assert!(matches!(final_event, TunnResult::Done));
+
+        // Now prove real data forwarding over the established session - not
+        // just the handshake: a fake IPv4 packet, encrypted by the
+        // Connector side, decrypted by the node side, and confirmed to
+        // still contain exactly the source address the Connector would
+        // learn a route from.
+        let mut fake_ip_packet = vec![0u8; 20];
+        fake_ip_packet[0] = 0x45;
+        fake_ip_packet[2..4].copy_from_slice(&20u16.to_be_bytes()); // total length
+        fake_ip_packet[12..16].copy_from_slice(&[10, 99, 0, 1]); // source
+        fake_ip_packet[16..20].copy_from_slice(&[10, 99, 0, 2]); // destination
+
+        let encrypted = match connector_side.encapsulate(&fake_ip_packet) {
+            TunnelEvent::SendToNode(bytes) => bytes,
+            other => panic!("expected an encrypted data packet, got {other:?}"),
+        };
+
+        let decrypted = match node_side.decapsulate(None, &encrypted, &mut buf) {
+            TunnResult::WriteToTunnelV4(bytes, _) => bytes.to_vec(),
+            other => panic!("expected the node to decrypt a tunnel payload, got {other:?}"),
+        };
+
+        assert_eq!(decrypted, fake_ip_packet);
+        assert_eq!(
+            parse_source_address(&decrypted),
+            Some("10.99.0.1".parse().unwrap())
+        );
     }
 }

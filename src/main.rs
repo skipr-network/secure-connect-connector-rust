@@ -8,12 +8,14 @@ mod heartbeat;
 mod identity;
 mod policy;
 mod registry_client;
+mod tun_device;
 mod tunnel;
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use audit::{AuditEvent, AuditLog};
+use boringtun::noise::Tunn;
 use config::Config;
 use dto::HeartbeatNode;
 use flow_control::ControlPlaneState;
@@ -56,7 +58,22 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("failed to bind the WireGuard UDP socket")?,
     );
+
+    // Real packet forwarding (TT-1827): needs CAP_NET_ADMIN + /dev/net/tun,
+    // proven for real via two Docker containers exchanging genuine ICMP
+    // traffic through actual WireGuard encryption before this was wired in
+    // (see tunnel.rs's module doc comment).
+    let (tun_reader, tun_writer) = tun_device::create(config.tun_addr, config.tun_netmask, 1400)
+        .context("failed to create the Connector's TUN device")?;
+    info!(tun_addr = %config.tun_addr, tun_netmask = %config.tun_netmask, "TUN device ready");
+
     tokio::spawn(run_wireguard_receive_loop(
+        wg_socket.clone(),
+        tunnel_manager.clone(),
+        tun_writer,
+    ));
+    tokio::spawn(run_tun_send_loop(
+        tun_reader,
         wg_socket.clone(),
         tunnel_manager.clone(),
     ));
@@ -191,13 +208,16 @@ async fn dial_new_nodes(
 
 /// Drives every node tunnel's WireGuard session from the network side:
 /// receives a datagram, matches it to the node it came from, feeds it to
-/// that tunnel, and sends back whatever the tunnel produces in response
-/// (e.g. the initiator's post-handshake keepalive). Runs for the lifetime of
-/// the process; a single receive error is logged and the loop continues -
-/// one bad datagram must not take down every node's tunnel.
+/// that tunnel, and either sends back whatever the tunnel produces in
+/// response (e.g. the initiator's post-handshake keepalive) or, for real
+/// decrypted payload data (TT-1827), learns the route and writes it to the
+/// TUN device so the OS's own IP stack delivers it onward. Runs for the
+/// lifetime of the process; a single receive error is logged and the loop
+/// continues - one bad datagram must not take down every node's tunnel.
 async fn run_wireguard_receive_loop(
     wg_socket: Arc<UdpSocket>,
     tunnel_manager: Arc<Mutex<TunnelManager>>,
+    mut tun_writer: tun_device::TunWriter,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -214,6 +234,7 @@ async fn run_wireguard_receive_loop(
             warn!(%src, "received a WireGuard datagram from an unrecognized peer address");
             continue;
         };
+        let node_id = tunnel.node_id.clone();
 
         match tunnel.receive(&buf[..len]) {
             TunnelEvent::SendToNode(packet) => {
@@ -221,10 +242,57 @@ async fn run_wireguard_receive_loop(
                     error!(%error, %src, "failed to send WireGuard response packet");
                 }
             }
+            TunnelEvent::DecryptedData(packet) => {
+                if let Some(source_ip) = tunnel::parse_source_address(&packet) {
+                    manager.learn_route(&node_id, source_ip);
+                }
+                drop(manager);
+                if let Err(error) = tun_writer.write_packet(&packet).await {
+                    error!(%error, node_id = %node_id, "failed to write decrypted packet to TUN device");
+                }
+            }
             TunnelEvent::ProtocolError(protocol_error) => {
                 warn!(error = %protocol_error, %src, "WireGuard protocol error");
             }
-            TunnelEvent::DecryptedData(_) | TunnelEvent::Nothing => {}
+            TunnelEvent::Nothing => {}
+        }
+    }
+}
+
+/// Reads outbound IP packets the OS routed to the TUN device (e.g. return
+/// traffic from an internal endpoint), looks up which node's tunnel can
+/// reach that destination, and encrypts+sends it there. A destination with
+/// no learned route is dropped - there's genuinely nowhere defensible to
+/// send it, not a bug to work around.
+async fn run_tun_send_loop(
+    mut tun_reader: tun_device::TunReader,
+    wg_socket: Arc<UdpSocket>,
+    tunnel_manager: Arc<Mutex<TunnelManager>>,
+) {
+    let mut buf = [0u8; 2048];
+    loop {
+        let len = match tun_reader.read_packet(&mut buf).await {
+            Ok(len) => len,
+            Err(error) => {
+                error!(%error, "failed to read from TUN device");
+                continue;
+            }
+        };
+        let Some(destination_ip) = Tunn::dst_address(&buf[..len]) else {
+            continue;
+        };
+
+        let mut manager = tunnel_manager.lock().await;
+        let Some(tunnel) = manager.route_for(destination_ip) else {
+            warn!(%destination_ip, "no known route for outbound packet - dropping");
+            continue;
+        };
+
+        if let TunnelEvent::SendToNode(packet) = tunnel.encapsulate(&buf[..len]) {
+            let addr = tunnel.addr;
+            if let Err(error) = wg_socket.send_to(&packet, addr).await {
+                error!(%error, %addr, %destination_ip, "failed to send encrypted outbound packet");
+            }
         }
     }
 }
@@ -245,6 +313,8 @@ mod tests {
             identity_key_path: "/tmp/unused-in-this-test".into(),
             audit_log_path: "/tmp/unused-in-this-test-audit.log".into(),
             control_plane_listen_addr: "127.0.0.1:0".to_string(),
+            tun_addr: std::net::Ipv4Addr::new(10, 99, 0, 1),
+            tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
         }
     }

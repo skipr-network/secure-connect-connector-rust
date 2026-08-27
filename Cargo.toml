@@ -21,6 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 boringtun = { version = "0.7.1", default-features = false }
+tun = { version = "0.8.14", features = ["async"] }
 
 [dev-dependencies]
 wiremock = "0.6"
