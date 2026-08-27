@@ -11,11 +11,18 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 
+/// Not constructed by production code - the Connector's own identity is
+/// X25519 now (`identity.rs`, TT-1822), not Ed25519. This and
+/// `generate_keypair` remain genuinely useful: every test that needs to
+/// simulate an Agent's or a device's Ed25519 identity (both still real
+/// Ed25519 signers this Connector verifies against) uses them.
+#[allow(dead_code)]
 pub struct KeyPair {
     pub signing_key: SigningKey,
     pub public_key_hex: String,
 }
 
+#[allow(dead_code)]
 pub fn generate_keypair() -> KeyPair {
     let signing_key = SigningKey::generate(&mut OsRng);
     let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
@@ -25,10 +32,17 @@ pub fn generate_keypair() -> KeyPair {
     }
 }
 
+/// Only exercised by this module's own round-trip test now - no production
+/// caller needs to re-encode a private key it just generated (see
+/// `generate_keypair`'s doc comment).
+#[allow(dead_code)]
 pub fn encode_private_key_hex(signing_key: &SigningKey) -> String {
     hex::encode(signing_key.to_bytes())
 }
 
+/// Only exercised by this module's own tests now - see `generate_keypair`'s
+/// doc comment for why nothing in production decodes a private key anymore.
+#[allow(dead_code)]
 pub fn decode_private_key_hex(hex_str: &str) -> Result<SigningKey> {
     let bytes = hex::decode(hex_str).context("private key is not valid hex")?;
     let array: [u8; 32] = bytes.try_into().map_err(|_| {

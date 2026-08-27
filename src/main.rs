@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let connector_identity = identity::load_or_generate(&config.identity_key_path)?;
     info!(
         connector_id = %config.connector_id,
-        public_key = %connector_identity.public_key_hex,
+        public_key = %connector_identity.public_key_base64,
         "Connector identity ready"
     );
 
