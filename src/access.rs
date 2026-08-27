@@ -4,8 +4,11 @@
 //!
 //! This module only makes the allow/refuse decision and, when allowed,
 //! names which endpoints traffic may be forwarded to - it does not dial or
-//! forward anything itself. That needs the node-tunnel slice (not yet
-//! built), so `decide_access` has no caller in `main` yet either.
+//! forward anything itself. `main` calls this via `flow_control`'s handlers
+//! once Gatekeeper actually relays a flow-admission request; the endpoints
+//! an `Allowed` decision names aren't dialed anywhere yet (that needs real
+//! packet forwarding through the tunnel, still out of scope - see
+//! `tunnel`'s module doc comment).
 
 use chrono::{DateTime, Utc};
 
@@ -14,7 +17,6 @@ use crate::dto::PolicyBundleEndpoint;
 use crate::policy::PolicyStore;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum AccessDecision {
     Allowed {
         /// From the matched `Entitlement` row, never from a caller-supplied
@@ -26,7 +28,6 @@ pub enum AccessDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 pub enum RefusalReason {
     NoPolicyApplied,
     PolicyExpired,
@@ -71,7 +72,6 @@ impl RefusalReason {
 /// caller-asserted `user_id` here would let anyone claim to be anyone; the
 /// `user_id` returned in `Allowed` comes only from the matching
 /// `Entitlement` row, i.e. from our own data, never from the caller.
-#[allow(dead_code)]
 pub fn decide_access(
     store: &PolicyStore,
     gateway_id: &str,
@@ -82,12 +82,7 @@ pub fn decide_access(
 
 /// Pairs `decide_access` with TT-1820's audit trail - the acceptance
 /// criteria requires an audit entry for every allow/deny decision, not just
-/// the decision itself. Not called from `main` yet, same as `decide_access`:
-/// there's no real traffic path to call it from until the node-tunnel slice
-/// exists, but that slice's only job will be to call this instead of the
-/// plain `decide_access`, so it's built and tested against the real
-/// `AuditLog` now rather than guessed at later.
-#[allow(dead_code)]
+/// the decision itself. Called by `flow_control`'s admission handler.
 pub fn decide_access_and_audit(
     store: &PolicyStore,
     audit_log: &AuditLog,

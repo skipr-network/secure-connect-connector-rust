@@ -34,10 +34,8 @@ use std::path::Path;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub struct ConnectorIdentity {
-    /// Not read from `main` yet - needed once the node-tunnel slice dials
-    /// each node's WireGuard interface using this as the Connector's own
-    /// static secret.
-    #[allow(dead_code)]
+    /// Moved into `TunnelManager::new` in `main` - the Connector's own
+    /// static secret for every node's WireGuard session.
     pub secret: StaticSecret,
     pub public_key_base64: String,
 }

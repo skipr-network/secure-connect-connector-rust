@@ -14,17 +14,21 @@ use std::sync::RwLock;
 
 use crate::dto::{ConnectorHeartbeatResponse, HeartbeatNode, PolicyBundle};
 
-/// Not read from `main` yet - reading back the applied state is needed once
-/// enforcement/node tunnels (later TT-1732 slices) exist to act on it. Read in
-/// tests (including `main`'s `run_heartbeat` tests) to confirm apply/reject
-/// behavior.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PolicyState {
+    /// Not read anywhere in production yet - `access::decide_access_at` only
+    /// needs `expires_at`/`policy_bundles`. Read in tests to confirm apply
+    /// behavior; genuinely useful once diagnostics/audit context needs it.
+    #[allow(dead_code)]
     pub connector_id: String,
+    #[allow(dead_code)]
     pub generated_at: String,
     pub expires_at: String,
     pub policy_bundles: Vec<PolicyBundle>,
+    /// Not read in production yet - the node-tunnel slice (`tunnel.rs`)
+    /// reads `node_list` straight off the heartbeat response in `main`
+    /// (before it's stored here), not back out of `PolicyState`.
+    #[allow(dead_code)]
     pub node_list: Vec<HeartbeatNode>,
 }
 
@@ -80,9 +84,8 @@ impl PolicyStore {
     }
 
     /// A snapshot of the currently applied policy state, or `None` if no
-    /// verified, non-expired package has ever been successfully applied. Not
-    /// called from `main` yet - see the `PolicyState` doc comment.
-    #[allow(dead_code)]
+    /// verified, non-expired package has ever been successfully applied.
+    /// Called by `access::decide_access_at` on every flow-admission check.
     pub fn current(&self) -> Option<PolicyState> {
         self.state
             .read()

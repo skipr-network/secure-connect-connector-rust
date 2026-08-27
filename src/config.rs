@@ -21,6 +21,14 @@ pub struct Config {
     /// Konyk's answer (TT-1732 comment thread): 60s default, must stay configurable
     /// and below Agent's 5-minute signature validity window.
     pub heartbeat_interval: Duration,
+    /// Where the flow-admission/release HTTP server (TT-1821) listens. Not
+    /// specified anywhere in the spec or the agreed contract - Konyk's own
+    /// comment says these calls should arrive "inside the already established
+    /// Connector <-> Node private tunnel network", but nothing in this repo
+    /// yet binds to a real WireGuard-tunnel-internal interface (TT-1823 only
+    /// establishes the session, not a routable virtual address). A plain
+    /// configurable bind address is the honest stand-in until that exists.
+    pub control_plane_listen_addr: String,
 }
 
 impl Config {
@@ -38,6 +46,8 @@ impl Config {
                 env::var("CONNECTOR_AUDIT_LOG_PATH")
                     .unwrap_or_else(|_| "/var/skipr/connector/audit/audit.log".to_string()),
             ),
+            control_plane_listen_addr: env::var("CONNECTOR_CONTROL_PLANE_LISTEN_ADDR")
+                .unwrap_or_else(|_| "0.0.0.0:8443".to_string()),
             heartbeat_interval: Duration::from_secs(
                 env::var("HEARTBEAT_INTERVAL_SECONDS")
                     .ok()
@@ -67,6 +77,7 @@ mod tests {
             "REGISTRY_BASE_URL",
             "CONNECTOR_IDENTITY_KEY_PATH",
             "CONNECTOR_AUDIT_LOG_PATH",
+            "CONNECTOR_CONTROL_PLANE_LISTEN_ADDR",
             "HEARTBEAT_INTERVAL_SECONDS",
         ] {
             unsafe { env::remove_var(key) };
@@ -136,6 +147,41 @@ mod tests {
             config.audit_log_path,
             PathBuf::from("/tmp/custom-audit.log")
         );
+        clear_all();
+    }
+
+    #[test]
+    fn defaults_the_control_plane_listen_addr() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.control_plane_listen_addr, "0.0.0.0:8443");
+        clear_all();
+    }
+
+    #[test]
+    fn reads_a_configured_control_plane_listen_addr() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+            env::set_var("CONNECTOR_CONTROL_PLANE_LISTEN_ADDR", "127.0.0.1:9000");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.control_plane_listen_addr, "127.0.0.1:9000");
         clear_all();
     }
 

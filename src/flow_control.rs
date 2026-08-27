@@ -5,12 +5,15 @@
 //! WireGuard tunnel rather than the public internet.
 //!
 //! Transport-agnostic on purpose: this module only builds the axum `Router`
-//! and its handlers, fully testable without a real socket. What actually
-//! restricts these endpoints to genuine Gatekeeper peers is that the tunnel
+//! and its handlers, fully testable without a real socket - `main` binds it
+//! to `Config::control_plane_listen_addr`. What's *meant* to actually
+//! restrict these endpoints to genuine Gatekeeper peers is that the tunnel
 //! network isn't reachable from anywhere else (Konyk's final comment on
-//! TT-1732) - binding this router to the tunnel-internal listen address is
-//! the node-tunnel slice's job, not yet built, so `router` has no caller in
-//! `main` yet either.
+//! TT-1732), but nothing yet binds this to a real WireGuard-tunnel-internal
+//! address - TT-1823 only establishes the session, not a routable virtual
+//! interface - so today it's reachable at whatever
+//! `control_plane_listen_addr` is configured to, which is the honest
+//! current limitation, not a security design.
 
 use std::sync::Arc;
 
@@ -63,14 +66,11 @@ pub struct FlowReleaseRequest {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct ControlPlaneState {
     pub policy_store: Arc<PolicyStore>,
     pub audit_log: Arc<AuditLog>,
 }
 
-/// Not called from `main` yet - see the module doc comment.
-#[allow(dead_code)]
 pub fn router(state: ControlPlaneState) -> Router {
     Router::new()
         .route("/api/flow/admit", post(admit_flow))

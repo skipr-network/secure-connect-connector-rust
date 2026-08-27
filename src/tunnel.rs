@@ -31,12 +31,11 @@ use crate::dto::HeartbeatNode;
 /// spec or the agreed Connector<->Gatekeeper contract - every node in this
 /// fleet uses the standard port, same as any ordinary WireGuard deployment;
 /// nothing found so far suggests a different convention.
-const WIREGUARD_PORT: u16 = 51820;
+pub(crate) const WIREGUARD_PORT: u16 = 51820;
 
 /// Outcome of feeding a tunnel a network event, translated from boringtun's
 /// borrowed `TunnResult` into owned bytes so callers don't fight lifetimes.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum TunnelEvent {
     /// Bytes that must be sent back out over the socket to this node.
     SendToNode(Vec<u8>),
@@ -65,16 +64,18 @@ impl From<TunnResult<'_>> for TunnelEvent {
     }
 }
 
-#[allow(dead_code)]
 pub struct NodeTunnel {
     tunn: Tunn,
+    /// Not read back off `NodeTunnel` in production - callers already have
+    /// the originating `HeartbeatNode.node_id` from the same sync pass, so
+    /// this only gets read in tests confirming the right tunnel got built.
+    #[allow(dead_code)]
     pub node_id: String,
     pub addr: SocketAddr,
 }
 
 impl NodeTunnel {
     /// Produces the handshake-initiation packet to send to this node.
-    #[allow(dead_code)]
     pub fn initiate_handshake(&mut self) -> TunnelEvent {
         let mut buf = [0u8; 2048];
         self.tunn
@@ -86,7 +87,6 @@ impl NodeTunnel {
     /// handshake response, an established session's keepalive/data packet,
     /// or a malformed/unexpected one (surfaced as `ProtocolError`, never a
     /// panic).
-    #[allow(dead_code)]
     pub fn receive(&mut self, datagram: &[u8]) -> TunnelEvent {
         let mut buf = [0u8; 2048];
         self.tunn
@@ -97,7 +97,6 @@ impl NodeTunnel {
     /// A session has completed its handshake at least once. Per
     /// `Tunn::stats`'s own doc comment, the first element is "time since
     /// last handshake" - `None` until one has actually succeeded.
-    #[allow(dead_code)]
     pub fn is_established(&self) -> bool {
         self.tunn.stats().0.is_some()
     }
@@ -105,7 +104,6 @@ impl NodeTunnel {
 
 /// Builds and maintains one `NodeTunnel` per node currently reachable in the
 /// Connector's Location, from the identity established in TT-1822.
-#[allow(dead_code)]
 pub struct TunnelManager {
     identity_secret: StaticSecret,
     rate_limiter: Arc<RateLimiter>,
@@ -114,7 +112,6 @@ pub struct TunnelManager {
 }
 
 impl TunnelManager {
-    #[allow(dead_code)]
     pub fn new(identity_secret: StaticSecret) -> Self {
         let identity_public = PublicKey::from(&identity_secret);
         Self {
@@ -131,7 +128,6 @@ impl TunnelManager {
     /// untouched - rebuilding one would throw away an established session
     /// (and restart the handshake) for no reason. A node whose key fails to
     /// decode is logged and skipped, not fatal to the rest of the sync.
-    #[allow(dead_code)]
     pub fn sync_nodes(&mut self, nodes: &[HeartbeatNode]) {
         let mut seen = HashSet::new();
         for node in nodes {
@@ -191,9 +187,15 @@ impl TunnelManager {
         })
     }
 
-    #[allow(dead_code)]
     pub fn tunnel_for(&mut self, node_id: &str) -> Option<&mut NodeTunnel> {
         self.tunnels.get_mut(node_id)
+    }
+
+    /// Matches an incoming UDP datagram's source address back to the node it
+    /// came from - a real socket has no other way to know which `NodeTunnel`
+    /// should process a given packet.
+    pub fn tunnel_for_addr(&mut self, addr: SocketAddr) -> Option<&mut NodeTunnel> {
+        self.tunnels.values_mut().find(|tunnel| tunnel.addr == addr)
     }
 
     #[allow(dead_code)]
@@ -264,6 +266,29 @@ mod tests {
         assert_eq!(manager.node_count(), 1);
         assert!(manager.tunnel_for("n-good").is_some());
         assert!(manager.tunnel_for("n-bad").is_none());
+    }
+
+    #[test]
+    fn tunnel_for_addr_finds_the_tunnel_matching_that_source_address() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        let expected_addr = manager.tunnel_for("n-1").unwrap().addr;
+
+        let found = manager.tunnel_for_addr(expected_addr).unwrap();
+
+        assert_eq!(found.node_id, "n-1");
+    }
+
+    #[test]
+    fn tunnel_for_addr_returns_none_for_an_unrecognized_address() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let found = manager.tunnel_for_addr("10.0.0.99:51820".parse().unwrap());
+
+        assert!(found.is_none());
     }
 
     #[test]
