@@ -1,3 +1,4 @@
+mod access;
 mod config;
 mod crypto;
 mod dto;

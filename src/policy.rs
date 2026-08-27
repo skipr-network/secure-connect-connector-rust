@@ -46,7 +46,14 @@ impl PolicyStore {
         self.apply_at(response, Utc::now())
     }
 
-    fn apply_at(&self, response: ConnectorHeartbeatResponse, now: DateTime<Utc>) -> Result<()> {
+    /// `pub(crate)` (not just test-private) so other in-crate modules' tests -
+    /// e.g. `access`'s - can set up precisely timed scenarios through the
+    /// real validated-apply path instead of hand-building a `PolicyState`.
+    pub(crate) fn apply_at(
+        &self,
+        response: ConnectorHeartbeatResponse,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         let expires_at = DateTime::parse_from_rfc3339(&response.expires_at).with_context(|| {
             format!(
                 "heartbeat package has an unparseable expires_at: {}",
