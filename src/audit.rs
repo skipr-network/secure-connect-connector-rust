@@ -26,12 +26,23 @@ pub enum AuditEvent {
     },
     AccessAllowed {
         gateway_id: String,
+        /// From the matched Entitlement row, never a caller-supplied value -
+        /// see `access::decide_access`'s doc comment.
         user_id: String,
+        device_public_key: String,
     },
     AccessRefused {
         gateway_id: String,
-        user_id: String,
+        /// No trustworthy user_id exists for a refusal - either nothing
+        /// matched (so no user_id is known) or the check never got that far
+        /// (e.g. no policy applied yet). The presented device key is the one
+        /// thing that actually came from the caller.
+        device_public_key: String,
         reason: String,
+    },
+    FlowReleased {
+        flow_id: String,
+        gateway_id: String,
     },
 }
 
@@ -155,11 +166,12 @@ mod tests {
         log.record(AuditEvent::AccessAllowed {
             gateway_id: "gw-1".to_string(),
             user_id: "u-1".to_string(),
+            device_public_key: "device-key-1".to_string(),
         })
         .unwrap();
         log.record(AuditEvent::AccessRefused {
             gateway_id: "gw-1".to_string(),
-            user_id: "u-ghost".to_string(),
+            device_public_key: "device-key-ghost".to_string(),
             reason: "not_entitled".to_string(),
         })
         .unwrap();
@@ -172,6 +184,22 @@ mod tests {
     }
 
     #[test]
+    fn records_a_flow_released_event() {
+        let dir = tempdir().unwrap();
+        let log = AuditLog::new(dir.path().join("audit.log"));
+
+        log.record(AuditEvent::FlowReleased {
+            flow_id: "flow-1".to_string(),
+            gateway_id: "gw-1".to_string(),
+        })
+        .unwrap();
+
+        let entries = read_lines(&dir.path().join("audit.log"));
+        assert_eq!(entries[0]["event"], "flow_released");
+        assert_eq!(entries[0]["flow_id"], "flow-1");
+    }
+
+    #[test]
     fn appends_across_multiple_record_calls_without_truncating() {
         let dir = tempdir().unwrap();
         let log = AuditLog::new(dir.path().join("audit.log"));
@@ -180,6 +208,7 @@ mod tests {
             log.record(AuditEvent::AccessAllowed {
                 gateway_id: "gw-1".to_string(),
                 user_id: format!("u-{index}"),
+                device_public_key: format!("device-key-{index}"),
             })
             .unwrap();
         }

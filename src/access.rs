@@ -17,6 +17,9 @@ use crate::policy::PolicyStore;
 #[allow(dead_code)]
 pub enum AccessDecision {
     Allowed {
+        /// From the matched `Entitlement` row, never from a caller-supplied
+        /// value - see `decide_access`'s doc comment for why.
+        user_id: String,
         endpoints: Vec<PolicyBundleEndpoint>,
     },
     Refused(RefusalReason),
@@ -40,20 +43,41 @@ impl RefusalReason {
             RefusalReason::NotEntitled => "not_entitled",
         }
     }
+
+    /// The wire-level `FlowAdmissionResponse.reason` vocabulary is fixed to
+    /// four values by the agreed Connector<->Gatekeeper contract (TT-1732
+    /// comment thread, 2026-08-26): "not_entitled" | "invalid_signature" |
+    /// "expired_entitlement" | "unknown_gateway" - `invalid_signature` is
+    /// produced by the caller (signature verification fails before this type
+    /// is even reached), not by a `RefusalReason` variant. `NoPolicyApplied`
+    /// has no dedicated wire value; it collapses to `not_entitled` since
+    /// there being no policy to check against is, from Gatekeeper's
+    /// perspective, indistinguishable from nothing having matched - the more
+    /// granular distinction still exists in the local audit log
+    /// (`as_audit_str`), which isn't bound by this external contract.
+    pub(crate) fn as_wire_str(self) -> &'static str {
+        match self {
+            RefusalReason::NoPolicyApplied | RefusalReason::NotEntitled => "not_entitled",
+            RefusalReason::PolicyExpired => "expired_entitlement",
+            RefusalReason::UnknownGateway => "unknown_gateway",
+        }
+    }
 }
 
-/// Matches on both `user_id` and `device_public_key` - an `Entitlement` row
-/// authorizes a specific user's specific device, not the user account in
-/// general, so a user's device that isn't itself listed must be refused
-/// even if that same user has a different, entitled device.
+/// Takes `device_public_key` only, never a `user_id` parameter - per the
+/// agreed Connector<->Gatekeeper contract (TT-1732 comment thread,
+/// 2026-08-26), the flow-admission message a caller presents carries a
+/// `user_public_key` proven by signature, never a `user_id`. Trusting a
+/// caller-asserted `user_id` here would let anyone claim to be anyone; the
+/// `user_id` returned in `Allowed` comes only from the matching
+/// `Entitlement` row, i.e. from our own data, never from the caller.
 #[allow(dead_code)]
 pub fn decide_access(
     store: &PolicyStore,
     gateway_id: &str,
-    user_id: &str,
     device_public_key: &str,
 ) -> AccessDecision {
-    decide_access_at(store, gateway_id, user_id, device_public_key, Utc::now())
+    decide_access_at(store, gateway_id, device_public_key, Utc::now())
 }
 
 /// Pairs `decide_access` with TT-1820's audit trail - the acceptance
@@ -68,19 +92,19 @@ pub fn decide_access_and_audit(
     store: &PolicyStore,
     audit_log: &AuditLog,
     gateway_id: &str,
-    user_id: &str,
     device_public_key: &str,
 ) -> AccessDecision {
-    let decision = decide_access(store, gateway_id, user_id, device_public_key);
+    let decision = decide_access(store, gateway_id, device_public_key);
 
     let event = match &decision {
-        AccessDecision::Allowed { .. } => AuditEvent::AccessAllowed {
+        AccessDecision::Allowed { user_id, .. } => AuditEvent::AccessAllowed {
             gateway_id: gateway_id.to_string(),
-            user_id: user_id.to_string(),
+            user_id: user_id.clone(),
+            device_public_key: device_public_key.to_string(),
         },
         AccessDecision::Refused(reason) => AuditEvent::AccessRefused {
             gateway_id: gateway_id.to_string(),
-            user_id: user_id.to_string(),
+            device_public_key: device_public_key.to_string(),
             reason: reason.as_audit_str().to_string(),
         },
     };
@@ -96,7 +120,6 @@ pub fn decide_access_and_audit(
 fn decide_access_at(
     store: &PolicyStore,
     gateway_id: &str,
-    user_id: &str,
     device_public_key: &str,
     now: DateTime<Utc>,
 ) -> AccessDecision {
@@ -123,16 +146,17 @@ fn decide_access_at(
         return AccessDecision::Refused(RefusalReason::UnknownGateway);
     };
 
-    let is_entitled = bundle.entitlement_list.iter().any(|entitlement| {
-        entitlement.user_id == user_id && entitlement.device_public_key == device_public_key
-    });
+    let matched = bundle
+        .entitlement_list
+        .iter()
+        .find(|entitlement| entitlement.device_public_key == device_public_key);
 
-    if is_entitled {
-        AccessDecision::Allowed {
+    match matched {
+        Some(entitlement) => AccessDecision::Allowed {
+            user_id: entitlement.user_id.clone(),
             endpoints: bundle.endpoints.clone(),
-        }
-    } else {
-        AccessDecision::Refused(RefusalReason::NotEntitled)
+        },
+        None => AccessDecision::Refused(RefusalReason::NotEntitled),
     }
 }
 
@@ -171,7 +195,7 @@ mod tests {
     fn refuses_when_no_policy_has_ever_been_applied() {
         let store = PolicyStore::new();
 
-        let decision = decide_access_at(&store, "gw-1", "u-1", "device-key-1", Utc::now());
+        let decision = decide_access_at(&store, "gw-1", "device-key-1", Utc::now());
 
         assert_eq!(
             decision,
@@ -180,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_an_entitled_user_and_returns_the_gateways_endpoints() {
+    fn allows_an_entitled_device_and_returns_its_user_id_and_the_gateways_endpoints() {
         let store = PolicyStore::new();
         let now = DateTime::parse_from_rfc3339("2026-08-27T10:00:00Z")
             .unwrap()
@@ -199,11 +223,12 @@ mod tests {
             )
             .unwrap();
 
-        let decision = decide_access_at(&store, "gw-1", "u-1", "device-key-1", now);
+        let decision = decide_access_at(&store, "gw-1", "device-key-1", now);
 
         assert_eq!(
             decision,
             AccessDecision::Allowed {
+                user_id: "u-1".to_string(),
                 endpoints: vec![PolicyBundleEndpoint {
                     host: "10.0.0.5".to_string(),
                     port: 443
@@ -213,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_user_whose_device_is_not_the_entitled_one() {
+    fn refuses_a_device_that_is_not_in_the_entitlement_list() {
         let store = PolicyStore::new();
         let now = DateTime::parse_from_rfc3339("2026-08-27T10:00:00Z")
             .unwrap()
@@ -232,8 +257,10 @@ mod tests {
             )
             .unwrap();
 
-        // Same user_id, but a different device than the one actually entitled.
-        let decision = decide_access_at(&store, "gw-1", "u-1", "device-key-EVIL", now);
+        // A different device than the one actually entitled - there is no
+        // caller-asserted user_id to even compare against anymore; only the
+        // presented device key matters.
+        let decision = decide_access_at(&store, "gw-1", "device-key-EVIL", now);
 
         assert_eq!(
             decision,
@@ -242,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_user_missing_from_the_entitlement_list_entirely() {
+    fn refuses_a_device_when_the_entitlement_list_is_empty() {
         let store = PolicyStore::new();
         let now = DateTime::parse_from_rfc3339("2026-08-27T10:00:00Z")
             .unwrap()
@@ -257,7 +284,7 @@ mod tests {
             )
             .unwrap();
 
-        let decision = decide_access_at(&store, "gw-1", "u-ghost", "device-key-1", now);
+        let decision = decide_access_at(&store, "gw-1", "device-key-ghost", now);
 
         assert_eq!(
             decision,
@@ -285,7 +312,7 @@ mod tests {
             )
             .unwrap();
 
-        let decision = decide_access_at(&store, "gw-UNKNOWN", "u-1", "device-key-1", now);
+        let decision = decide_access_at(&store, "gw-UNKNOWN", "device-key-1", now);
 
         assert_eq!(
             decision,
@@ -317,7 +344,7 @@ mod tests {
         // Nothing ever refreshed it, and real time has since moved past that
         // 5-minute window - still "current" in the store, but stale.
         let decision_time = applied_at + Duration::minutes(10);
-        let decision = decide_access_at(&store, "gw-1", "u-1", "device-key-1", decision_time);
+        let decision = decide_access_at(&store, "gw-1", "device-key-1", decision_time);
 
         assert_eq!(
             decision,
@@ -343,7 +370,7 @@ mod tests {
             )
             .unwrap();
 
-        let decision = decide_access_at(&store, "gw-1", "u-1", "device-key-1", expiry);
+        let decision = decide_access_at(&store, "gw-1", "device-key-1", expiry);
 
         assert_eq!(
             decision,
@@ -352,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_access_and_audit_records_an_allowed_decision() {
+    fn decide_access_and_audit_records_an_allowed_decision_with_the_resolved_user_id() {
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
         let store = PolicyStore::new();
@@ -370,9 +397,18 @@ mod tests {
             ))
             .unwrap();
 
-        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "u-1", "device-key-1");
+        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-1");
 
-        assert!(matches!(decision, AccessDecision::Allowed { .. }));
+        assert_eq!(
+            decision,
+            AccessDecision::Allowed {
+                user_id: "u-1".to_string(),
+                endpoints: vec![PolicyBundleEndpoint {
+                    host: "10.0.0.5".to_string(),
+                    port: 443
+                }]
+            }
+        );
         let entry: serde_json::Value = serde_json::from_str(
             std::fs::read_to_string(dir.path().join("audit.log"))
                 .unwrap()
@@ -384,6 +420,7 @@ mod tests {
         assert_eq!(entry["event"], "access_allowed");
         assert_eq!(entry["gateway_id"], "gw-1");
         assert_eq!(entry["user_id"], "u-1");
+        assert_eq!(entry["device_public_key"], "device-key-1");
     }
 
     #[test]
@@ -402,10 +439,9 @@ mod tests {
             ))
             .unwrap();
 
-        let not_entitled =
-            decide_access_and_audit(&store, &audit_log, "gw-1", "u-ghost", "device-key-1");
+        let not_entitled = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost");
         let unknown_gateway =
-            decide_access_and_audit(&store, &audit_log, "gw-UNKNOWN", "u-1", "device-key-1");
+            decide_access_and_audit(&store, &audit_log, "gw-UNKNOWN", "device-key-1");
 
         assert_eq!(
             not_entitled,
@@ -431,8 +467,7 @@ mod tests {
         let audit_log = AuditLog::new("/this/path/does/not/exist/and/cannot/be/created/audit.log");
         let store = PolicyStore::new();
 
-        let decision =
-            decide_access_and_audit(&store, &audit_log, "gw-1", "u-ghost", "device-key-1");
+        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost");
 
         assert_eq!(
             decision,
@@ -446,8 +481,7 @@ mod tests {
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
         let store = PolicyStore::new();
 
-        let decision =
-            decide_access_and_audit(&store, &audit_log, "gw-1", "u-ghost", "device-key-1");
+        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost");
 
         assert_eq!(
             decision,
@@ -463,6 +497,7 @@ mod tests {
         .unwrap();
         assert_eq!(entry["event"], "access_refused");
         assert_eq!(entry["reason"], "no_policy_applied");
+        assert_eq!(entry["device_public_key"], "device-key-ghost");
     }
 
     #[test]
@@ -472,7 +507,7 @@ mod tests {
         // doesn't matter - it must still refuse.
         let store = PolicyStore::new();
 
-        let decision = decide_access(&store, "gw-1", "u-1", "device-key-1");
+        let decision = decide_access(&store, "gw-1", "device-key-1");
 
         assert_eq!(
             decision,

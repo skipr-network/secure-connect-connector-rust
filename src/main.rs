@@ -3,6 +3,7 @@ mod audit;
 mod config;
 mod crypto;
 mod dto;
+mod flow_control;
 mod heartbeat;
 mod identity;
 mod policy;
