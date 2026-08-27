@@ -1,0 +1,38 @@
+name: ci
+
+# Required status check "ci / build-and-test", same convention as the rest of the
+# fleet's ci.yml (see branch-source-guard.yml) - checks fmt, clippy (warnings as
+# errors), and the full test suite, including the cross-language Ed25519 interop
+# test against a fixed signature captured from the Java fleet's Ed25519Support.
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
