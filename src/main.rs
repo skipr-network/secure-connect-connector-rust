@@ -8,6 +8,7 @@ mod heartbeat;
 mod identity;
 mod policy;
 mod registry_client;
+mod tunnel;
 
 use audit::{AuditEvent, AuditLog};
 use config::Config;
