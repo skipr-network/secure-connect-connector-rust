@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ConnectorHeartbeatResponse {
     pub connector_id: String,
     pub generated_at: String,
@@ -17,7 +17,7 @@ pub struct ConnectorHeartbeatResponse {
     pub node_list: Vec<HeartbeatNode>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PolicyBundle {
     pub gateway_id: String,
     pub location: String,
@@ -27,19 +27,19 @@ pub struct PolicyBundle {
     pub entitlement_list: Vec<Entitlement>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PolicyBundleEndpoint {
     pub host: String,
     pub port: u16,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Entitlement {
     pub user_id: String,
     pub device_public_key: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HeartbeatNode {
     pub node_id: String,
     pub ip_address: String,
