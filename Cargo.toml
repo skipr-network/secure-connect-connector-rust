@@ -1,7 +1,30 @@
 [package]
 name = "secure_connect_connector"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Private Gateway Connector runtime (TT-1732)"
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+hex = "0.4"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+boringtun = { version = "0.7.1", default-features = false }
+tun = { version = "0.8.14", features = ["async"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
