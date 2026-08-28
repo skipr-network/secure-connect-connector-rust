@@ -83,7 +83,7 @@ pub fn decide_access(
 /// Pairs `decide_access` with TT-1820's audit trail - the acceptance
 /// criteria requires an audit entry for every allow/deny decision, not just
 /// the decision itself. Called by `flow_control`'s admission handler.
-pub fn decide_access_and_audit(
+pub async fn decide_access_and_audit(
     store: &PolicyStore,
     audit_log: &AuditLog,
     gateway_id: &str,
@@ -105,7 +105,7 @@ pub fn decide_access_and_audit(
     };
     // Best-effort: an audit-write failure must not itself block or flip an
     // access decision that's already been made.
-    if let Err(error) = audit_log.record(event) {
+    if let Err(error) = audit_log.record(event).await {
         tracing::error!(%error, "failed to write access-decision audit entry");
     }
 
@@ -373,8 +373,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decide_access_and_audit_records_an_allowed_decision_with_the_resolved_user_id() {
+    #[tokio::test]
+    async fn decide_access_and_audit_records_an_allowed_decision_with_the_resolved_user_id() {
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
         let store = PolicyStore::new();
@@ -392,7 +392,7 @@ mod tests {
             ))
             .unwrap();
 
-        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-1");
+        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-1").await;
 
         assert_eq!(
             decision,
@@ -418,8 +418,8 @@ mod tests {
         assert_eq!(entry["device_public_key"], "device-key-1");
     }
 
-    #[test]
-    fn decide_access_and_audit_records_not_entitled_and_unknown_gateway_reasons() {
+    #[tokio::test]
+    async fn decide_access_and_audit_records_not_entitled_and_unknown_gateway_reasons() {
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
         let store = PolicyStore::new();
@@ -434,9 +434,10 @@ mod tests {
             ))
             .unwrap();
 
-        let not_entitled = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost");
+        let not_entitled =
+            decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost").await;
         let unknown_gateway =
-            decide_access_and_audit(&store, &audit_log, "gw-UNKNOWN", "device-key-1");
+            decide_access_and_audit(&store, &audit_log, "gw-UNKNOWN", "device-key-1").await;
 
         assert_eq!(
             not_entitled,
@@ -455,14 +456,15 @@ mod tests {
         assert_eq!(entries[1]["reason"], "unknown_gateway");
     }
 
-    #[test]
-    fn decide_access_and_audit_still_returns_the_decision_when_the_audit_write_fails() {
+    #[tokio::test]
+    async fn decide_access_and_audit_still_returns_the_decision_when_the_audit_write_fails() {
         // Audit logging is best-effort (see the comment on decide_access_and_audit) -
         // a write failure must not swallow or change the actual access decision.
         let audit_log = AuditLog::new("/this/path/does/not/exist/and/cannot/be/created/audit.log");
         let store = PolicyStore::new();
 
-        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost");
+        let decision =
+            decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost").await;
 
         assert_eq!(
             decision,
@@ -470,13 +472,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decide_access_and_audit_records_a_refused_decision_with_its_reason() {
+    #[tokio::test]
+    async fn decide_access_and_audit_records_a_refused_decision_with_its_reason() {
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
         let store = PolicyStore::new();
 
-        let decision = decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost");
+        let decision =
+            decide_access_and_audit(&store, &audit_log, "gw-1", "device-key-ghost").await;
 
         assert_eq!(
             decision,

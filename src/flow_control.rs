@@ -15,7 +15,7 @@
 //! `control_plane_listen_addr` is configured to, which is the honest
 //! current limitation, not a security design.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -27,22 +27,22 @@ use serde::{Deserialize, Serialize};
 use crate::access::{AccessDecision, decide_access_and_audit};
 use crate::audit::{AuditEvent, AuditLog};
 use crate::crypto;
+use crate::flow_table::FlowTable;
 use crate::policy::PolicyStore;
+use crate::signature_binding::SignatureBindingGuard;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FlowAdmissionRequest {
     pub flow_id: String,
     pub gateway_id: String,
-    /// Not consulted by this slice - node routing/audit context only, per
-    /// the agreed contract's schema. Present so the JSON shape matches what
-    /// Gatekeeper actually sends.
-    #[allow(dead_code)]
+    /// Which node this flow's traffic arrives on - together with `port`,
+    /// identifies the flow for the real packet-forwarding loops to gate on
+    /// (`flow_table`, TT-1732 review, Tasneem finding #1).
     pub node_id: String,
-    /// NAT/routing bookkeeping (spec §B.8) is a later slice once real
-    /// traffic forwarding exists; `flow_id` is the real key for this slice
-    /// (matching by `port` alone is exactly the reuse race the contract
-    /// discussion flagged).
-    #[allow(dead_code)]
+    /// The translated source port Gatekeeper's NAT assigned this flow (spec
+    /// §B.8) - `flow_table`'s real key alongside `node_id`, now that real
+    /// packet forwarding gates on flow admission instead of forwarding
+    /// anything with a learned route.
     pub port: u16,
     pub user_public_key: String,
     pub signature: String,
@@ -69,6 +69,8 @@ pub struct FlowReleaseRequest {
 pub struct ControlPlaneState {
     pub policy_store: Arc<PolicyStore>,
     pub audit_log: Arc<AuditLog>,
+    pub signature_binding: Arc<Mutex<SignatureBindingGuard>>,
+    pub flow_table: Arc<Mutex<FlowTable>>,
 }
 
 pub fn router(state: ControlPlaneState) -> Router {
@@ -82,18 +84,25 @@ async fn admit_flow(
     State(state): State<ControlPlaneState>,
     Json(request): Json<FlowAdmissionRequest>,
 ) -> Json<FlowAdmissionResponse> {
-    Json(handle_flow_admission(
-        &state.policy_store,
-        &state.audit_log,
-        request,
-    ))
+    Json(
+        handle_flow_admission(
+            &state.policy_store,
+            &state.audit_log,
+            &state.signature_binding,
+            &state.flow_table,
+            request,
+        )
+        .await,
+    )
 }
 
 /// Extracted from the axum handler so it's directly unit-testable without
 /// going through HTTP extraction.
-fn handle_flow_admission(
+async fn handle_flow_admission(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
+    signature_binding: &Mutex<SignatureBindingGuard>,
+    flow_table: &Mutex<FlowTable>,
     request: FlowAdmissionRequest,
 ) -> FlowAdmissionResponse {
     // Authentication first (spec §B.9): proves possession of user_public_key,
@@ -107,12 +116,51 @@ fn handle_flow_admission(
         // This is itself a deny decision (acceptance criteria: "Connector...
         // makes an allow/deny decision... a local audit entry is recorded"),
         // not just an early exit - best-effort, same as decide_access_and_audit.
-        if let Err(error) = audit_log.record(AuditEvent::AccessRefused {
-            gateway_id: request.gateway_id.clone(),
-            device_public_key: request.user_public_key.clone(),
-            reason: "invalid_signature".to_string(),
-        }) {
+        if let Err(error) = audit_log
+            .record(AuditEvent::AccessRefused {
+                gateway_id: request.gateway_id.clone(),
+                device_public_key: request.user_public_key.clone(),
+                reason: "invalid_signature".to_string(),
+            })
+            .await
+        {
             tracing::error!(%error, "failed to write invalid-signature audit entry");
+        }
+        return FlowAdmissionResponse {
+            flow_id: request.flow_id,
+            decision: "refuse".to_string(),
+            reason: Some("invalid_signature".to_string()),
+        };
+    }
+
+    // A cryptographically valid signature can still be a captured one being
+    // replayed against a gateway it was never presented for (TT-1732
+    // review, Tasneem) - refused with the same wire-level reason as any
+    // other signature problem, since from the caller's perspective it's
+    // still "your signature doesn't check out for this request" (the fixed
+    // wire vocabulary has no dedicated "replay" value; see
+    // `signature_binding`'s module doc for why this can't bind to
+    // flow_id/node_id/port instead).
+    let bound_to_this_gateway = {
+        let mut guard = signature_binding
+            .lock()
+            .expect("signature binding guard lock poisoned");
+        guard.check_and_bind(
+            &request.user_public_key,
+            &request.signature,
+            &request.gateway_id,
+        )
+    };
+    if !bound_to_this_gateway {
+        if let Err(error) = audit_log
+            .record(AuditEvent::AccessRefused {
+                gateway_id: request.gateway_id.clone(),
+                device_public_key: request.user_public_key.clone(),
+                reason: "signature_reused_for_different_gateway".to_string(),
+            })
+            .await
+        {
+            tracing::error!(%error, "failed to write signature-replay audit entry");
         }
         return FlowAdmissionResponse {
             flow_id: request.flow_id,
@@ -126,14 +174,29 @@ fn handle_flow_admission(
         audit_log,
         &request.gateway_id,
         &request.user_public_key,
-    );
+    )
+    .await;
 
     match decision {
-        AccessDecision::Allowed { .. } => FlowAdmissionResponse {
-            flow_id: request.flow_id,
-            decision: "admit".to_string(),
-            reason: None,
-        },
+        AccessDecision::Allowed { .. } => {
+            // The real forwarding loops (`main`) only learn a route and
+            // forward traffic for a (node_id, port) pair present here -
+            // this is what actually closes TT-1732 review finding #1 ("a
+            // refused, or never checked, device's traffic could still be
+            // forwarded once its IP was learned"): nothing is forwardable
+            // until it's recorded as admitted right here.
+            flow_table.lock().expect("flow table lock poisoned").admit(
+                request.node_id.clone(),
+                request.port,
+                request.gateway_id.clone(),
+                request.flow_id.clone(),
+            );
+            FlowAdmissionResponse {
+                flow_id: request.flow_id,
+                decision: "admit".to_string(),
+                reason: None,
+            }
+        }
         AccessDecision::Refused(reason) => FlowAdmissionResponse {
             flow_id: request.flow_id,
             decision: "refuse".to_string(),
@@ -146,7 +209,12 @@ async fn release_flow(
     State(state): State<ControlPlaneState>,
     Json(request): Json<FlowReleaseRequest>,
 ) -> impl IntoResponse {
-    handle_flow_release(&state.audit_log, request);
+    state
+        .flow_table
+        .lock()
+        .expect("flow table lock poisoned")
+        .release(&request.flow_id);
+    handle_flow_release(&state.audit_log, request).await;
     StatusCode::NO_CONTENT
 }
 
@@ -155,11 +223,14 @@ async fn release_flow(
 /// there's nothing to release yet. For now this closes the loop on the
 /// acceptance criteria's audit requirement ("Local audit is written... the
 /// action completes").
-fn handle_flow_release(audit_log: &AuditLog, request: FlowReleaseRequest) {
-    if let Err(error) = audit_log.record(AuditEvent::FlowReleased {
-        flow_id: request.flow_id,
-        gateway_id: request.gateway_id,
-    }) {
+async fn handle_flow_release(audit_log: &AuditLog, request: FlowReleaseRequest) {
+    if let Err(error) = audit_log
+        .record(AuditEvent::FlowReleased {
+            flow_id: request.flow_id,
+            gateway_id: request.gateway_id,
+        })
+        .await
+    {
         tracing::error!(%error, "failed to write flow-release audit entry");
     }
 }
@@ -222,8 +293,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admits_an_entitled_devices_correctly_signed_flow() {
+    fn signature_binding() -> Mutex<SignatureBindingGuard> {
+        Mutex::new(SignatureBindingGuard::new())
+    }
+
+    fn flow_table() -> Mutex<FlowTable> {
+        Mutex::new(FlowTable::new())
+    }
+
+    #[tokio::test]
+    async fn admits_an_entitled_devices_correctly_signed_flow() {
         let device = crypto::generate_keypair();
         let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
         let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
@@ -234,7 +313,14 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(&store, &audit_log, request);
+        let response = handle_flow_admission(
+            &store,
+            &audit_log,
+            &signature_binding(),
+            &flow_table(),
+            request,
+        )
+        .await;
 
         assert_eq!(
             response,
@@ -246,8 +332,180 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refuses_a_flow_with_an_invalid_signature_before_ever_checking_entitlement() {
+    #[tokio::test]
+    async fn an_admitted_flow_is_recorded_in_the_flow_table_for_the_real_forwarding_loops_to_gate_on()
+     {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+
+        assert_eq!(
+            table.lock().unwrap().gateway_for("n-1", 51820),
+            Some("gw-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_flow_is_never_recorded_in_the_flow_table() {
+        let device = crypto::generate_keypair();
+        // Not entitled - the admission decision refuses.
+        let store = store_with_entitled_device("gw-1", "u-1", "some-other-device-key");
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+
+        assert!(table.lock().unwrap().gateway_for("n-1", 51820).is_none());
+    }
+
+    #[tokio::test]
+    async fn releasing_a_flow_removes_it_from_the_flow_table() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+        assert!(table.lock().unwrap().gateway_for("n-1", 51820).is_some());
+
+        table.lock().unwrap().release("flow-1");
+
+        assert!(table.lock().unwrap().gateway_for("n-1", 51820).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_same_session_signature_admits_a_second_flow_to_the_same_gateway() {
+        // The spec's own model: signed_data is signed once per Gatekeeper
+        // session, not per flow - reusing it for a second flow to the SAME
+        // gateway within that session is legitimate, not a replay.
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let binding = signature_binding();
+        let mut request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        let first =
+            handle_flow_admission(&store, &audit_log, &binding, &flow_table(), request.clone())
+                .await;
+        request.flow_id = "flow-2".to_string();
+        let second =
+            handle_flow_admission(&store, &audit_log, &binding, &flow_table(), request).await;
+
+        assert_eq!(first.decision, "admit");
+        assert_eq!(second.decision, "admit");
+    }
+
+    #[tokio::test]
+    async fn the_same_session_signature_replayed_for_a_different_gateway_is_refused() {
+        let device = crypto::generate_keypair();
+        // Entitled to BOTH gateways, so a refusal here can only be the
+        // replay guard - not a coincidental entitlement failure.
+        let store = PolicyStore::new();
+        store
+            .apply(ConnectorHeartbeatResponse {
+                connector_id: "c-1".to_string(),
+                generated_at: "2026-08-27T10:00:00Z".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                nonce: "n1".to_string(),
+                policy_bundles: vec![
+                    PolicyBundle {
+                        gateway_id: "gw-1".to_string(),
+                        location: "Amsterdam".to_string(),
+                        hostname: "crm.internal.example.com".to_string(),
+                        access_mode: "SELECTED_USERS".to_string(),
+                        endpoints: vec![PolicyBundleEndpoint {
+                            host: "10.0.0.5".to_string(),
+                            port: 443,
+                        }],
+                        entitlement_list: vec![Entitlement {
+                            user_id: "u-1".to_string(),
+                            device_public_key: device.public_key_hex.clone(),
+                        }],
+                    },
+                    PolicyBundle {
+                        gateway_id: "gw-2".to_string(),
+                        location: "Amsterdam".to_string(),
+                        hostname: "erp.internal.example.com".to_string(),
+                        access_mode: "SELECTED_USERS".to_string(),
+                        endpoints: vec![PolicyBundleEndpoint {
+                            host: "10.0.0.6".to_string(),
+                            port: 443,
+                        }],
+                        entitlement_list: vec![Entitlement {
+                            user_id: "u-1".to_string(),
+                            device_public_key: device.public_key_hex.clone(),
+                        }],
+                    },
+                ],
+                node_list: vec![],
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let binding = signature_binding();
+        let first_request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+        let mut replayed_request = first_request.clone();
+        replayed_request.gateway_id = "gw-2".to_string();
+        replayed_request.flow_id = "flow-2".to_string();
+
+        let first =
+            handle_flow_admission(&store, &audit_log, &binding, &flow_table(), first_request).await;
+        let replayed = handle_flow_admission(
+            &store,
+            &audit_log,
+            &binding,
+            &flow_table(),
+            replayed_request,
+        )
+        .await;
+
+        assert_eq!(first.decision, "admit");
+        assert_eq!(replayed.decision, "refuse");
+        assert_eq!(replayed.reason, Some("invalid_signature".to_string()));
+
+        let entries: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("audit.log"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries[1]["reason"],
+            "signature_reused_for_different_gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_flow_with_an_invalid_signature_before_ever_checking_entitlement() {
         let device = crypto::generate_keypair();
         let impostor = crypto::generate_keypair();
         // Store has this device entitled - proves the refusal is really about
@@ -264,7 +522,14 @@ mod tests {
         );
         request.user_public_key = device.public_key_hex.clone();
 
-        let response = handle_flow_admission(&store, &audit_log, request);
+        let response = handle_flow_admission(
+            &store,
+            &audit_log,
+            &signature_binding(),
+            &flow_table(),
+            request,
+        )
+        .await;
 
         assert_eq!(
             response,
@@ -289,8 +554,8 @@ mod tests {
         assert_eq!(entry["device_public_key"], device.public_key_hex);
     }
 
-    #[test]
-    fn refuses_a_correctly_signed_but_unentitled_device() {
+    #[tokio::test]
+    async fn refuses_a_correctly_signed_but_unentitled_device() {
         let device = crypto::generate_keypair();
         let store = store_with_entitled_device("gw-1", "u-1", "some-other-device-key");
         let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
@@ -301,7 +566,14 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(&store, &audit_log, request);
+        let response = handle_flow_admission(
+            &store,
+            &audit_log,
+            &signature_binding(),
+            &flow_table(),
+            request,
+        )
+        .await;
 
         assert_eq!(
             response,
@@ -313,8 +585,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refuses_an_unknown_gateway_with_the_wire_level_reason() {
+    #[tokio::test]
+    async fn refuses_an_unknown_gateway_with_the_wire_level_reason() {
         let device = crypto::generate_keypair();
         let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
         let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
@@ -325,14 +597,21 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(&store, &audit_log, request);
+        let response = handle_flow_admission(
+            &store,
+            &audit_log,
+            &signature_binding(),
+            &flow_table(),
+            request,
+        )
+        .await;
 
         assert_eq!(response.decision, "refuse");
         assert_eq!(response.reason, Some("unknown_gateway".to_string()));
     }
 
-    #[test]
-    fn refuses_when_no_policy_has_ever_been_applied_using_the_not_entitled_wire_value() {
+    #[tokio::test]
+    async fn refuses_when_no_policy_has_ever_been_applied_using_the_not_entitled_wire_value() {
         let device = crypto::generate_keypair();
         let store = PolicyStore::new();
         let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
@@ -343,7 +622,14 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(&store, &audit_log, request);
+        let response = handle_flow_admission(
+            &store,
+            &audit_log,
+            &signature_binding(),
+            &flow_table(),
+            request,
+        )
+        .await;
 
         // NoPolicyApplied has no dedicated wire value - collapses to
         // not_entitled (see RefusalReason::as_wire_str).
@@ -351,8 +637,8 @@ mod tests {
         assert_eq!(response.reason, Some("not_entitled".to_string()));
     }
 
-    #[test]
-    fn release_records_an_audit_entry_and_the_router_returns_204() {
+    #[tokio::test]
+    async fn release_records_an_audit_entry_and_the_router_returns_204() {
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
         handle_flow_release(
@@ -362,7 +648,8 @@ mod tests {
                 gateway_id: "gw-1".to_string(),
                 port: 51820,
             },
-        );
+        )
+        .await;
 
         let entries: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("audit.log"))
             .unwrap()
@@ -373,8 +660,8 @@ mod tests {
         assert_eq!(entries[0]["flow_id"], "flow-1");
     }
 
-    #[test]
-    fn release_does_not_panic_when_the_audit_write_fails() {
+    #[tokio::test]
+    async fn release_does_not_panic_when_the_audit_write_fails() {
         // Best-effort, same as everywhere else audit writes happen - a bad
         // path must not crash the release handler.
         let audit_log = AuditLog::new("/this/path/does/not/exist/and/cannot/be/created/audit.log");
@@ -386,7 +673,8 @@ mod tests {
                 gateway_id: "gw-1".to_string(),
                 port: 51820,
             },
-        );
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -397,6 +685,8 @@ mod tests {
         let state = ControlPlaneState {
             policy_store: Arc::new(store),
             audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
+            signature_binding: Arc::new(signature_binding()),
+            flow_table: Arc::new(flow_table()),
         };
         let app = router(state);
 

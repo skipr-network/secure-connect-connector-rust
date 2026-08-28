@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -33,6 +34,15 @@ use crate::dto::HeartbeatNode;
 /// fleet uses the standard port, same as any ordinary WireGuard deployment;
 /// nothing found so far suggests a different convention.
 pub(crate) const WIREGUARD_PORT: u16 = 51820;
+
+/// Mirrors boringtun's own `REJECT_AFTER_TIME` (`noise::timers`, `pub(crate)`
+/// there so not importable here) - a WireGuard session is no longer usable
+/// once this much time has passed since its last successful handshake. Kept
+/// in sync here so `NodeTunnel::is_established` stays consistent with when
+/// boringtun itself actually considers the session dead, rather than "a
+/// handshake completed at some point in this process's lifetime, however
+/// long ago" (TT-1732 review, Tasneem).
+const SESSION_REJECT_AFTER: Duration = Duration::from_secs(180);
 
 /// Outcome of feeding a tunnel a network event, translated from boringtun's
 /// borrowed `TunnResult` into owned bytes so callers don't fight lifetimes.
@@ -70,6 +80,10 @@ pub struct NodeTunnel {
     /// packet's source address is reachable through (TT-1827).
     pub node_id: String,
     pub addr: SocketAddr,
+    /// The base64 WireGuard public key this tunnel was built with - compared
+    /// against each heartbeat's reported key so `sync_nodes` can detect a
+    /// rotation and rebuild rather than silently keep dialing a stale key.
+    key_base64: String,
 }
 
 impl NodeTunnel {
@@ -92,11 +106,28 @@ impl NodeTunnel {
             .into()
     }
 
-    /// A session has completed its handshake at least once. Per
-    /// `Tunn::stats`'s own doc comment, the first element is "time since
-    /// last handshake" - `None` until one has actually succeeded.
+    /// A session has completed a handshake *and that session is still within
+    /// its validity window* - not just "a handshake succeeded at some point
+    /// in this process's lifetime", which per `Tunn::stats`'s own doc
+    /// comment (element 0: time since last handshake, `None` until one has
+    /// ever succeeded) would stay `true` forever after the first handshake,
+    /// even long after the session has actually expired and nothing is
+    /// re-dialing it (TT-1732 review, Tasneem - see `drive_timers`, which
+    /// must be called periodically for boringtun to proactively rekey
+    /// before this window closes).
     pub fn is_established(&self) -> bool {
-        self.tunn.stats().0.is_some()
+        matches!(self.tunn.stats().0, Some(elapsed) if elapsed < SESSION_REJECT_AFTER)
+    }
+
+    /// Drives this tunnel's internal WireGuard timers - keepalives,
+    /// proactive rekeying, and session-expiry detection. Must be called
+    /// periodically (boringtun's own documented convention: roughly once
+    /// per second) or a session silently goes stale with nothing to notice
+    /// or recover it (TT-1732 review, Tasneem: `Tunn::update_timers` was
+    /// never called anywhere in this codebase before this fix).
+    pub fn drive_timers(&mut self) -> TunnelEvent {
+        let mut buf = [0u8; 2048];
+        self.tunn.update_timers(&mut buf).into()
     }
 
     /// Encrypts an outbound IP packet (read from the TUN device) for sending
@@ -122,6 +153,40 @@ pub fn parse_source_address(packet: &[u8]) -> Option<IpAddr> {
     }
 }
 
+/// Parses the source TCP/UDP port from a raw IPv4/IPv6 packet - the field
+/// that identifies which admitted flow a decrypted packet belongs to (spec
+/// §B.8: "distinguished by translated source port", `flow_table`). Same
+/// pragmatic scope as `parse_source_address`: IPv4 accounts for a variable
+/// IHL, IPv6 assumes no extension headers. `None` for anything that isn't
+/// TCP or UDP, or too short to contain a port field - callers must treat
+/// that as "can't identify a flow" (refuse), never as "no flow" (allow).
+pub fn parse_source_port(packet: &[u8]) -> Option<u16> {
+    let first_byte = *packet.first()?;
+    let (protocol, l4_offset) = match first_byte >> 4 {
+        4 => {
+            let ihl = usize::from(first_byte & 0x0F) * 4;
+            if ihl < 20 || packet.len() < ihl + 4 {
+                return None;
+            }
+            (*packet.get(9)?, ihl)
+        }
+        6 => {
+            if packet.len() < 44 {
+                return None;
+            }
+            (*packet.get(6)?, 40)
+        }
+        _ => return None,
+    };
+    // 6 = TCP, 17 = UDP - both have source port as the first two bytes of
+    // their header, so no protocol-specific parsing is needed beyond this.
+    if protocol != 6 && protocol != 17 {
+        return None;
+    }
+    let port_bytes: [u8; 2] = packet.get(l4_offset..l4_offset + 2)?.try_into().ok()?;
+    Some(u16::from_be_bytes(port_bytes))
+}
+
 /// Builds and maintains one `NodeTunnel` per node currently reachable in the
 /// Connector's Location, from the identity established in TT-1822.
 pub struct TunnelManager {
@@ -136,6 +201,21 @@ pub struct TunnelManager {
     /// addressing scheme for the Connector<->Node leg, so routing return
     /// traffic by "which node did we last hear this IP from" is the
     /// defensible minimum rather than inventing an unagreed addressing plan.
+    ///
+    /// **Only ever populated for admitted traffic** (TT-1732 review,
+    /// Tasneem findings #1/#8): `main`'s receive loop checks `flow_table`
+    /// before ever calling `learn_route`, so this map can no longer be
+    /// poisoned by arbitrary/unauthenticated decrypted traffic the way it
+    /// could before that gate existed. **Known residual scope, not solved
+    /// here**: this key is still a bare `IpAddr`, not scoped per
+    /// `gateway_id` - if two *different*, currently-active Private Gateways
+    /// sharing one Connector had genuinely overlapping internal IP ranges,
+    /// a later admitted flow's `learn_route` call would still overwrite an
+    /// earlier one's entry for that address. Resolving that fully needs
+    /// real per-gateway virtual addressing (Gatekeeper's job, spec §B.8,
+    /// not yet built - TT-1733) or full stateful NAT/connection tracking,
+    /// neither of which exists anywhere in this fleet yet; flagged
+    /// explicitly rather than silently declared solved.
     routes: HashMap<IpAddr, String>,
 }
 
@@ -153,10 +233,15 @@ impl TunnelManager {
 
     /// Adds a tunnel for each node with a reported WireGuard key that isn't
     /// already configured, and drops tunnels for nodes no longer in the
-    /// list. Deliberately leaves existing tunnels for still-present nodes
-    /// untouched - rebuilding one would throw away an established session
-    /// (and restart the handshake) for no reason. A node whose key fails to
-    /// decode is logged and skipped, not fatal to the rest of the sync.
+    /// list. A still-present node whose reported key or IP is unchanged from
+    /// what its existing tunnel was built with is left alone entirely -
+    /// rebuilding it would throw away an established session (and restart
+    /// the handshake) for no reason. But a still-present node whose key or
+    /// IP *did* change (a rotation) is rebuilt - otherwise the Connector
+    /// would keep dialing a stale address/key indefinitely (TT-1732 review,
+    /// Tasneem). A node whose key fails to decode is logged and skipped, not
+    /// fatal to the rest of the sync - and never tears down a working
+    /// existing tunnel just because a rebuild attempt failed.
     pub fn sync_nodes(&mut self, nodes: &[HeartbeatNode]) {
         let mut seen = HashSet::new();
         for node in nodes {
@@ -164,9 +249,22 @@ impl TunnelManager {
                 continue;
             };
             seen.insert(node.node_id.clone());
-            if self.tunnels.contains_key(&node.node_id) {
-                continue;
+
+            if let Some(existing) = self.tunnels.get(&node.node_id) {
+                let addr_unchanged = node
+                    .ip_address
+                    .parse::<IpAddr>()
+                    .map(|ip| SocketAddr::new(ip, WIREGUARD_PORT) == existing.addr)
+                    .unwrap_or(false);
+                if addr_unchanged && existing.key_base64 == *wireguard_public_key {
+                    continue;
+                }
+                tracing::info!(
+                    node_id = %node.node_id,
+                    "node's WireGuard key or address changed - rebuilding its tunnel"
+                );
             }
+
             match self.build_tunnel(node, wireguard_public_key) {
                 Ok(tunnel) => {
                     self.tunnels.insert(node.node_id.clone(), tunnel);
@@ -213,6 +311,7 @@ impl TunnelManager {
             tunn,
             node_id: node.node_id.clone(),
             addr: SocketAddr::new(ip, WIREGUARD_PORT),
+            key_base64: public_key_base64.to_string(),
         })
     }
 
@@ -230,6 +329,21 @@ impl TunnelManager {
     #[allow(dead_code)]
     pub fn node_count(&self) -> usize {
         self.tunnels.len()
+    }
+
+    /// Drives every tunnel's WireGuard timers and collects any resulting
+    /// packets to send - called periodically from `main` (TT-1732 review,
+    /// Tasneem). Returns owned data rather than borrowing tunnels out, so
+    /// the caller can send without holding this manager's own lock across
+    /// the network `.await`.
+    pub fn drive_all_timers(&mut self) -> Vec<(Vec<u8>, SocketAddr)> {
+        let mut packets = Vec::new();
+        for tunnel in self.tunnels.values_mut() {
+            if let TunnelEvent::SendToNode(packet) = tunnel.drive_timers() {
+                packets.push((packet, tunnel.addr));
+            }
+        }
+        packets
     }
 
     /// Records that `source_ip` is reachable via `node_id`'s tunnel - called
@@ -347,6 +461,55 @@ mod tests {
     }
 
     #[test]
+    fn sync_nodes_rebuilds_a_tunnel_when_a_still_present_nodes_key_rotates() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let old_key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&old_key))]);
+        manager.tunnel_for("n-1").unwrap().initiate_handshake();
+        assert_eq!(manager.node_count(), 1);
+
+        let new_key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&new_key))]);
+
+        assert_eq!(manager.node_count(), 1);
+        // A freshly-built tunnel has no handshake in progress yet, so it
+        // produces a real initiation packet again rather than Nothing - the
+        // old (stale-keyed) tunnel's in-progress state was discarded.
+        let event = manager.tunnel_for("n-1").unwrap().initiate_handshake();
+        assert!(matches!(event, TunnelEvent::SendToNode(_)));
+    }
+
+    #[test]
+    fn sync_nodes_rebuilds_a_tunnel_when_a_still_present_nodes_ip_rotates() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        let old_addr = manager.tunnel_for("n-1").unwrap().addr;
+
+        manager.sync_nodes(&[node("n-1", "10.0.0.99", Some(&key))]);
+
+        let new_addr = manager.tunnel_for("n-1").unwrap().addr;
+        assert_ne!(new_addr, old_addr);
+        assert_eq!(new_addr.ip().to_string(), "10.0.0.99");
+    }
+
+    #[test]
+    fn sync_nodes_leaves_an_existing_tunnel_alone_when_the_reported_key_and_ip_are_unchanged() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        manager.tunnel_for("n-1").unwrap().initiate_handshake();
+
+        // Same node_id, same IP, same key - a second, identical sync.
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        // A rebuilt tunnel would not yet have a handshake in progress; this
+        // one does, proving it's still the same tunnel instance.
+        let event = manager.tunnel_for("n-1").unwrap().initiate_handshake();
+        assert_eq!(event, TunnelEvent::Nothing);
+    }
+
+    #[test]
     fn sync_nodes_drops_a_tunnel_for_a_node_no_longer_present() {
         let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
         let key = random_public_key_base64();
@@ -379,6 +542,67 @@ mod tests {
     }
 
     #[test]
+    fn is_established_is_false_before_any_handshake() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        assert!(!manager.tunnel_for("n-1").unwrap().is_established());
+    }
+
+    #[test]
+    fn drive_timers_on_an_unestablished_tunnel_does_not_panic() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        // No assertion on the exact event - boringtun's own behavior before
+        // any handshake has been attempted; this just proves the plumbing
+        // (drive_timers callable on a fresh tunnel) doesn't crash.
+        manager.tunnel_for("n-1").unwrap().drive_timers();
+    }
+
+    #[test]
+    fn drive_all_timers_returns_no_packets_when_no_tunnels_exist() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+
+        assert!(manager.drive_all_timers().is_empty());
+    }
+
+    #[test]
+    fn drive_all_timers_does_not_immediately_resend_a_freshly_established_session() {
+        let connector_secret = WgStaticSecret::random_from_rng(OsRng);
+        let connector_public = PublicKey::from(&connector_secret);
+        let node_secret = WgStaticSecret::random_from_rng(OsRng);
+        let node_public = PublicKey::from(&node_secret);
+
+        let mut connector_manager = TunnelManager::new(connector_secret);
+        connector_manager.sync_nodes(&[node(
+            "n-1",
+            "127.0.0.1",
+            Some(&BASE64.encode(node_public.as_bytes())),
+        )]);
+        let connector_side = connector_manager.tunnel_for("n-1").unwrap();
+        let mut node_side = Tunn::new(node_secret, connector_public, None, None, 0, None);
+
+        let handshake_init = match connector_side.initiate_handshake() {
+            TunnelEvent::SendToNode(bytes) => bytes,
+            other => panic!("expected a handshake-initiation packet, got {other:?}"),
+        };
+        let mut buf = [0u8; 2048];
+        let handshake_response = match node_side.decapsulate(None, &handshake_init, &mut buf) {
+            TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
+            other => panic!("expected the node to respond, got {other:?}"),
+        };
+        connector_side.receive(&handshake_response);
+        assert!(connector_side.is_established());
+
+        // Immediately after establishment, nothing needs rekeying or a
+        // keepalive yet.
+        assert!(connector_manager.drive_all_timers().is_empty());
+    }
+
+    #[test]
     fn parse_source_address_reads_an_ipv4_header() {
         // A minimal 20-byte IPv4 header: version/IHL, then bytes up to the
         // source address field (offset 12-16), destination (16-20) unused
@@ -407,6 +631,61 @@ mod tests {
     fn parse_source_address_returns_none_for_a_truncated_or_empty_packet() {
         assert_eq!(parse_source_address(&[]), None);
         assert_eq!(parse_source_address(&[0x45, 0, 0]), None);
+    }
+
+    fn udp_packet_with_source_port(source_port: u16) -> Vec<u8> {
+        // Minimal 20-byte IPv4 header (IHL=5, protocol=17/UDP) followed by
+        // an 8-byte UDP header whose first 2 bytes are the source port.
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn parse_source_port_reads_a_udp_ipv4_packets_source_port() {
+        let packet = udp_packet_with_source_port(40001);
+
+        assert_eq!(parse_source_port(&packet), Some(40001));
+    }
+
+    #[test]
+    fn parse_source_port_reads_a_tcp_ipv4_packets_source_port() {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[9] = 6; // TCP
+        packet[20..22].copy_from_slice(&51234u16.to_be_bytes());
+
+        assert_eq!(parse_source_port(&packet), Some(51234));
+    }
+
+    #[test]
+    fn parse_source_port_accounts_for_a_non_default_ipv4_header_length() {
+        // IHL=6 (24-byte header, i.e. one 4-byte options word) - the source
+        // port must be read from offset 24, not the default offset 20.
+        let mut packet = vec![0u8; 32];
+        packet[0] = 0x46;
+        packet[9] = 17;
+        packet[24..26].copy_from_slice(&12345u16.to_be_bytes());
+
+        assert_eq!(parse_source_port(&packet), Some(12345));
+    }
+
+    #[test]
+    fn parse_source_port_returns_none_for_a_non_tcp_udp_protocol() {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 1; // ICMP
+        packet[20..22].copy_from_slice(&40001u16.to_be_bytes());
+
+        assert_eq!(parse_source_port(&packet), None);
+    }
+
+    #[test]
+    fn parse_source_port_returns_none_for_a_truncated_or_empty_packet() {
+        assert_eq!(parse_source_port(&[]), None);
+        assert_eq!(parse_source_port(&[0x45, 0, 0, 0, 0, 0, 0, 0, 0, 17]), None);
     }
 
     #[test]

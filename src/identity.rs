@@ -76,6 +76,22 @@ fn load(path: &Path) -> Result<ConnectorIdentity> {
         )
     })?;
 
+    // The two lines are meant to be a matched pair - if the file was ever
+    // partially written, manually edited, or corrupted, using the stored
+    // public key as-is without checking it against the secret would mean
+    // this Connector announces (and Portal registers) a public key that
+    // doesn't correspond to what it actually uses for the WireGuard
+    // handshake - a Connector that can never establish a tunnel, without any
+    // error until nodes silently refuse a handshake from an unrecognized
+    // peer (TT-1732 review, Tasneem).
+    let derived_public_key_base64 = encode_public_base64(&PublicKey::from(&secret));
+    if derived_public_key_base64 != public_key_base64 {
+        anyhow::bail!(
+            "identity key file at {} is corrupt: the stored public key does not match the one derived from the stored private key",
+            path.display()
+        );
+    }
+
     Ok(ConnectorIdentity {
         secret,
         public_key_base64,
@@ -194,6 +210,28 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("identity.key");
         fs::write(&path, "not-a-valid-base64-seed\n").unwrap();
+
+        assert!(load_or_generate(&path).is_err());
+    }
+
+    #[test]
+    fn rejects_a_key_file_whose_public_key_does_not_match_its_private_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        // A genuinely valid private key, paired with a genuinely valid but
+        // *different* public key - the file is well-formed, just corrupt.
+        let real_secret = StaticSecret::random_from_rng(OsRng);
+        let mismatched_secret = StaticSecret::random_from_rng(OsRng);
+        let mismatched_public_base64 = encode_public_base64(&PublicKey::from(&mismatched_secret));
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                encode_secret_base64(&real_secret),
+                mismatched_public_base64
+            ),
+        )
+        .unwrap();
 
         assert!(load_or_generate(&path).is_err());
     }

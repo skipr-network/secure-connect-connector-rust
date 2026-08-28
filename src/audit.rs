@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -59,45 +59,62 @@ pub struct AuditLog {
     // concurrent record() calls from interleaving mid-line, it isn't a
     // cross-process lock (each heartbeat/access decision opens in append
     // mode, which is atomic for a single write() up to PIPE_BUF on unix).
-    write_lock: Mutex<()>,
+    // Arc'd so it - and `path` - can move into the `spawn_blocking` closure
+    // below, which requires 'static.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl AuditLog {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            write_lock: Mutex::new(()),
+            write_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    pub fn record(&self, event: AuditEvent) -> Result<()> {
-        self.record_at(event, Utc::now())
+    /// Async so the actual (blocking) file I/O runs via `spawn_blocking`
+    /// rather than directly on a Tokio worker thread - `record` is called
+    /// from network-reachable axum handlers (`flow_control`'s admission/
+    /// release), where blocking the runtime thread on disk I/O would stall
+    /// unrelated in-flight requests sharing that worker (TT-1732 review,
+    /// Tasneem). `spawn_blocking`, not `block_in_place`: the latter only
+    /// works on the multi-threaded runtime - `main`'s does qualify, but
+    /// `#[tokio::test]` defaults to the *single-threaded* runtime, and this
+    /// method has no way to know which kind of runtime its caller is on.
+    pub async fn record(&self, event: AuditEvent) -> Result<()> {
+        self.record_at(event, Utc::now()).await
     }
 
-    fn record_at(&self, event: AuditEvent, now: DateTime<Utc>) -> Result<()> {
+    async fn record_at(&self, event: AuditEvent, now: DateTime<Utc>) -> Result<()> {
         let record = AuditRecord {
             timestamp: now.to_rfc3339(),
             event: &event,
         };
         let line = serde_json::to_string(&record).context("failed to serialize audit record")?;
 
-        let _guard = self.write_lock.lock().expect("audit log lock poisoned");
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create audit log directory: {}", parent.display())
-            })?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open audit log file: {}", self.path.display()))?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to write audit entry to {}", self.path.display()))?;
+        let path = self.path.clone();
+        let write_lock = self.write_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = write_lock.lock().expect("audit log lock poisoned");
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create audit log directory: {}", parent.display())
+                })?;
+            }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("failed to open audit log file: {}", path.display()))?;
+            writeln!(file, "{line}")
+                .with_context(|| format!("failed to write audit entry to {}", path.display()))?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("audit log write task panicked")??;
         Ok(())
     }
 }
@@ -116,8 +133,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn records_a_policy_applied_event_with_a_timestamp() {
+    #[tokio::test]
+    async fn records_a_policy_applied_event_with_a_timestamp() {
         let dir = tempdir().unwrap();
         let log = AuditLog::new(dir.path().join("audit.log"));
         let now = DateTime::parse_from_rfc3339("2026-08-27T10:00:00Z")
@@ -132,6 +149,7 @@ mod tests {
             },
             now,
         )
+        .await
         .unwrap();
 
         let entries = read_lines(&dir.path().join("audit.log"));
@@ -143,14 +161,15 @@ mod tests {
         assert_eq!(entries[0]["node_count"], 3);
     }
 
-    #[test]
-    fn records_a_policy_rejected_event() {
+    #[tokio::test]
+    async fn records_a_policy_rejected_event() {
         let dir = tempdir().unwrap();
         let log = AuditLog::new(dir.path().join("audit.log"));
 
         log.record(AuditEvent::PolicyRejected {
             reason: "heartbeat package expired".to_string(),
         })
+        .await
         .unwrap();
 
         let entries = read_lines(&dir.path().join("audit.log"));
@@ -158,8 +177,8 @@ mod tests {
         assert_eq!(entries[0]["reason"], "heartbeat package expired");
     }
 
-    #[test]
-    fn records_access_allowed_and_refused_events() {
+    #[tokio::test]
+    async fn records_access_allowed_and_refused_events() {
         let dir = tempdir().unwrap();
         let log = AuditLog::new(dir.path().join("audit.log"));
 
@@ -168,12 +187,14 @@ mod tests {
             user_id: "u-1".to_string(),
             device_public_key: "device-key-1".to_string(),
         })
+        .await
         .unwrap();
         log.record(AuditEvent::AccessRefused {
             gateway_id: "gw-1".to_string(),
             device_public_key: "device-key-ghost".to_string(),
             reason: "not_entitled".to_string(),
         })
+        .await
         .unwrap();
 
         let entries = read_lines(&dir.path().join("audit.log"));
@@ -183,8 +204,8 @@ mod tests {
         assert_eq!(entries[1]["reason"], "not_entitled");
     }
 
-    #[test]
-    fn records_a_flow_released_event() {
+    #[tokio::test]
+    async fn records_a_flow_released_event() {
         let dir = tempdir().unwrap();
         let log = AuditLog::new(dir.path().join("audit.log"));
 
@@ -192,6 +213,7 @@ mod tests {
             flow_id: "flow-1".to_string(),
             gateway_id: "gw-1".to_string(),
         })
+        .await
         .unwrap();
 
         let entries = read_lines(&dir.path().join("audit.log"));
@@ -199,8 +221,8 @@ mod tests {
         assert_eq!(entries[0]["flow_id"], "flow-1");
     }
 
-    #[test]
-    fn appends_across_multiple_record_calls_without_truncating() {
+    #[tokio::test]
+    async fn appends_across_multiple_record_calls_without_truncating() {
         let dir = tempdir().unwrap();
         let log = AuditLog::new(dir.path().join("audit.log"));
 
@@ -210,6 +232,7 @@ mod tests {
                 user_id: format!("u-{index}"),
                 device_public_key: format!("device-key-{index}"),
             })
+            .await
             .unwrap();
         }
 
@@ -218,8 +241,8 @@ mod tests {
         assert_eq!(entries[4]["user_id"], "u-4");
     }
 
-    #[test]
-    fn creates_missing_parent_directories() {
+    #[tokio::test]
+    async fn creates_missing_parent_directories() {
         let dir = tempdir().unwrap();
         let nested_path = dir.path().join("nested/deeper/audit.log");
         let log = AuditLog::new(&nested_path);
@@ -227,18 +250,21 @@ mod tests {
         log.record(AuditEvent::PolicyRejected {
             reason: "test".to_string(),
         })
+        .await
         .unwrap();
 
         assert!(nested_path.exists());
     }
 
-    #[test]
-    fn errors_when_the_path_has_no_writable_parent() {
+    #[tokio::test]
+    async fn errors_when_the_path_has_no_writable_parent() {
         let log = AuditLog::new("/this/path/does/not/exist/and/cannot/be/created/audit.log");
 
-        let result = log.record(AuditEvent::PolicyRejected {
-            reason: "test".to_string(),
-        });
+        let result = log
+            .record(AuditEvent::PolicyRejected {
+                reason: "test".to_string(),
+            })
+            .await;
 
         assert!(result.is_err());
     }

@@ -4,14 +4,17 @@ mod config;
 mod crypto;
 mod dto;
 mod flow_control;
+mod flow_table;
 mod heartbeat;
 mod identity;
 mod policy;
 mod registry_client;
+mod signature_binding;
 mod tun_device;
 mod tunnel;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use audit::{AuditEvent, AuditLog};
@@ -19,6 +22,7 @@ use boringtun::noise::Tunn;
 use config::Config;
 use dto::HeartbeatNode;
 use flow_control::ControlPlaneState;
+use flow_table::FlowTable;
 use heartbeat::HeartbeatClient;
 use policy::PolicyStore;
 use registry_client::RegistryClient;
@@ -67,16 +71,25 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to create the Connector's TUN device")?;
     info!(tun_addr = %config.tun_addr, tun_netmask = %config.tun_netmask, "TUN device ready");
 
+    // Shared with the flow-admission control plane below: only a
+    // (node_id, port) pair recorded here by an actual "admit" decision may
+    // have its packets learned/forwarded (TT-1732 review, Tasneem finding
+    // #1 - real packet forwarding never consulted access decisions before
+    // this fix).
+    let flow_table = Arc::new(std::sync::Mutex::new(FlowTable::new()));
+
     tokio::spawn(run_wireguard_receive_loop(
         wg_socket.clone(),
         tunnel_manager.clone(),
         tun_writer,
+        flow_table.clone(),
     ));
     tokio::spawn(run_tun_send_loop(
         tun_reader,
         wg_socket.clone(),
         tunnel_manager.clone(),
     ));
+    tokio::spawn(run_timer_loop(wg_socket.clone(), tunnel_manager.clone()));
 
     let control_plane_listener = tokio::net::TcpListener::bind(&config.control_plane_listen_addr)
         .await
@@ -93,6 +106,10 @@ async fn main() -> anyhow::Result<()> {
     let control_plane_router = flow_control::router(ControlPlaneState {
         policy_store: policy_store.clone(),
         audit_log: audit_log.clone(),
+        signature_binding: Arc::new(std::sync::Mutex::new(
+            signature_binding::SignatureBindingGuard::new(),
+        )),
+        flow_table: flow_table.clone(),
     });
     tokio::spawn(async move {
         if let Err(error) = axum::serve(control_plane_listener, control_plane_router).await {
@@ -159,7 +176,7 @@ async fn run_heartbeat(
             reason: error.to_string(),
         },
     };
-    if let Err(audit_error) = audit_log.record(audit_event) {
+    if let Err(audit_error) = audit_log.record(audit_event).await {
         error!(error = %audit_error, "failed to write policy audit entry");
     }
 
@@ -182,26 +199,39 @@ async fn run_heartbeat(
 /// handshake for any node that doesn't have an established session yet.
 /// Established tunnels are left alone entirely - re-dialing them would
 /// discard a working session for no reason.
+///
+/// Collects the handshake packets to send *while* holding the
+/// `tunnel_manager` lock (mutating each tunnel's state needs `&mut`), then
+/// releases the lock before actually sending anything - the lock must never
+/// be held across a network `.await`, or it serializes this heartbeat
+/// dial-out against unrelated live traffic forwarding sharing the same
+/// `TunnelManager` (TT-1732 review, Tasneem).
 async fn dial_new_nodes(
     tunnel_manager: &Mutex<TunnelManager>,
     wg_socket: &UdpSocket,
     nodes: &[HeartbeatNode],
 ) {
-    let mut manager = tunnel_manager.lock().await;
-    manager.sync_nodes(nodes);
+    let mut handshakes_to_send = Vec::new();
+    {
+        let mut manager = tunnel_manager.lock().await;
+        manager.sync_nodes(nodes);
 
-    for node in nodes {
-        let Some(tunnel) = manager.tunnel_for(&node.node_id) else {
-            continue;
-        };
-        if tunnel.is_established() {
-            continue;
-        }
-        if let TunnelEvent::SendToNode(packet) = tunnel.initiate_handshake() {
-            let addr = tunnel.addr;
-            if let Err(error) = wg_socket.send_to(&packet, addr).await {
-                error!(%error, node_id = %node.node_id, %addr, "failed to send WireGuard handshake initiation");
+        for node in nodes {
+            let Some(tunnel) = manager.tunnel_for(&node.node_id) else {
+                continue;
+            };
+            if tunnel.is_established() {
+                continue;
             }
+            if let TunnelEvent::SendToNode(packet) = tunnel.initiate_handshake() {
+                handshakes_to_send.push((packet, tunnel.addr, node.node_id.clone()));
+            }
+        }
+    }
+
+    for (packet, addr, node_id) in handshakes_to_send {
+        if let Err(error) = wg_socket.send_to(&packet, addr).await {
+            error!(%error, %node_id, %addr, "failed to send WireGuard handshake initiation");
         }
     }
 }
@@ -211,13 +241,19 @@ async fn dial_new_nodes(
 /// that tunnel, and either sends back whatever the tunnel produces in
 /// response (e.g. the initiator's post-handshake keepalive) or, for real
 /// decrypted payload data (TT-1827), learns the route and writes it to the
-/// TUN device so the OS's own IP stack delivers it onward. Runs for the
+/// TUN device so the OS's own IP stack delivers it onward - but only for a
+/// flow `flow_table` actually admitted (TT-1732 review, Tasneem finding #1:
+/// decrypting successfully proves the packet came from a genuine node
+/// tunnel, but says nothing about whether Gatekeeper's flow-admission relay
+/// ever admitted this specific device/gateway; before this fix, ANY
+/// decrypted traffic was learned and forwarded regardless). Runs for the
 /// lifetime of the process; a single receive error is logged and the loop
 /// continues - one bad datagram must not take down every node's tunnel.
 async fn run_wireguard_receive_loop(
     wg_socket: Arc<UdpSocket>,
     tunnel_manager: Arc<Mutex<TunnelManager>>,
     mut tun_writer: tun_device::TunWriter,
+    flow_table: Arc<std::sync::Mutex<FlowTable>>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -235,19 +271,48 @@ async fn run_wireguard_receive_loop(
             continue;
         };
         let node_id = tunnel.node_id.clone();
+        let event = tunnel.receive(&buf[..len]);
+        // Mutating manager state (learn_route) happens here, still under the
+        // lock; the lock is released below, before any of this event's
+        // branches do actual network/TUN I/O - it must never be held across
+        // an `.await` (TT-1732 review, Tasneem).
+        let mut forwardable = false;
+        if let TunnelEvent::DecryptedData(ref packet) = event {
+            match (
+                tunnel::parse_source_address(packet),
+                tunnel::parse_source_port(packet),
+            ) {
+                (Some(source_ip), Some(source_port)) => {
+                    let is_admitted = flow_table
+                        .lock()
+                        .expect("flow table lock poisoned")
+                        .gateway_for(&node_id, source_port)
+                        .is_some();
+                    if is_admitted {
+                        manager.learn_route(&node_id, source_ip);
+                        forwardable = true;
+                    } else {
+                        warn!(
+                            %node_id, %source_ip, source_port,
+                            "decrypted packet has no matching admitted flow - dropping"
+                        );
+                    }
+                }
+                _ => {
+                    warn!(%node_id, "decrypted packet has no parseable source address/port - dropping");
+                }
+            }
+        }
+        drop(manager);
 
-        match tunnel.receive(&buf[..len]) {
+        match event {
             TunnelEvent::SendToNode(packet) => {
                 if let Err(error) = wg_socket.send_to(&packet, src).await {
                     error!(%error, %src, "failed to send WireGuard response packet");
                 }
             }
             TunnelEvent::DecryptedData(packet) => {
-                if let Some(source_ip) = tunnel::parse_source_address(&packet) {
-                    manager.learn_route(&node_id, source_ip);
-                }
-                drop(manager);
-                if let Err(error) = tun_writer.write_packet(&packet).await {
+                if forwardable && let Err(error) = tun_writer.write_packet(&packet).await {
                     error!(%error, node_id = %node_id, "failed to write decrypted packet to TUN device");
                 }
             }
@@ -287,11 +352,38 @@ async fn run_tun_send_loop(
             warn!(%destination_ip, "no known route for outbound packet - dropping");
             continue;
         };
+        let event = tunnel.encapsulate(&buf[..len]);
+        let addr = tunnel.addr;
+        // Released before the send below - must never be held across a
+        // network `.await` (TT-1732 review, Tasneem).
+        drop(manager);
 
-        if let TunnelEvent::SendToNode(packet) = tunnel.encapsulate(&buf[..len]) {
-            let addr = tunnel.addr;
+        if let TunnelEvent::SendToNode(packet) = event
+            && let Err(error) = wg_socket.send_to(&packet, addr).await
+        {
+            error!(%error, %addr, %destination_ip, "failed to send encrypted outbound packet");
+        }
+    }
+}
+
+/// Periodically drives every tunnel's WireGuard timers - required for
+/// sessions to stay alive at all; boringtun does nothing on its own to
+/// rekey or detect expiry unless this is called regularly (TT-1732 review,
+/// Tasneem: `Tunn::update_timers` was never called anywhere before this
+/// fix, so a session would silently go stale after a few minutes and never
+/// be re-dialed). Interval matches boringtun's own documented usage
+/// convention of roughly once per second.
+async fn run_timer_loop(wg_socket: Arc<UdpSocket>, tunnel_manager: Arc<Mutex<TunnelManager>>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let packets = {
+            let mut manager = tunnel_manager.lock().await;
+            manager.drive_all_timers()
+        };
+        for (packet, addr) in packets {
             if let Err(error) = wg_socket.send_to(&packet, addr).await {
-                error!(%error, %addr, %destination_ip, "failed to send encrypted outbound packet");
+                error!(%error, %addr, "failed to send WireGuard timer-driven packet");
             }
         }
     }
@@ -300,7 +392,6 @@ async fn run_tun_send_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
