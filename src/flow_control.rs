@@ -6,14 +6,19 @@
 //!
 //! Transport-agnostic on purpose: this module only builds the axum `Router`
 //! and its handlers, fully testable without a real socket - `main` binds it
-//! to `Config::control_plane_listen_addr`. What's *meant* to actually
-//! restrict these endpoints to genuine Gatekeeper peers is that the tunnel
-//! network isn't reachable from anywhere else (Konyk's final comment on
-//! TT-1732), but nothing yet binds this to a real WireGuard-tunnel-internal
-//! address - TT-1823 only establishes the session, not a routable virtual
-//! interface - so today it's reachable at whatever
-//! `control_plane_listen_addr` is configured to, which is the honest
-//! current limitation, not a security design.
+//! to `Config::control_plane_listen_addr`. What actually restricts these
+//! endpoints to genuine Gatekeeper peers is that the tunnel network isn't
+//! reachable from anywhere else (Konyk's final comment on TT-1732) - and
+//! since TT-1838, that's a real guarantee rather than an aspiration:
+//! `control_plane_listen_addr` binds to `connector_virtual_ip`, the
+//! Connector's own address on its TUN interface, which only receives
+//! traffic that arrived through an established WireGuard session with a
+//! node whose wg0 `allowed-ips` includes this Connector's address
+//! specifically (Gatekeeper's `WireGuardPeerProvisioner`, TT-1838). Before
+//! that, nothing bound this listener to a real WireGuard-tunnel-internal
+//! address, so it was reachable at whatever address the process happened to
+//! be configured with - an honest limitation, not a security design, and
+//! now closed.
 
 use std::sync::{Arc, Mutex};
 
@@ -253,6 +258,7 @@ mod tests {
         store
             .apply(ConnectorHeartbeatResponse {
                 connector_id: "c-1".to_string(),
+                connector_virtual_ip: Some("10.98.0.1".to_string()),
                 generated_at: "2026-08-27T10:00:00Z".to_string(),
                 expires_at: "2099-01-01T00:00:00Z".to_string(),
                 nonce: "n1".to_string(),
@@ -429,6 +435,7 @@ mod tests {
         store
             .apply(ConnectorHeartbeatResponse {
                 connector_id: "c-1".to_string(),
+                connector_virtual_ip: Some("10.98.0.1".to_string()),
                 generated_at: "2026-08-27T10:00:00Z".to_string(),
                 expires_at: "2099-01-01T00:00:00Z".to_string(),
                 nonce: "n1".to_string(),

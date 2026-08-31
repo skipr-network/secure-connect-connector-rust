@@ -30,14 +30,9 @@ pub struct Config {
     /// establishes the session, not a routable virtual address). A plain
     /// configurable bind address is the honest stand-in until that exists.
     pub control_plane_listen_addr: String,
-    /// The Connector's own address on its TUN interface (TT-1827) - real
-    /// packet forwarding needs *some* local address for the OS to route
-    /// through, but nothing in the spec or the agreed contract defines a
-    /// Connector<->Node virtual addressing scheme. `10.99.0.1/24` is a
-    /// private (RFC 1918), otherwise-unused-in-this-codebase default,
-    /// documented as an assumption the same way `WIREGUARD_PORT` is -
-    /// override via env if it ever collides with something real.
-    pub tun_addr: Ipv4Addr,
+    /// Netmask for the Connector's TUN interface - the address itself is no longer a local
+    /// config concern (TT-1838): it's `connector_virtual_ip`, learned from the first successful
+    /// heartbeat (Portal's own registered, per-Connector address), not guessed here.
     pub tun_netmask: Ipv4Addr,
 }
 
@@ -63,10 +58,6 @@ impl Config {
             ),
             control_plane_listen_addr: env::var("CONNECTOR_CONTROL_PLANE_LISTEN_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:8443".to_string()),
-            tun_addr: env::var("CONNECTOR_TUN_ADDR")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(Ipv4Addr::new(10, 99, 0, 1)),
             tun_netmask: env::var("CONNECTOR_TUN_NETMASK")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -131,7 +122,6 @@ mod tests {
             "CONNECTOR_IDENTITY_KEY_PATH",
             "CONNECTOR_AUDIT_LOG_PATH",
             "CONNECTOR_CONTROL_PLANE_LISTEN_ADDR",
-            "CONNECTOR_TUN_ADDR",
             "CONNECTOR_TUN_NETMASK",
             "HEARTBEAT_INTERVAL_SECONDS",
         ] {
@@ -241,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_the_tun_addr_and_netmask() {
+    fn defaults_the_tun_netmask() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -253,13 +243,12 @@ mod tests {
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.tun_addr, Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(config.tun_netmask, Ipv4Addr::new(255, 255, 255, 0));
         clear_all();
     }
 
     #[test]
-    fn reads_a_configured_tun_addr_and_netmask() {
+    fn reads_a_configured_tun_netmask() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -267,32 +256,12 @@ mod tests {
             env::set_var("AGENT_BASE_URL", "https://agent.example.com");
             env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
-            env::set_var("CONNECTOR_TUN_ADDR", "10.5.0.1");
             env::set_var("CONNECTOR_TUN_NETMASK", "255.255.0.0");
         }
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.tun_addr, Ipv4Addr::new(10, 5, 0, 1));
         assert_eq!(config.tun_netmask, Ipv4Addr::new(255, 255, 0, 0));
-        clear_all();
-    }
-
-    #[test]
-    fn falls_back_to_the_default_tun_addr_when_the_env_value_is_unparseable() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_all();
-        unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
-            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
-            env::set_var("CONNECTOR_TUN_ADDR", "not-an-ip");
-        }
-
-        let config = Config::from_env().unwrap();
-
-        assert_eq!(config.tun_addr, Ipv4Addr::new(10, 99, 0, 1));
         clear_all();
     }
 

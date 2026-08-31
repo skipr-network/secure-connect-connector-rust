@@ -178,6 +178,7 @@ mod tests {
     fn response(expires_at: &str, bundles: Vec<PolicyBundle>) -> ConnectorHeartbeatResponse {
         ConnectorHeartbeatResponse {
             connector_id: "c-1".to_string(),
+            connector_virtual_ip: Some("10.98.0.1".to_string()),
             generated_at: "2026-08-27T10:00:00Z".to_string(),
             expires_at: expires_at.to_string(),
             nonce: "n1".to_string(),
