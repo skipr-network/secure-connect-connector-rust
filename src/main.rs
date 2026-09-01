@@ -63,6 +63,13 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to bind the WireGuard UDP socket")?,
     );
 
+    // Shared with the flow-admission control plane below: only a (node_id, port) pair recorded
+    // here by an actual "admit" decision may have its packets forwarded (TT-1732 review, Tasneem
+    // finding #1). Created before the startup heartbeat loop below (not after, like the TUN
+    // device) since run_heartbeat's node-dialing needs it too, to evict a departed node's flows
+    // (TT-1732 review, Tasneem, TT-1847 finding #1).
+    let flow_table = Arc::new(std::sync::Mutex::new(FlowTable::new()));
+
     // TT-1838: the TUN device's own address is connector_virtual_ip - Portal's registered,
     // per-Connector control-channel address - not a locally guessed default anymore, so it can
     // only be known once the first heartbeat succeeds. Retries at the configured heartbeat
@@ -78,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await
         {
@@ -103,13 +111,6 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to create the Connector's TUN device")?;
     info!(tun_addr = %connector_virtual_ip, tun_netmask = %config.tun_netmask, "TUN device ready");
 
-    // Shared with the flow-admission control plane below: only a
-    // (node_id, port) pair recorded here by an actual "admit" decision may
-    // have its packets learned/forwarded (TT-1732 review, Tasneem finding
-    // #1 - real packet forwarding never consulted access decisions before
-    // this fix).
-    let flow_table = Arc::new(std::sync::Mutex::new(FlowTable::new()));
-
     tokio::spawn(run_wireguard_receive_loop(
         wg_socket.clone(),
         tunnel_manager.clone(),
@@ -121,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         tun_reader,
         wg_socket.clone(),
         tunnel_manager.clone(),
+        flow_table.clone(),
     ));
     tokio::spawn(run_timer_loop(wg_socket.clone(), tunnel_manager.clone()));
 
@@ -168,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await
         {
@@ -194,6 +197,10 @@ async fn main() -> anyhow::Result<()> {
 /// nothing local can guess it anymore (Portal is the sole source of truth). `None` means Portal
 /// hasn't assigned one yet (or an older Agent didn't relay it) - not an error in itself, but
 /// `main`'s startup loop treats it as "not ready" and keeps retrying.
+// Each param is a genuinely distinct dependency this function needs (not an arbitrary pile) -
+// bundling them into a struct would just move the same count into a constructor call at every
+// site instead of removing it.
+#[allow(clippy::too_many_arguments)]
 async fn run_heartbeat(
     config: &Config,
     registry_client: &RegistryClient,
@@ -202,6 +209,7 @@ async fn run_heartbeat(
     audit_log: &AuditLog,
     tunnel_manager: &Mutex<TunnelManager>,
     wg_socket: &UdpSocket,
+    flow_table: &std::sync::Mutex<FlowTable>,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
     let agent_public_key = registry_client
         .get_agent_permitted_key(&config.agent_ip_address)
@@ -258,7 +266,7 @@ async fn run_heartbeat(
         );
     }
 
-    dial_new_nodes(tunnel_manager, wg_socket, &node_list).await;
+    dial_new_nodes(tunnel_manager, wg_socket, &node_list, flow_table).await;
 
     Ok(connector_virtual_ip)
 }
@@ -266,7 +274,8 @@ async fn run_heartbeat(
 /// Syncs the tunnel set to this heartbeat's node list, then kicks off a
 /// handshake for any node that doesn't have an established session yet.
 /// Established tunnels are left alone entirely - re-dialing them would
-/// discard a working session for no reason.
+/// discard a working session for no reason. Also evicts `flow_table`'s
+/// entries for any node this sync dropped (TT-1847 finding #1).
 ///
 /// Collects the handshake packets to send *while* holding the
 /// `tunnel_manager` lock (mutating each tunnel's state needs `&mut`), then
@@ -278,11 +287,12 @@ async fn dial_new_nodes(
     tunnel_manager: &Mutex<TunnelManager>,
     wg_socket: &UdpSocket,
     nodes: &[HeartbeatNode],
+    flow_table: &std::sync::Mutex<FlowTable>,
 ) {
     let mut handshakes_to_send = Vec::new();
-    {
+    let dropped = {
         let mut manager = tunnel_manager.lock().await;
-        manager.sync_nodes(nodes);
+        let dropped = manager.sync_nodes(nodes);
 
         for node in nodes {
             let Some(tunnel) = manager.tunnel_for(&node.node_id) else {
@@ -294,6 +304,18 @@ async fn dial_new_nodes(
             if let TunnelEvent::SendToNode(packet) = tunnel.initiate_handshake() {
                 handshakes_to_send.push((packet, tunnel.addr, node.node_id.clone()));
             }
+        }
+        dropped
+    };
+
+    // A node this Connector no longer has a tunnel for can't have its flows released cleanly by
+    // Gatekeeper either - evict them here instead of leaving permanent ghost entries (TT-1732
+    // review, Tasneem, TT-1847 finding #1).
+    if !dropped.is_empty() {
+        let mut table = flow_table.lock().expect("flow table lock poisoned");
+        for node_id in &dropped {
+            info!(%node_id, "node no longer present in heartbeat's node list - evicting its admitted flows");
+            table.evict_node(node_id);
         }
     }
 
@@ -315,12 +337,11 @@ async fn dial_new_nodes(
 ///   release control channel, always forwarded - see the inline comment at
 ///   the gate for why no flow_table check applies here.
 /// - Addressed anywhere else: forwarded traffic for admitted user flows,
-///   still gated on `flow_table` and still learns the route (TT-1827,
-///   TT-1732 review, Tasneem finding #1: decrypting successfully proves the
-///   packet came from a genuine node tunnel, but says nothing about whether
-///   Gatekeeper's flow-admission relay ever admitted this specific
-///   device/gateway; before that fix, ANY decrypted traffic was learned and
-///   forwarded regardless).
+///   still gated on `flow_table` (TT-1827, TT-1732 review, Tasneem finding
+///   #1: decrypting successfully proves the packet came from a genuine node
+///   tunnel, but says nothing about whether Gatekeeper's flow-admission
+///   relay ever admitted this specific device/gateway; before that fix, ANY
+///   decrypted traffic was forwarded regardless).
 ///
 /// Runs for the lifetime of the process; a single receive error is logged
 /// and the loop continues - one bad datagram must not take down every
@@ -349,10 +370,8 @@ async fn run_wireguard_receive_loop(
         };
         let node_id = tunnel.node_id.clone();
         let event = tunnel.receive(&buf[..len]);
-        // Mutating manager state (learn_route) happens here, still under the
-        // lock; the lock is released below, before any of this event's
-        // branches do actual network/TUN I/O - it must never be held across
-        // an `.await` (TT-1732 review, Tasneem).
+        drop(manager);
+
         let mut forwardable = false;
         if let TunnelEvent::DecryptedData(ref packet) = event {
             if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
@@ -366,33 +385,28 @@ async fn run_wireguard_receive_loop(
                 // wg0 allowed-ips include it.
                 forwardable = true;
             } else {
-                match (
-                    tunnel::parse_source_address(packet),
-                    tunnel::parse_source_port(packet),
-                ) {
-                    (Some(source_ip), Some(source_port)) => {
+                match tunnel::parse_source_port(packet) {
+                    Some(source_port) => {
                         let is_admitted = flow_table
                             .lock()
                             .expect("flow table lock poisoned")
                             .gateway_for(&node_id, source_port)
                             .is_some();
                         if is_admitted {
-                            manager.learn_route(&node_id, source_ip);
                             forwardable = true;
                         } else {
                             warn!(
-                                %node_id, %source_ip, source_port,
+                                %node_id, source_port,
                                 "decrypted packet has no matching admitted flow - dropping"
                             );
                         }
                     }
-                    _ => {
-                        warn!(%node_id, "decrypted packet has no parseable source address/port - dropping");
+                    None => {
+                        warn!(%node_id, "decrypted packet has no parseable source port - dropping");
                     }
                 }
             }
         }
-        drop(manager);
 
         match event {
             TunnelEvent::SendToNode(packet) => {
@@ -414,14 +428,20 @@ async fn run_wireguard_receive_loop(
 }
 
 /// Reads outbound IP packets the OS routed to the TUN device (e.g. return
-/// traffic from an internal endpoint), looks up which node's tunnel can
-/// reach that destination, and encrypts+sends it there. A destination with
-/// no learned route is dropped - there's genuinely nowhere defensible to
-/// send it, not a bug to work around.
+/// traffic from an internal endpoint) and encrypts+sends each one to the
+/// right node's tunnel (TT-1847). The destination *address* on this leg is
+/// a masqueraded wg0 address identical across the whole fleet (`flow_table`'s
+/// module doc) and carries no node identity - the destination *port* is the
+/// only reliable signal left, resolved back to a node through `flow_table`'s
+/// own admission state (told explicitly by Gatekeeper, never inferred from
+/// traffic). A port with no unambiguous admitted node - never admitted, or
+/// currently admitted on two different nodes at once - is dropped: there's
+/// genuinely nowhere defensible to send it, not a bug to work around.
 async fn run_tun_send_loop(
     mut tun_reader: tun_device::TunReader,
     wg_socket: Arc<UdpSocket>,
     tunnel_manager: Arc<Mutex<TunnelManager>>,
+    flow_table: Arc<std::sync::Mutex<FlowTable>>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -432,13 +452,32 @@ async fn run_tun_send_loop(
                 continue;
             }
         };
-        let Some(destination_ip) = Tunn::dst_address(&buf[..len]) else {
+        let Some(destination_port) = tunnel::parse_destination_port(&buf[..len]) else {
             continue;
         };
 
+        // tunnel_manager is locked FIRST, and flow_table is looked up while still holding it, so
+        // the admission check and the tunnel lookup are atomic with respect to each other - no
+        // window where a concurrent release or node departure could invalidate node_id between
+        // resolving it and using it (TT-1732 review, Tasneem, TT-1847 finding #2). flow_table's
+        // std::sync::Mutex is only ever held for the synchronous lookup below, never across an
+        // `.await`.
         let mut manager = tunnel_manager.lock().await;
-        let Some(tunnel) = manager.route_for(destination_ip) else {
-            warn!(%destination_ip, "no known route for outbound packet - dropping");
+        let node_id = {
+            let table = flow_table.lock().expect("flow table lock poisoned");
+            match table.node_for_port(destination_port) {
+                Some(node_id) => node_id.to_string(),
+                None => {
+                    warn!(
+                        destination_port,
+                        "no unambiguous admitted node for outbound packet's port - dropping"
+                    );
+                    continue;
+                }
+            }
+        };
+        let Some(tunnel) = manager.tunnel_for(&node_id) else {
+            warn!(%node_id, destination_port, "admitted node has no active tunnel - dropping");
             continue;
         };
         let event = tunnel.encapsulate(&buf[..len]);
@@ -450,7 +489,7 @@ async fn run_tun_send_loop(
         if let TunnelEvent::SendToNode(packet) = event
             && let Err(error) = wg_socket.send_to(&packet, addr).await
         {
-            error!(%error, %addr, %destination_ip, "failed to send encrypted outbound packet");
+            error!(%error, %addr, %node_id, destination_port, "failed to send encrypted outbound packet");
         }
     }
 }
@@ -551,6 +590,7 @@ mod tests {
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
         let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         let result = run_heartbeat(
             &config,
@@ -560,6 +600,7 @@ mod tests {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await;
 
@@ -612,6 +653,7 @@ mod tests {
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
         let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         let result = run_heartbeat(
             &config,
@@ -621,6 +663,7 @@ mod tests {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await;
 
@@ -647,6 +690,7 @@ mod tests {
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
         let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         let result = run_heartbeat(
             &config,
@@ -656,6 +700,7 @@ mod tests {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await;
 
@@ -705,6 +750,7 @@ mod tests {
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
         let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         let result = run_heartbeat(
             &config,
@@ -714,6 +760,7 @@ mod tests {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await;
 
@@ -762,6 +809,7 @@ mod tests {
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
         let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         let result = run_heartbeat(
             &config,
@@ -771,6 +819,7 @@ mod tests {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await;
 
@@ -819,6 +868,7 @@ mod tests {
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
         let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         // Nodes-without-key is only a warning, not a failure - the cycle still
         // succeeds (there's simply nothing to dial yet for that node).
@@ -830,6 +880,7 @@ mod tests {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await;
 
@@ -896,6 +947,7 @@ mod tests {
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
         let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         let result = run_heartbeat(
             &config,
@@ -905,6 +957,7 @@ mod tests {
             &audit_log,
             &tunnel_manager,
             &wg_socket,
+            &flow_table,
         )
         .await;
 

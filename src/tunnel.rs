@@ -50,8 +50,9 @@ const SESSION_REJECT_AFTER: Duration = Duration::from_secs(180);
 pub enum TunnelEvent {
     /// Bytes that must be sent back out over the socket to this node.
     SendToNode(Vec<u8>),
-    /// Decrypted tunnel payload data - `main`'s receive loop learns a route
-    /// from its source address and writes it to the TUN device (TT-1827).
+    /// Decrypted tunnel payload data - `main`'s receive loop checks it
+    /// against `flow_table` and writes it to the TUN device if admitted
+    /// (TT-1827, TT-1847).
     DecryptedData(Vec<u8>),
     /// Nothing to send, nothing decoded - e.g. a keepalive, or a handshake
     /// already in progress.
@@ -76,8 +77,8 @@ impl From<TunnResult<'_>> for TunnelEvent {
 
 pub struct NodeTunnel {
     tunn: Tunn,
-    /// Read by `main`'s receive loop to learn which node a decrypted
-    /// packet's source address is reachable through (TT-1827).
+    /// Which node this tunnel connects to - the key `flow_table` admission
+    /// state is looked up under (TT-1827, TT-1847).
     pub node_id: String,
     pub addr: SocketAddr,
     /// The base64 WireGuard public key this tunnel was built with - compared
@@ -140,27 +141,14 @@ impl NodeTunnel {
     }
 }
 
-/// Parses the source address from a raw IPv4/IPv6 packet - the counterpart
-/// to `Tunn::dst_address` (which boringtun exposes publicly; there's no
-/// source-address equivalent), needed to learn which node a decrypted
-/// packet's sender is reachable through. Same header byte offsets
-/// boringtun's own (private) parsing uses internally.
-pub fn parse_source_address(packet: &[u8]) -> Option<IpAddr> {
-    match packet.first()? >> 4 {
-        4 if packet.len() >= 20 => Some(IpAddr::from(<[u8; 4]>::try_from(&packet[12..16]).ok()?)),
-        6 if packet.len() >= 40 => Some(IpAddr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?)),
-        _ => None,
-    }
-}
-
-/// Parses the source TCP/UDP port from a raw IPv4/IPv6 packet - the field
-/// that identifies which admitted flow a decrypted packet belongs to (spec
-/// §B.8: "distinguished by translated source port", `flow_table`). Same
-/// pragmatic scope as `parse_source_address`: IPv4 accounts for a variable
-/// IHL, IPv6 assumes no extension headers. `None` for anything that isn't
-/// TCP or UDP, or too short to contain a port field - callers must treat
-/// that as "can't identify a flow" (refuse), never as "no flow" (allow).
-pub fn parse_source_port(packet: &[u8]) -> Option<u16> {
+/// Shared TCP/UDP header parsing for `parse_source_port`/`parse_destination_port` -
+/// `field_offset` is 0 for the source port, 2 for the destination port (the two
+/// fields are adjacent, first 4 bytes of either header). Same pragmatic scope
+/// throughout: IPv4 accounts for a variable IHL, IPv6 assumes no extension
+/// headers. `None` for anything that isn't TCP or UDP, or too short to contain
+/// the requested port field - callers must treat that as "can't identify a
+/// flow" (refuse), never as "no flow" (allow).
+fn parse_l4_port(packet: &[u8], field_offset: usize) -> Option<u16> {
     let first_byte = *packet.first()?;
     let (protocol, l4_offset) = match first_byte >> 4 {
         4 => {
@@ -178,13 +166,33 @@ pub fn parse_source_port(packet: &[u8]) -> Option<u16> {
         }
         _ => return None,
     };
-    // 6 = TCP, 17 = UDP - both have source port as the first two bytes of
-    // their header, so no protocol-specific parsing is needed beyond this.
+    // 6 = TCP, 17 = UDP - both have source/destination port as the first
+    // four bytes of their header, so no protocol-specific parsing is needed
+    // beyond this.
     if protocol != 6 && protocol != 17 {
         return None;
     }
-    let port_bytes: [u8; 2] = packet.get(l4_offset..l4_offset + 2)?.try_into().ok()?;
+    let offset = l4_offset + field_offset;
+    let port_bytes: [u8; 2] = packet.get(offset..offset + 2)?.try_into().ok()?;
     Some(u16::from_be_bytes(port_bytes))
+}
+
+/// Parses the source TCP/UDP port from a raw IPv4/IPv6 packet - the field
+/// that identifies which admitted flow a decrypted packet belongs to (spec
+/// §B.8: "distinguished by translated source port", `flow_table`).
+pub fn parse_source_port(packet: &[u8]) -> Option<u16> {
+    parse_l4_port(packet, 0)
+}
+
+/// Parses the destination TCP/UDP port from a raw IPv4/IPv6 packet - for a
+/// reply packet arriving from the TUN side, this is the same translated port
+/// the original flow was admitted on, and (TT-1847) the only reliable key
+/// left for routing it back to the right node's tunnel: the packet's
+/// destination *address* is a node's masqueraded wg0 address, which is
+/// identical across the whole fleet (`FlowTable`'s own module doc) and so
+/// carries no node identity at all.
+pub fn parse_destination_port(packet: &[u8]) -> Option<u16> {
+    parse_l4_port(packet, 2)
 }
 
 /// Builds and maintains one `NodeTunnel` per node currently reachable in the
@@ -194,29 +202,6 @@ pub struct TunnelManager {
     rate_limiter: Arc<RateLimiter>,
     tunnels: HashMap<String, NodeTunnel>,
     next_index: u32,
-    /// Destination IP -> node_id, learned from the source IP of decrypted
-    /// packets actually received from that node's tunnel (TT-1827). Not a
-    /// statically configured AllowedIPs/addressing table: nothing in the
-    /// spec or the agreed Connector<->Gatekeeper contract defines a virtual
-    /// addressing scheme for the Connector<->Node leg, so routing return
-    /// traffic by "which node did we last hear this IP from" is the
-    /// defensible minimum rather than inventing an unagreed addressing plan.
-    ///
-    /// **Only ever populated for admitted traffic** (TT-1732 review,
-    /// Tasneem findings #1/#8): `main`'s receive loop checks `flow_table`
-    /// before ever calling `learn_route`, so this map can no longer be
-    /// poisoned by arbitrary/unauthenticated decrypted traffic the way it
-    /// could before that gate existed. **Known residual scope, not solved
-    /// here**: this key is still a bare `IpAddr`, not scoped per
-    /// `gateway_id` - if two *different*, currently-active Private Gateways
-    /// sharing one Connector had genuinely overlapping internal IP ranges,
-    /// a later admitted flow's `learn_route` call would still overwrite an
-    /// earlier one's entry for that address. Resolving that fully needs
-    /// real per-gateway virtual addressing (Gatekeeper's job, spec §B.8,
-    /// not yet built - TT-1733) or full stateful NAT/connection tracking,
-    /// neither of which exists anywhere in this fleet yet; flagged
-    /// explicitly rather than silently declared solved.
-    routes: HashMap<IpAddr, String>,
 }
 
 impl TunnelManager {
@@ -227,7 +212,6 @@ impl TunnelManager {
             rate_limiter: Arc::new(RateLimiter::new(&identity_public, 10)),
             tunnels: HashMap::new(),
             next_index: 0,
-            routes: HashMap::new(),
         }
     }
 
@@ -242,7 +226,12 @@ impl TunnelManager {
     /// Tasneem). A node whose key fails to decode is logged and skipped, not
     /// fatal to the rest of the sync - and never tears down a working
     /// existing tunnel just because a rebuild attempt failed.
-    pub fn sync_nodes(&mut self, nodes: &[HeartbeatNode]) {
+    ///
+    /// Returns the node_ids that were dropped by this sync (present before,
+    /// gone now) - `main` uses this to evict their entries from `FlowTable`
+    /// too (TT-1732 review, Tasneem, TT-1847 finding #1), so a flow for a
+    /// node that's simply vanished doesn't linger forever.
+    pub fn sync_nodes(&mut self, nodes: &[HeartbeatNode]) -> Vec<String> {
         let mut seen = HashSet::new();
         for node in nodes {
             let Some(wireguard_public_key) = &node.wireguard_public_key else {
@@ -278,7 +267,14 @@ impl TunnelManager {
                 }
             }
         }
+        let dropped: Vec<String> = self
+            .tunnels
+            .keys()
+            .filter(|node_id| !seen.contains(*node_id))
+            .cloned()
+            .collect();
         self.tunnels.retain(|node_id, _| seen.contains(node_id));
+        dropped
     }
 
     fn build_tunnel(
@@ -344,22 +340,6 @@ impl TunnelManager {
             }
         }
         packets
-    }
-
-    /// Records that `source_ip` is reachable via `node_id`'s tunnel - called
-    /// after successfully decrypting a packet from that node, so return
-    /// traffic (or anything else destined to it) can be routed correctly.
-    pub fn learn_route(&mut self, node_id: &str, source_ip: IpAddr) {
-        self.routes.insert(source_ip, node_id.to_string());
-    }
-
-    /// Looks up which node's tunnel an outbound packet (by its destination
-    /// IP) should be routed through. `None` means we've never seen traffic
-    /// from that address, so there's genuinely nowhere defensible to send
-    /// it - the caller drops the packet rather than guessing.
-    pub fn route_for(&mut self, destination_ip: IpAddr) -> Option<&mut NodeTunnel> {
-        let node_id = self.routes.get(&destination_ip)?.clone();
-        self.tunnels.get_mut(&node_id)
     }
 }
 
@@ -522,6 +502,41 @@ mod tests {
     }
 
     #[test]
+    fn sync_nodes_returns_the_node_ids_it_dropped() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let dropped = manager.sync_nodes(&[]);
+
+        assert_eq!(dropped, vec!["n-1".to_string()]);
+    }
+
+    #[test]
+    fn sync_nodes_returns_nothing_dropped_when_every_node_is_still_present() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let dropped = manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn sync_nodes_does_not_report_a_rebuild_as_a_drop() {
+        // A key/IP rotation rebuilds the tunnel in place - the node is still
+        // present, just reconfigured, not gone.
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let dropped = manager.sync_nodes(&[node("n-1", "10.0.0.99", Some(&key))]);
+
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
     fn sync_nodes_preserves_an_existing_tunnel_for_a_still_present_node_rather_than_rebuilding_it()
     {
         let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
@@ -602,37 +617,6 @@ mod tests {
         assert!(connector_manager.drive_all_timers().is_empty());
     }
 
-    #[test]
-    fn parse_source_address_reads_an_ipv4_header() {
-        // A minimal 20-byte IPv4 header: version/IHL, then bytes up to the
-        // source address field (offset 12-16), destination (16-20) unused
-        // here.
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x45; // version 4, IHL 5
-        packet[12..16].copy_from_slice(&[10, 0, 0, 5]);
-
-        let source = parse_source_address(&packet);
-
-        assert_eq!(source, Some("10.0.0.5".parse().unwrap()));
-    }
-
-    #[test]
-    fn parse_source_address_reads_an_ipv6_header() {
-        let mut packet = vec![0u8; 40];
-        packet[0] = 0x60; // version 6
-        packet[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-
-        let source = parse_source_address(&packet);
-
-        assert_eq!(source, Some("::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn parse_source_address_returns_none_for_a_truncated_or_empty_packet() {
-        assert_eq!(parse_source_address(&[]), None);
-        assert_eq!(parse_source_address(&[0x45, 0, 0]), None);
-    }
-
     fn udp_packet_with_source_port(source_port: u16) -> Vec<u8> {
         // Minimal 20-byte IPv4 header (IHL=5, protocol=17/UDP) followed by
         // an 8-byte UDP header whose first 2 bytes are the source port.
@@ -689,39 +673,56 @@ mod tests {
     }
 
     #[test]
-    fn route_for_returns_none_when_nothing_has_ever_been_learned() {
-        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+    fn parse_destination_port_reads_a_udp_ipv4_packets_destination_port() {
+        // Same fixture as the source-port UDP test, but the destination
+        // port occupies the next 2 bytes (offset 22..24, not 20..22).
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[22..24].copy_from_slice(&51820u16.to_be_bytes());
 
-        let route = manager.route_for("10.0.0.5".parse().unwrap());
-
-        assert!(route.is_none());
+        assert_eq!(parse_destination_port(&packet), Some(51820));
     }
 
     #[test]
-    fn learn_route_then_route_for_finds_the_right_tunnel() {
-        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
-        let key = random_public_key_base64();
-        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
-        let destination: IpAddr = "10.0.0.5".parse().unwrap();
+    fn parse_destination_port_reads_a_tcp_ipv4_packets_destination_port() {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[9] = 6; // TCP
+        packet[22..24].copy_from_slice(&443u16.to_be_bytes());
 
-        manager.learn_route("n-1", destination);
-        let route = manager.route_for(destination);
-
-        assert!(route.is_some());
+        assert_eq!(parse_destination_port(&packet), Some(443));
     }
 
     #[test]
-    fn route_for_returns_none_if_the_learned_nodes_tunnel_was_since_dropped() {
-        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
-        let key = random_public_key_base64();
-        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
-        let destination: IpAddr = "10.0.0.5".parse().unwrap();
-        manager.learn_route("n-1", destination);
+    fn parse_source_and_destination_port_read_different_fields_of_the_same_packet() {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[20..22].copy_from_slice(&40001u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&51820u16.to_be_bytes());
 
-        // The node disappears from a later heartbeat's node_list.
-        manager.sync_nodes(&[]);
+        assert_eq!(parse_source_port(&packet), Some(40001));
+        assert_eq!(parse_destination_port(&packet), Some(51820));
+    }
 
-        assert!(manager.route_for(destination).is_none());
+    #[test]
+    fn parse_destination_port_returns_none_for_a_non_tcp_udp_protocol() {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 1; // ICMP
+        packet[22..24].copy_from_slice(&40001u16.to_be_bytes());
+
+        assert_eq!(parse_destination_port(&packet), None);
+    }
+
+    #[test]
+    fn parse_destination_port_returns_none_for_a_truncated_or_empty_packet() {
+        assert_eq!(parse_destination_port(&[]), None);
+        assert_eq!(
+            parse_destination_port(&[0x45, 0, 0, 0, 0, 0, 0, 0, 0, 17]),
+            None
+        );
     }
 
     #[test]
@@ -785,8 +786,7 @@ mod tests {
         // Now prove real data forwarding over the established session - not
         // just the handshake: a fake IPv4 packet, encrypted by the
         // Connector side, decrypted by the node side, and confirmed to
-        // still contain exactly the source address the Connector would
-        // learn a route from.
+        // still contain exactly the source address it was sent with.
         let mut fake_ip_packet = vec![0u8; 20];
         fake_ip_packet[0] = 0x45;
         fake_ip_packet[2..4].copy_from_slice(&20u16.to_be_bytes()); // total length
@@ -803,10 +803,9 @@ mod tests {
             other => panic!("expected the node to decrypt a tunnel payload, got {other:?}"),
         };
 
+        // Byte-for-byte identity already proves the source address field
+        // (bytes 12..16) round-tripped intact through real encryption and
+        // decryption - no separate field-level assertion needed.
         assert_eq!(decrypted, fake_ip_packet);
-        assert_eq!(
-            parse_source_address(&decrypted),
-            Some("10.99.0.1".parse().unwrap())
-        );
     }
 }
