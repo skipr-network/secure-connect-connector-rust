@@ -22,14 +22,12 @@ pub struct Config {
     /// Konyk's answer (TT-1732 comment thread): 60s default, must stay configurable
     /// and below Agent's 5-minute signature validity window.
     pub heartbeat_interval: Duration,
-    /// Where the flow-admission/release HTTP server (TT-1821) listens. Not
-    /// specified anywhere in the spec or the agreed contract - Konyk's own
-    /// comment says these calls should arrive "inside the already established
-    /// Connector <-> Node private tunnel network", but nothing in this repo
-    /// yet binds to a real WireGuard-tunnel-internal interface (TT-1823 only
-    /// establishes the session, not a routable virtual address). A plain
-    /// configurable bind address is the honest stand-in until that exists.
-    pub control_plane_listen_addr: String,
+    /// Port the flow-admission/release HTTP server (TT-1821) listens on. The
+    /// host half is not configurable (TT-1838): `main` always binds to
+    /// `connector_virtual_ip`, the Connector's own TUN address, which only
+    /// receives traffic that arrived through an established WireGuard
+    /// session - so only the port is left as a knob.
+    pub control_plane_port: u16,
     /// Netmask for the Connector's TUN interface - the address itself is no longer a local
     /// config concern (TT-1838): it's `connector_virtual_ip`, learned from the first successful
     /// heartbeat (Portal's own registered, per-Connector address), not guessed here.
@@ -56,8 +54,10 @@ impl Config {
                 env::var("CONNECTOR_AUDIT_LOG_PATH")
                     .unwrap_or_else(|_| "/var/skipr/connector/audit/audit.log".to_string()),
             ),
-            control_plane_listen_addr: env::var("CONNECTOR_CONTROL_PLANE_LISTEN_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:8443".to_string()),
+            control_plane_port: env::var("CONNECTOR_CONTROL_PLANE_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8443),
             tun_netmask: env::var("CONNECTOR_TUN_NETMASK")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -121,7 +121,7 @@ mod tests {
             "REGISTRY_BASE_URL",
             "CONNECTOR_IDENTITY_KEY_PATH",
             "CONNECTOR_AUDIT_LOG_PATH",
-            "CONNECTOR_CONTROL_PLANE_LISTEN_ADDR",
+            "CONNECTOR_CONTROL_PLANE_PORT",
             "CONNECTOR_TUN_NETMASK",
             "HEARTBEAT_INTERVAL_SECONDS",
         ] {
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_the_control_plane_listen_addr() {
+    fn defaults_the_control_plane_port() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -208,12 +208,12 @@ mod tests {
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.control_plane_listen_addr, "0.0.0.0:8443");
+        assert_eq!(config.control_plane_port, 8443);
         clear_all();
     }
 
     #[test]
-    fn reads_a_configured_control_plane_listen_addr() {
+    fn reads_a_configured_control_plane_port() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -221,12 +221,12 @@ mod tests {
             env::set_var("AGENT_BASE_URL", "https://agent.example.com");
             env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
-            env::set_var("CONNECTOR_CONTROL_PLANE_LISTEN_ADDR", "127.0.0.1:9000");
+            env::set_var("CONNECTOR_CONTROL_PLANE_PORT", "9000");
         }
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.control_plane_listen_addr, "127.0.0.1:9000");
+        assert_eq!(config.control_plane_port, 9000);
         clear_all();
     }
 

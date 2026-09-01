@@ -124,16 +124,18 @@ async fn main() -> anyhow::Result<()> {
     ));
     tokio::spawn(run_timer_loop(wg_socket.clone(), tunnel_manager.clone()));
 
-    let control_plane_listener = tokio::net::TcpListener::bind(&config.control_plane_listen_addr)
+    // TT-1838: bind to connector_virtual_ip itself, not a wildcard/loopback address - this is
+    // what actually restricts these endpoints to genuine Gatekeeper peers (see flow_control.rs's
+    // module doc). Only the port stays configurable.
+    let control_plane_bind_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(connector_virtual_ip),
+        config.control_plane_port,
+    );
+    let control_plane_listener = tokio::net::TcpListener::bind(control_plane_bind_addr)
         .await
-        .with_context(|| {
-            format!(
-                "failed to bind the flow-admission control-plane listener on {}",
-                config.control_plane_listen_addr
-            )
-        })?;
+        .with_context(|| format!("failed to bind the flow-admission control-plane listener on {control_plane_bind_addr}"))?;
     info!(
-        addr = %config.control_plane_listen_addr,
+        addr = %control_plane_bind_addr,
         "flow-admission control plane listening"
     );
     let control_plane_router = flow_control::router(ControlPlaneState {
@@ -158,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     interval.reset();
     loop {
         interval.tick().await;
-        if let Err(error) = run_heartbeat(
+        match run_heartbeat(
             &config,
             &registry_client,
             &heartbeat_client,
@@ -169,7 +171,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         {
-            error!(%error, "heartbeat cycle failed");
+            // A steady-state heartbeat reporting a different connector_virtual_ip than the one
+            // the TUN device and control-plane listener were already created with (TT-1838) -
+            // rebinding either live isn't supported, so this can only be surfaced, not applied.
+            Ok(Some(latest)) if latest != connector_virtual_ip => {
+                error!(
+                    started_with = %connector_virtual_ip,
+                    now_reported = %latest,
+                    "Portal reported a different connector_virtual_ip than the one this process is bound to - restart the Connector to pick it up"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%error, "heartbeat cycle failed");
+            }
         }
     }
 }
@@ -477,7 +492,7 @@ mod tests {
             registry_base_url,
             identity_key_path: "/tmp/unused-in-this-test".into(),
             audit_log_path: "/tmp/unused-in-this-test-audit.log".into(),
-            control_plane_listen_addr: "127.0.0.1:0".to_string(),
+            control_plane_port: 0,
             tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
         }

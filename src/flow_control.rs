@@ -6,19 +6,19 @@
 //!
 //! Transport-agnostic on purpose: this module only builds the axum `Router`
 //! and its handlers, fully testable without a real socket - `main` binds it
-//! to `Config::control_plane_listen_addr`. What actually restricts these
-//! endpoints to genuine Gatekeeper peers is that the tunnel network isn't
-//! reachable from anywhere else (Konyk's final comment on TT-1732) - and
-//! since TT-1838, that's a real guarantee rather than an aspiration:
-//! `control_plane_listen_addr` binds to `connector_virtual_ip`, the
+//! to `connector_virtual_ip:Config::control_plane_port`. What actually
+//! restricts these endpoints to genuine Gatekeeper peers is that the tunnel
+//! network isn't reachable from anywhere else (Konyk's final comment on
+//! TT-1732) - and since TT-1838, that's a real guarantee rather than an
+//! aspiration: the listener binds to `connector_virtual_ip` itself, the
 //! Connector's own address on its TUN interface, which only receives
 //! traffic that arrived through an established WireGuard session with a
 //! node whose wg0 `allowed-ips` includes this Connector's address
 //! specifically (Gatekeeper's `WireGuardPeerProvisioner`, TT-1838). Before
-//! that, nothing bound this listener to a real WireGuard-tunnel-internal
-//! address, so it was reachable at whatever address the process happened to
-//! be configured with - an honest limitation, not a security design, and
-//! now closed.
+//! that, this listener bound to a wildcard/loopback address configured
+//! independently of any tunnel-internal address, so it was reachable at
+//! whatever address the process happened to be configured with - an honest
+//! limitation, not a security design, and now closed.
 
 use std::sync::{Arc, Mutex};
 
