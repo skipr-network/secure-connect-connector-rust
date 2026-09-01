@@ -226,7 +226,12 @@ impl TunnelManager {
     /// Tasneem). A node whose key fails to decode is logged and skipped, not
     /// fatal to the rest of the sync - and never tears down a working
     /// existing tunnel just because a rebuild attempt failed.
-    pub fn sync_nodes(&mut self, nodes: &[HeartbeatNode]) {
+    ///
+    /// Returns the node_ids that were dropped by this sync (present before,
+    /// gone now) - `main` uses this to evict their entries from `FlowTable`
+    /// too (TT-1732 review, Tasneem, TT-1847 finding #1), so a flow for a
+    /// node that's simply vanished doesn't linger forever.
+    pub fn sync_nodes(&mut self, nodes: &[HeartbeatNode]) -> Vec<String> {
         let mut seen = HashSet::new();
         for node in nodes {
             let Some(wireguard_public_key) = &node.wireguard_public_key else {
@@ -262,7 +267,14 @@ impl TunnelManager {
                 }
             }
         }
+        let dropped: Vec<String> = self
+            .tunnels
+            .keys()
+            .filter(|node_id| !seen.contains(*node_id))
+            .cloned()
+            .collect();
         self.tunnels.retain(|node_id, _| seen.contains(node_id));
+        dropped
     }
 
     fn build_tunnel(
@@ -487,6 +499,41 @@ mod tests {
         manager.sync_nodes(&[]);
 
         assert_eq!(manager.node_count(), 0);
+    }
+
+    #[test]
+    fn sync_nodes_returns_the_node_ids_it_dropped() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let dropped = manager.sync_nodes(&[]);
+
+        assert_eq!(dropped, vec!["n-1".to_string()]);
+    }
+
+    #[test]
+    fn sync_nodes_returns_nothing_dropped_when_every_node_is_still_present() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let dropped = manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn sync_nodes_does_not_report_a_rebuild_as_a_drop() {
+        // A key/IP rotation rebuilds the tunnel in place - the node is still
+        // present, just reconfigured, not gone.
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let dropped = manager.sync_nodes(&[node("n-1", "10.0.0.99", Some(&key))]);
+
+        assert!(dropped.is_empty());
     }
 
     #[test]
