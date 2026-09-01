@@ -63,13 +63,45 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to bind the WireGuard UDP socket")?,
     );
 
+    // TT-1838: the TUN device's own address is connector_virtual_ip - Portal's registered,
+    // per-Connector control-channel address - not a locally guessed default anymore, so it can
+    // only be known once the first heartbeat succeeds. Retries at the configured heartbeat
+    // cadence (the same cadence steady-state heartbeats already use) rather than a separate,
+    // invented backoff. The heartbeat's other effects (policy application, node dialing) also
+    // run here on the very first successful attempt - nothing is fetched twice.
+    let connector_virtual_ip = loop {
+        match run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+        )
+        .await
+        {
+            Ok(Some(ip)) => break ip,
+            Ok(None) => {
+                warn!(
+                    "heartbeat succeeded but Portal has not assigned a connector_virtual_ip yet - cannot create the TUN device until it does, retrying"
+                );
+            }
+            Err(error) => {
+                error!(%error, "initial heartbeat failed - cannot create the TUN device until one succeeds, retrying");
+            }
+        }
+        tokio::time::sleep(config.heartbeat_interval).await;
+    };
+
     // Real packet forwarding (TT-1827): needs CAP_NET_ADMIN + /dev/net/tun,
     // proven for real via two Docker containers exchanging genuine ICMP
     // traffic through actual WireGuard encryption before this was wired in
     // (see tunnel.rs's module doc comment).
-    let (tun_reader, tun_writer) = tun_device::create(config.tun_addr, config.tun_netmask, 1400)
-        .context("failed to create the Connector's TUN device")?;
-    info!(tun_addr = %config.tun_addr, tun_netmask = %config.tun_netmask, "TUN device ready");
+    let (tun_reader, tun_writer) =
+        tun_device::create(connector_virtual_ip, config.tun_netmask, 1400)
+            .context("failed to create the Connector's TUN device")?;
+    info!(tun_addr = %connector_virtual_ip, tun_netmask = %config.tun_netmask, "TUN device ready");
 
     // Shared with the flow-admission control plane below: only a
     // (node_id, port) pair recorded here by an actual "admit" decision may
@@ -83,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         tunnel_manager.clone(),
         tun_writer,
         flow_table.clone(),
+        std::net::IpAddr::V4(connector_virtual_ip),
     ));
     tokio::spawn(run_tun_send_loop(
         tun_reader,
@@ -91,16 +124,18 @@ async fn main() -> anyhow::Result<()> {
     ));
     tokio::spawn(run_timer_loop(wg_socket.clone(), tunnel_manager.clone()));
 
-    let control_plane_listener = tokio::net::TcpListener::bind(&config.control_plane_listen_addr)
+    // TT-1838: bind to connector_virtual_ip itself, not a wildcard/loopback address - this is
+    // what actually restricts these endpoints to genuine Gatekeeper peers (see flow_control.rs's
+    // module doc). Only the port stays configurable.
+    let control_plane_bind_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(connector_virtual_ip),
+        config.control_plane_port,
+    );
+    let control_plane_listener = tokio::net::TcpListener::bind(control_plane_bind_addr)
         .await
-        .with_context(|| {
-            format!(
-                "failed to bind the flow-admission control-plane listener on {}",
-                config.control_plane_listen_addr
-            )
-        })?;
+        .with_context(|| format!("failed to bind the flow-admission control-plane listener on {control_plane_bind_addr}"))?;
     info!(
-        addr = %config.control_plane_listen_addr,
+        addr = %control_plane_bind_addr,
         "flow-admission control plane listening"
     );
     let control_plane_router = flow_control::router(ControlPlaneState {
@@ -118,9 +153,14 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mut interval = tokio::time::interval(config.heartbeat_interval);
+    // The startup loop above already ran one successful heartbeat to learn
+    // connector_virtual_ip - without this, interval's own first tick fires
+    // immediately, re-running a heartbeat right away instead of waiting a
+    // full interval like every subsequent one does.
+    interval.reset();
     loop {
         interval.tick().await;
-        if let Err(error) = run_heartbeat(
+        match run_heartbeat(
             &config,
             &registry_client,
             &heartbeat_client,
@@ -131,11 +171,29 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         {
-            error!(%error, "heartbeat cycle failed");
+            // A steady-state heartbeat reporting a different connector_virtual_ip than the one
+            // the TUN device and control-plane listener were already created with (TT-1838) -
+            // rebinding either live isn't supported, so this can only be surfaced, not applied.
+            Ok(Some(latest)) if latest != connector_virtual_ip => {
+                error!(
+                    started_with = %connector_virtual_ip,
+                    now_reported = %latest,
+                    "Portal reported a different connector_virtual_ip than the one this process is bound to - restart the Connector to pick it up"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(%error, "heartbeat cycle failed");
+            }
         }
     }
 }
 
+/// Returns the Connector's own control-channel address if this heartbeat carried one - `main`
+/// uses the very first successful heartbeat's value to create the TUN device (TT-1838), since
+/// nothing local can guess it anymore (Portal is the sole source of truth). `None` means Portal
+/// hasn't assigned one yet (or an older Agent didn't relay it) - not an error in itself, but
+/// `main`'s startup loop treats it as "not ready" and keeps retrying.
 async fn run_heartbeat(
     config: &Config,
     registry_client: &RegistryClient,
@@ -144,7 +202,7 @@ async fn run_heartbeat(
     audit_log: &AuditLog,
     tunnel_manager: &Mutex<TunnelManager>,
     wg_socket: &UdpSocket,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
     let agent_public_key = registry_client
         .get_agent_permitted_key(&config.agent_ip_address)
         .await?;
@@ -159,6 +217,16 @@ async fn run_heartbeat(
         .iter()
         .filter(|node| node.wireguard_public_key.is_none())
         .count();
+    let connector_virtual_ip = match &response.connector_virtual_ip {
+        Some(raw) => match raw.parse::<std::net::Ipv4Addr>() {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                error!(%error, value = %raw, "connector_virtual_ip in the heartbeat response is not a valid IPv4 address");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Applying can still reject the package (e.g. an already-expired one) even
     // though the signature verified - don't touch existing local state on that.
@@ -192,7 +260,7 @@ async fn run_heartbeat(
 
     dial_new_nodes(tunnel_manager, wg_socket, &node_list).await;
 
-    Ok(())
+    Ok(connector_virtual_ip)
 }
 
 /// Syncs the tunnel set to this heartbeat's node list, then kicks off a
@@ -240,20 +308,29 @@ async fn dial_new_nodes(
 /// receives a datagram, matches it to the node it came from, feeds it to
 /// that tunnel, and either sends back whatever the tunnel produces in
 /// response (e.g. the initiator's post-handshake keepalive) or, for real
-/// decrypted payload data (TT-1827), learns the route and writes it to the
-/// TUN device so the OS's own IP stack delivers it onward - but only for a
-/// flow `flow_table` actually admitted (TT-1732 review, Tasneem finding #1:
-/// decrypting successfully proves the packet came from a genuine node
-/// tunnel, but says nothing about whether Gatekeeper's flow-admission relay
-/// ever admitted this specific device/gateway; before this fix, ANY
-/// decrypted traffic was learned and forwarded regardless). Runs for the
-/// lifetime of the process; a single receive error is logged and the loop
-/// continues - one bad datagram must not take down every node's tunnel.
+/// decrypted payload data, writes it to the TUN device so the OS's own IP
+/// stack delivers it onward. Two distinct cases (TT-1838), gated
+/// differently:
+/// - Addressed to `connector_virtual_ip` itself: Gatekeeper's flow-admission/
+///   release control channel, always forwarded - see the inline comment at
+///   the gate for why no flow_table check applies here.
+/// - Addressed anywhere else: forwarded traffic for admitted user flows,
+///   still gated on `flow_table` and still learns the route (TT-1827,
+///   TT-1732 review, Tasneem finding #1: decrypting successfully proves the
+///   packet came from a genuine node tunnel, but says nothing about whether
+///   Gatekeeper's flow-admission relay ever admitted this specific
+///   device/gateway; before that fix, ANY decrypted traffic was learned and
+///   forwarded regardless).
+///
+/// Runs for the lifetime of the process; a single receive error is logged
+/// and the loop continues - one bad datagram must not take down every
+/// node's tunnel.
 async fn run_wireguard_receive_loop(
     wg_socket: Arc<UdpSocket>,
     tunnel_manager: Arc<Mutex<TunnelManager>>,
     mut tun_writer: tun_device::TunWriter,
     flow_table: Arc<std::sync::Mutex<FlowTable>>,
+    connector_virtual_ip: std::net::IpAddr,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -278,28 +355,40 @@ async fn run_wireguard_receive_loop(
         // an `.await` (TT-1732 review, Tasneem).
         let mut forwardable = false;
         if let TunnelEvent::DecryptedData(ref packet) = event {
-            match (
-                tunnel::parse_source_address(packet),
-                tunnel::parse_source_port(packet),
-            ) {
-                (Some(source_ip), Some(source_port)) => {
-                    let is_admitted = flow_table
-                        .lock()
-                        .expect("flow table lock poisoned")
-                        .gateway_for(&node_id, source_port)
-                        .is_some();
-                    if is_admitted {
-                        manager.learn_route(&node_id, source_ip);
-                        forwardable = true;
-                    } else {
-                        warn!(
-                            %node_id, %source_ip, source_port,
-                            "decrypted packet has no matching admitted flow - dropping"
-                        );
+            if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
+                // Addressed to the Connector's own control-channel address (TT-1838) - Gatekeeper
+                // calling this Connector's own flow-admission/release API, not traffic being
+                // forwarded onward to some internal endpoint. The flow_table gate below exists to
+                // authorize *forwarded* traffic; it has no entry for this because this packet
+                // *is* the thing that would create one. Reachability through the tunnel is itself
+                // the trust boundary here (Konyk, TT-1732 thread) - now a real one, since this
+                // address is no longer reachable by anything other than the genuine peer whose
+                // wg0 allowed-ips include it.
+                forwardable = true;
+            } else {
+                match (
+                    tunnel::parse_source_address(packet),
+                    tunnel::parse_source_port(packet),
+                ) {
+                    (Some(source_ip), Some(source_port)) => {
+                        let is_admitted = flow_table
+                            .lock()
+                            .expect("flow table lock poisoned")
+                            .gateway_for(&node_id, source_port)
+                            .is_some();
+                        if is_admitted {
+                            manager.learn_route(&node_id, source_ip);
+                            forwardable = true;
+                        } else {
+                            warn!(
+                                %node_id, %source_ip, source_port,
+                                "decrypted packet has no matching admitted flow - dropping"
+                            );
+                        }
                     }
-                }
-                _ => {
-                    warn!(%node_id, "decrypted packet has no parseable source address/port - dropping");
+                    _ => {
+                        warn!(%node_id, "decrypted packet has no parseable source address/port - dropping");
+                    }
                 }
             }
         }
@@ -403,8 +492,7 @@ mod tests {
             registry_base_url,
             identity_key_path: "/tmp/unused-in-this-test".into(),
             audit_log_path: "/tmp/unused-in-this-test-audit.log".into(),
-            control_plane_listen_addr: "127.0.0.1:0".to_string(),
-            tun_addr: std::net::Ipv4Addr::new(10, 99, 0, 1),
+            control_plane_port: 0,
             tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
         }
@@ -475,12 +563,68 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        // No connector_virtual_ip in this response body - Ok(None), not an error.
+        assert_eq!(result.unwrap(), None);
         assert_eq!(policy_store.current().unwrap().connector_id, "c-1");
         let entries = read_audit_lines(&dir);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["event"], "policy_applied");
         assert_eq!(entries[0]["gateway_count"], 0);
+    }
+
+    /// TT-1838: `main` uses this returned value to create the TUN device - must be the real
+    /// parsed address, not just "heartbeat succeeded".
+    #[tokio::test]
+    async fn run_heartbeat_returns_the_parsed_connector_virtual_ip_when_present() {
+        let agent_identity = crypto::generate_keypair();
+        let body = r#"{"connector_id":"c-1","connector_virtual_ip":"10.98.0.7","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(body, "application/json")
+                    .insert_header("X-Signature", signature.as_str()),
+            )
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri(), agent_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Some(std::net::Ipv4Addr::new(10, 98, 0, 7)));
     }
 
     #[tokio::test]

@@ -10,6 +10,11 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ConnectorHeartbeatResponse {
     pub connector_id: String,
+    /// TT-1838: this Connector's one stable control-channel address, assigned by Portal and
+    /// relayed unchanged through Agent. `None` until Portal has assigned one (or against an
+    /// older Agent that doesn't send it yet) - `main` treats that as "not ready", since the TUN
+    /// device can't be created without a real address to bind.
+    pub connector_virtual_ip: Option<String>,
     pub generated_at: String,
     pub expires_at: String,
     pub nonce: String,
@@ -85,6 +90,39 @@ mod tests {
             response.node_list[0].wireguard_public_key.as_deref(),
             Some("wgkey=")
         );
+    }
+
+    #[test]
+    fn connector_virtual_ip_is_populated_when_present() {
+        let json = r#"{
+            "connector_id": "c-1",
+            "connector_virtual_ip": "10.98.0.7",
+            "generated_at": "2026-08-27T10:00:00Z",
+            "expires_at": "2026-08-27T10:05:00Z",
+            "nonce": "abc123",
+            "policy_bundles": [],
+            "node_list": []
+        }"#;
+
+        let response: ConnectorHeartbeatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.connector_virtual_ip.as_deref(), Some("10.98.0.7"));
+    }
+
+    #[test]
+    fn connector_virtual_ip_defaults_to_none_when_absent() {
+        let json = r#"{
+            "connector_id": "c-1",
+            "generated_at": "2026-08-27T10:00:00Z",
+            "expires_at": "2026-08-27T10:05:00Z",
+            "nonce": "abc123",
+            "policy_bundles": [],
+            "node_list": []
+        }"#;
+
+        let response: ConnectorHeartbeatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.connector_virtual_ip, None);
     }
 
     #[test]
