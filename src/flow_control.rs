@@ -45,9 +45,9 @@ pub struct FlowAdmissionRequest {
     /// (`flow_table`, TT-1732 review, Tasneem finding #1).
     pub node_id: String,
     /// The translated source port Gatekeeper's NAT assigned this flow (spec
-    /// §B.8) - `flow_table`'s real key alongside `node_id`, now that real
-    /// packet forwarding gates on flow admission instead of forwarding
-    /// anything with a learned route.
+    /// §B.8) - `flow_table`'s real key alongside `node_id`, both for gating
+    /// forwarded traffic and, since TT-1847, for routing reply traffic back
+    /// to the right node.
     pub port: u16,
     pub user_public_key: String,
     pub signature: String,
@@ -184,12 +184,13 @@ async fn handle_flow_admission(
 
     match decision {
         AccessDecision::Allowed { .. } => {
-            // The real forwarding loops (`main`) only learn a route and
-            // forward traffic for a (node_id, port) pair present here -
-            // this is what actually closes TT-1732 review finding #1 ("a
-            // refused, or never checked, device's traffic could still be
-            // forwarded once its IP was learned"): nothing is forwardable
-            // until it's recorded as admitted right here.
+            // The real forwarding loops (`main`) only forward traffic for a
+            // (node_id, port) pair present here, in both directions
+            // (forward: TT-1732 review finding #1 - "a refused, or never
+            // checked, device's traffic could still be forwarded once its
+            // IP was learned"; reverse/reply routing: TT-1847) - nothing is
+            // forwardable or routable until it's recorded as admitted right
+            // here.
             flow_table.lock().expect("flow table lock poisoned").admit(
                 request.node_id.clone(),
                 request.port,

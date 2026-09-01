@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         tun_reader,
         wg_socket.clone(),
         tunnel_manager.clone(),
+        flow_table.clone(),
     ));
     tokio::spawn(run_timer_loop(wg_socket.clone(), tunnel_manager.clone()));
 
@@ -315,12 +316,11 @@ async fn dial_new_nodes(
 ///   release control channel, always forwarded - see the inline comment at
 ///   the gate for why no flow_table check applies here.
 /// - Addressed anywhere else: forwarded traffic for admitted user flows,
-///   still gated on `flow_table` and still learns the route (TT-1827,
-///   TT-1732 review, Tasneem finding #1: decrypting successfully proves the
-///   packet came from a genuine node tunnel, but says nothing about whether
-///   Gatekeeper's flow-admission relay ever admitted this specific
-///   device/gateway; before that fix, ANY decrypted traffic was learned and
-///   forwarded regardless).
+///   still gated on `flow_table` (TT-1827, TT-1732 review, Tasneem finding
+///   #1: decrypting successfully proves the packet came from a genuine node
+///   tunnel, but says nothing about whether Gatekeeper's flow-admission
+///   relay ever admitted this specific device/gateway; before that fix, ANY
+///   decrypted traffic was forwarded regardless).
 ///
 /// Runs for the lifetime of the process; a single receive error is logged
 /// and the loop continues - one bad datagram must not take down every
@@ -349,10 +349,8 @@ async fn run_wireguard_receive_loop(
         };
         let node_id = tunnel.node_id.clone();
         let event = tunnel.receive(&buf[..len]);
-        // Mutating manager state (learn_route) happens here, still under the
-        // lock; the lock is released below, before any of this event's
-        // branches do actual network/TUN I/O - it must never be held across
-        // an `.await` (TT-1732 review, Tasneem).
+        drop(manager);
+
         let mut forwardable = false;
         if let TunnelEvent::DecryptedData(ref packet) = event {
             if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
@@ -366,33 +364,28 @@ async fn run_wireguard_receive_loop(
                 // wg0 allowed-ips include it.
                 forwardable = true;
             } else {
-                match (
-                    tunnel::parse_source_address(packet),
-                    tunnel::parse_source_port(packet),
-                ) {
-                    (Some(source_ip), Some(source_port)) => {
+                match tunnel::parse_source_port(packet) {
+                    Some(source_port) => {
                         let is_admitted = flow_table
                             .lock()
                             .expect("flow table lock poisoned")
                             .gateway_for(&node_id, source_port)
                             .is_some();
                         if is_admitted {
-                            manager.learn_route(&node_id, source_ip);
                             forwardable = true;
                         } else {
                             warn!(
-                                %node_id, %source_ip, source_port,
+                                %node_id, source_port,
                                 "decrypted packet has no matching admitted flow - dropping"
                             );
                         }
                     }
-                    _ => {
-                        warn!(%node_id, "decrypted packet has no parseable source address/port - dropping");
+                    None => {
+                        warn!(%node_id, "decrypted packet has no parseable source port - dropping");
                     }
                 }
             }
         }
-        drop(manager);
 
         match event {
             TunnelEvent::SendToNode(packet) => {
@@ -414,14 +407,20 @@ async fn run_wireguard_receive_loop(
 }
 
 /// Reads outbound IP packets the OS routed to the TUN device (e.g. return
-/// traffic from an internal endpoint), looks up which node's tunnel can
-/// reach that destination, and encrypts+sends it there. A destination with
-/// no learned route is dropped - there's genuinely nowhere defensible to
-/// send it, not a bug to work around.
+/// traffic from an internal endpoint) and encrypts+sends each one to the
+/// right node's tunnel (TT-1847). The destination *address* on this leg is
+/// a masqueraded wg0 address identical across the whole fleet (`flow_table`'s
+/// module doc) and carries no node identity - the destination *port* is the
+/// only reliable signal left, resolved back to a node through `flow_table`'s
+/// own admission state (told explicitly by Gatekeeper, never inferred from
+/// traffic). A port with no unambiguous admitted node - never admitted, or
+/// currently admitted on two different nodes at once - is dropped: there's
+/// genuinely nowhere defensible to send it, not a bug to work around.
 async fn run_tun_send_loop(
     mut tun_reader: tun_device::TunReader,
     wg_socket: Arc<UdpSocket>,
     tunnel_manager: Arc<Mutex<TunnelManager>>,
+    flow_table: Arc<std::sync::Mutex<FlowTable>>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -432,13 +431,25 @@ async fn run_tun_send_loop(
                 continue;
             }
         };
-        let Some(destination_ip) = Tunn::dst_address(&buf[..len]) else {
+        let Some(destination_port) = tunnel::parse_destination_port(&buf[..len]) else {
             continue;
         };
 
+        let node_id = {
+            let table = flow_table.lock().expect("flow table lock poisoned");
+            let Some(node_id) = table.node_for_port(destination_port) else {
+                warn!(
+                    destination_port,
+                    "no unambiguous admitted node for outbound packet's port - dropping"
+                );
+                continue;
+            };
+            node_id.to_string()
+        };
+
         let mut manager = tunnel_manager.lock().await;
-        let Some(tunnel) = manager.route_for(destination_ip) else {
-            warn!(%destination_ip, "no known route for outbound packet - dropping");
+        let Some(tunnel) = manager.tunnel_for(&node_id) else {
+            warn!(%node_id, destination_port, "admitted node has no active tunnel - dropping");
             continue;
         };
         let event = tunnel.encapsulate(&buf[..len]);
@@ -450,7 +461,7 @@ async fn run_tun_send_loop(
         if let TunnelEvent::SendToNode(packet) = event
             && let Err(error) = wg_socket.send_to(&packet, addr).await
         {
-            error!(%error, %addr, %destination_ip, "failed to send encrypted outbound packet");
+            error!(%error, %addr, %node_id, destination_port, "failed to send encrypted outbound packet");
         }
     }
 }
