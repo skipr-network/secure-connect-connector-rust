@@ -196,6 +196,7 @@ async fn handle_flow_admission(
                 request.port,
                 request.gateway_id.clone(),
                 request.flow_id.clone(),
+                request.user_public_key.clone(),
             );
             FlowAdmissionResponse {
                 flow_id: request.flow_id,

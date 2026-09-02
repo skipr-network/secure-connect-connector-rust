@@ -32,6 +32,13 @@ use std::collections::{HashMap, HashSet};
 struct AdmittedFlow {
     gateway_id: String,
     flow_id: String,
+    /// The device's signing key, as presented (and verified) on the admission
+    /// request that created this entry (TT-1640). Not used for routing -
+    /// `gateway_for`/`node_for_port` never touch it - only for
+    /// `evict_gateway_device`, which needs to find "this device's admitted
+    /// flows on this gateway" without anything Gatekeeper's release contract
+    /// already carries (`flow_id`/`port` alone can't answer "which user").
+    device_public_key: String,
 }
 
 #[derive(Default)]
@@ -51,7 +58,14 @@ impl FlowTable {
         Self::default()
     }
 
-    pub fn admit(&mut self, node_id: String, port: u16, gateway_id: String, flow_id: String) {
+    pub fn admit(
+        &mut self,
+        node_id: String,
+        port: u16,
+        gateway_id: String,
+        flow_id: String,
+        device_public_key: String,
+    ) {
         self.nodes_by_port
             .entry(port)
             .or_default()
@@ -61,6 +75,7 @@ impl FlowTable {
             AdmittedFlow {
                 gateway_id,
                 flow_id,
+                device_public_key,
             },
         );
     }
@@ -98,6 +113,33 @@ impl FlowTable {
         for port in removed_ports {
             self.deindex(node_id, port);
         }
+    }
+
+    /// Drops every currently-admitted flow for one device on one gateway
+    /// (TT-1640, "Revoke User Active Session From Gateway"), leaving every
+    /// other flow - including that same device's flows to a *different*
+    /// gateway - untouched. This is the only piece of the revoke feature
+    /// that lives here: everything upstream of this (who to revoke, when)
+    /// is decided by Portal and carried down through the heartbeat's
+    /// `revoked_sessions`/entitlement-diff reconciliation in `main`. Returns
+    /// the number of flows evicted, purely for logging - callers must not
+    /// branch on it, since "nothing to evict" (the device already
+    /// disconnected, or reconciled on a previous heartbeat) is a normal,
+    /// expected outcome, not a failure.
+    pub fn evict_gateway_device(&mut self, gateway_id: &str, device_public_key: &str) -> usize {
+        let removed: Vec<(String, u16)> = self
+            .flows
+            .iter()
+            .filter(|(_, flow)| {
+                flow.gateway_id == gateway_id && flow.device_public_key == device_public_key
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (node_id, port) in &removed {
+            self.flows.remove(&(node_id.clone(), *port));
+            self.deindex(node_id, *port);
+        }
+        removed.len()
     }
 
     fn deindex(&mut self, node_id: &str, port: u16) {
@@ -163,6 +205,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         assert_eq!(table.gateway_for("n-1", 40001), Some("gw-1"));
@@ -176,6 +219,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         assert!(table.gateway_for("n-2", 40001).is_none());
@@ -189,6 +233,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         table.release("flow-1");
@@ -204,6 +249,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         table.release("flow-does-not-exist");
@@ -219,12 +265,14 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
         table.admit(
             "n-1".to_string(),
             40002,
             "gw-1".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         table.release("flow-1");
@@ -248,6 +296,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         assert_eq!(table.node_for_port(40001), Some("n-1"));
@@ -266,12 +315,14 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
         table.admit(
             "n-2".to_string(),
             40001,
             "gw-2".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         assert!(table.node_for_port(40001).is_none());
@@ -285,12 +336,14 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
         table.admit(
             "n-2".to_string(),
             40001,
             "gw-2".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         table.release("flow-2");
@@ -306,12 +359,14 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
         table.admit(
             "n-1".to_string(),
             40002,
             "gw-1".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         assert_eq!(table.node_for_port(40001), Some("n-1"));
@@ -326,12 +381,14 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
         table.admit(
             "n-1".to_string(),
             40002,
             "gw-1".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         table.evict_node("n-1");
@@ -348,12 +405,14 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
         table.admit(
             "n-2".to_string(),
             40002,
             "gw-1".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         table.evict_node("n-1");
@@ -372,12 +431,14 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
         table.admit(
             "n-2".to_string(),
             40001,
             "gw-2".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
         assert!(table.node_for_port(40001).is_none());
 
@@ -394,6 +455,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         table.evict_node("n-does-not-exist");
@@ -414,6 +476,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         table.release("flow-1");
@@ -422,9 +485,122 @@ mod tests {
             40001,
             "gw-2".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         assert_eq!(table.node_for_port(40001), Some("n-2"));
+    }
+
+    #[test]
+    fn evict_gateway_device_removes_only_that_devices_flows_on_that_gateway() {
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        table.admit(
+            "n-1".to_string(),
+            40002,
+            "gw-1".to_string(),
+            "flow-2".to_string(),
+            "dev-B".to_string(),
+        );
+
+        let evicted = table.evict_gateway_device("gw-1", "dev-A");
+
+        assert_eq!(evicted, 1);
+        assert!(table.gateway_for("n-1", 40001).is_none());
+        assert_eq!(table.gateway_for("n-1", 40002), Some("gw-1"));
+    }
+
+    #[test]
+    fn evict_gateway_device_does_not_touch_the_same_devices_flow_on_a_different_gateway() {
+        // The single most important property of this feature: revoking one
+        // gateway's session must never touch the user's wider SecureConnect
+        // session, including their other Private Gateway access.
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        table.admit(
+            "n-1".to_string(),
+            40002,
+            "gw-2".to_string(),
+            "flow-2".to_string(),
+            "dev-A".to_string(),
+        );
+
+        table.evict_gateway_device("gw-1", "dev-A");
+
+        assert!(table.gateway_for("n-1", 40001).is_none());
+        assert_eq!(table.gateway_for("n-1", 40002), Some("gw-2"));
+    }
+
+    #[test]
+    fn evict_gateway_device_evicts_every_admitted_port_for_that_device_on_that_gateway() {
+        // One device can legitimately hold several admitted flows to the
+        // same gateway at once (e.g. several concurrent connections) - all
+        // of them must go.
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        table.admit(
+            "n-1".to_string(),
+            40002,
+            "gw-1".to_string(),
+            "flow-2".to_string(),
+            "dev-A".to_string(),
+        );
+
+        let evicted = table.evict_gateway_device("gw-1", "dev-A");
+
+        assert_eq!(evicted, 2);
+        assert!(table.gateway_for("n-1", 40001).is_none());
+        assert!(table.gateway_for("n-1", 40002).is_none());
+    }
+
+    #[test]
+    fn evict_gateway_device_clears_the_port_index_too() {
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+
+        table.evict_gateway_device("gw-1", "dev-A");
+        table.admit(
+            "n-2".to_string(),
+            40001,
+            "gw-2".to_string(),
+            "flow-2".to_string(),
+            "dev-B".to_string(),
+        );
+
+        assert_eq!(table.node_for_port(40001), Some("n-2"));
+    }
+
+    #[test]
+    fn evicting_a_device_with_no_admitted_flow_is_a_harmless_no_op() {
+        let mut table = FlowTable::new();
+
+        let evicted = table.evict_gateway_device("gw-1", "dev-never-connected");
+
+        assert_eq!(evicted, 0);
     }
 
     #[test]
@@ -435,6 +611,7 @@ mod tests {
             40001,
             "gw-1".to_string(),
             "flow-1".to_string(),
+            "dev-1".to_string(),
         );
 
         // The port is reused for a new flow (e.g. after the first was
@@ -444,6 +621,7 @@ mod tests {
             40001,
             "gw-2".to_string(),
             "flow-2".to_string(),
+            "dev-1".to_string(),
         );
 
         assert_eq!(table.gateway_for("n-1", 40001), Some("gw-2"));
