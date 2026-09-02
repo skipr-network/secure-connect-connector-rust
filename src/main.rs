@@ -20,7 +20,7 @@ use anyhow::Context;
 use audit::{AuditEvent, AuditLog};
 use boringtun::noise::Tunn;
 use config::Config;
-use dto::HeartbeatNode;
+use dto::{HeartbeatNode, PolicyBundle};
 use flow_control::ControlPlaneState;
 use flow_table::FlowTable;
 use heartbeat::HeartbeatClient;
@@ -221,6 +221,13 @@ async fn run_heartbeat(
     let gateways = response.policy_bundles.len();
     let nodes = response.node_list.len();
     let node_list = response.node_list.clone();
+    // Snapshotted before `policy_store.apply(response)` replaces it and before `response` is moved
+    // (TT-1640): the entitlement lists this Connector had *before* this heartbeat, diffed after a
+    // successful apply against what it has *now* - see `reconcile_dropped_entitlements`. `None` on
+    // the very first heartbeat (nothing was ever admitted before any policy existed, so nothing to
+    // diff against).
+    let old_bundles = policy_store.current().map(|state| state.policy_bundles);
+    let new_bundles = response.policy_bundles.clone();
     let nodes_without_key = node_list
         .iter()
         .filter(|node| node.wireguard_public_key.is_none())
@@ -267,8 +274,61 @@ async fn run_heartbeat(
     }
 
     dial_new_nodes(tunnel_manager, wg_socket, &node_list, flow_table).await;
+    if let Some(old_bundles) = old_bundles {
+        reconcile_dropped_entitlements(flow_table, &old_bundles, &new_bundles);
+    }
 
     Ok(connector_virtual_ip)
+}
+
+/// Tears down every already-admitted flow whose device dropped out of its gateway's entitlement
+/// list in this heartbeat (TT-1640, "Revoke User Active Session From Gateway Through Connector",
+/// spec §B.9.3: "each heartbeat's entitlement-list refresh tears down any open flow whose key has
+/// dropped out"). Before this, dropping a user from `entitlement_list` (an admin revoking gateway
+/// access, or an end-user being blocked) only blocked *new* admissions on the *next* heartbeat - an
+/// already-admitted flow just kept forwarding traffic indefinitely, since nothing ever re-checked it
+/// against a freshly-applied policy (`decide_access_at` is only consulted on `admit_flow`).
+///
+/// Diffs old vs. new per gateway: a device present in the old bundle's `entitlement_list` but not in
+/// the new one - including when the whole gateway bundle disappeared entirely (gateway disabled,
+/// Connector no longer attached to it, ...) - had its access revoked, so any admitted flow it still
+/// holds on that gateway is evicted. A device that's still entitled, or a gateway that's unchanged,
+/// is left completely alone. Idempotent and order-independent - evicting a device with no admitted
+/// flow is a no-op (`FlowTable::evict_gateway_device`).
+fn reconcile_dropped_entitlements(
+    flow_table: &std::sync::Mutex<FlowTable>,
+    old_bundles: &[PolicyBundle],
+    new_bundles: &[PolicyBundle],
+) {
+    let mut table = flow_table.lock().expect("flow table lock poisoned");
+    for old_bundle in old_bundles {
+        let still_entitled: std::collections::HashSet<&str> = new_bundles
+            .iter()
+            .find(|bundle| bundle.gateway_id == old_bundle.gateway_id)
+            .map(|bundle| {
+                bundle
+                    .entitlement_list
+                    .iter()
+                    .map(|e| e.device_public_key.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for entitlement in &old_bundle.entitlement_list {
+            if still_entitled.contains(entitlement.device_public_key.as_str()) {
+                continue;
+            }
+            let evicted =
+                table.evict_gateway_device(&old_bundle.gateway_id, &entitlement.device_public_key);
+            if evicted > 0 {
+                info!(
+                    gateway_id = %old_bundle.gateway_id,
+                    device_public_key = %entitlement.device_public_key,
+                    evicted,
+                    "entitlement dropped: tore down admitted flow(s) for this gateway"
+                );
+            }
+        }
+    }
 }
 
 /// Syncs the tunnel set to this heartbeat's node list, then kicks off a
@@ -520,6 +580,7 @@ async fn run_timer_loop(wg_socket: Arc<UdpSocket>, tunnel_manager: Arc<Mutex<Tun
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dto::Entitlement;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -974,5 +1035,249 @@ mod tests {
                 .unwrap();
         assert!(len > 0);
         assert_eq!(from, wg_socket.local_addr().unwrap());
+    }
+
+    fn bundle(gateway_id: &str, entitled_device_keys: &[&str]) -> PolicyBundle {
+        PolicyBundle {
+            gateway_id: gateway_id.to_string(),
+            location: "Amsterdam".to_string(),
+            hostname: "crm.internal.example.com".to_string(),
+            access_mode: "SELECTED_USERS".to_string(),
+            endpoints: vec![],
+            entitlement_list: entitled_device_keys
+                .iter()
+                .map(|key| Entitlement {
+                    user_id: "u-1".to_string(),
+                    device_public_key: key.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn reconcile_dropped_entitlements_evicts_a_device_no_longer_entitled_to_its_gateway() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        let old_bundles = vec![bundle("gw-1", &["dev-A"])];
+        let new_bundles = vec![bundle("gw-1", &[])];
+
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+
+        assert!(
+            flow_table
+                .lock()
+                .unwrap()
+                .gateway_for("n-1", 40001)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_dropped_entitlements_leaves_a_still_entitled_device_alone() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        let old_bundles = vec![bundle("gw-1", &["dev-A"])];
+        let new_bundles = vec![bundle("gw-1", &["dev-A"])];
+
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+
+        assert_eq!(
+            flow_table.lock().unwrap().gateway_for("n-1", 40001),
+            Some("gw-1")
+        );
+    }
+
+    #[test]
+    fn reconcile_dropped_entitlements_leaves_the_same_devices_other_gateway_flow_alone() {
+        // The AC this whole feature exists for: revoking one gateway's access must never touch the
+        // user's wider SecureConnect session, including their other Private Gateway access.
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40002,
+            "gw-2".to_string(),
+            "flow-2".to_string(),
+            "dev-A".to_string(),
+        );
+        let old_bundles = vec![bundle("gw-1", &["dev-A"]), bundle("gw-2", &["dev-A"])];
+        let new_bundles = vec![bundle("gw-1", &[]), bundle("gw-2", &["dev-A"])];
+
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+
+        assert!(
+            flow_table
+                .lock()
+                .unwrap()
+                .gateway_for("n-1", 40001)
+                .is_none()
+        );
+        assert_eq!(
+            flow_table.lock().unwrap().gateway_for("n-1", 40002),
+            Some("gw-2")
+        );
+    }
+
+    #[test]
+    fn reconcile_dropped_entitlements_evicts_every_flow_when_the_whole_gateway_bundle_disappears() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        let old_bundles = vec![bundle("gw-1", &["dev-A"])];
+        let new_bundles: Vec<PolicyBundle> = vec![];
+
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+
+        assert!(
+            flow_table
+                .lock()
+                .unwrap()
+                .gateway_for("n-1", 40001)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_dropped_entitlements_with_no_prior_bundles_is_a_no_op() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+
+        reconcile_dropped_entitlements(&flow_table, &[], &[bundle("gw-1", &["dev-A"])]);
+    }
+
+    /// End-to-end through two real `run_heartbeat` calls: entitlement present on the first, dropped
+    /// on the second - proving the diff actually runs off `PolicyStore`'s real before/after state,
+    /// not just the pure reconciliation function above.
+    #[tokio::test]
+    async fn a_second_heartbeat_evicts_a_flow_whose_device_dropped_out_of_entitlement_list() {
+        let agent_identity = crypto::generate_keypair();
+        let first_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]},{"gateway_id":"gw-2","location":"Amsterdam","hostname":"erp.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
+        let second_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[]},{"gateway_id":"gw-2","location":"Amsterdam","hostname":"erp.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
+        let first_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, first_body.as_bytes());
+        let second_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, second_body.as_bytes());
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(first_body, "application/json")
+                    .insert_header("X-Signature", first_signature.as_str()),
+            )
+            .up_to_n_times(1)
+            .mount(&agent_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(second_body, "application/json")
+                    .insert_header("X-Signature", second_signature.as_str()),
+            )
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri(), agent_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+
+        run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+        )
+        .await
+        .unwrap();
+        // Simulates Gatekeeper admitting the flows during the window this Connector was entitled -
+        // this must not be evicted by the *first* heartbeat's own apply (nothing to diff against yet).
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+        );
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40002,
+            "gw-2".to_string(),
+            "flow-2".to_string(),
+            "dev-A".to_string(),
+        );
+
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            flow_table
+                .lock()
+                .unwrap()
+                .gateway_for("n-1", 40001)
+                .is_none(),
+            "the flow on the gateway whose entitlement was dropped must be torn down"
+        );
+        assert_eq!(
+            flow_table.lock().unwrap().gateway_for("n-1", 40002),
+            Some("gw-2"),
+            "the same device's flow on a gateway it's still entitled to must survive"
+        );
     }
 }
