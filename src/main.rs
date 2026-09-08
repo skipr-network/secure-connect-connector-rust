@@ -33,6 +33,16 @@ use tunnel::{TunnelEvent, TunnelManager};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // TT-1886: checked before tracing init or Config::from_env - this mode must not require
+    // CONNECTOR_ID/AGENT_BASE_URL/AGENT_IP_ADDRESS/REGISTRY_BASE_URL, since a real Enterprise
+    // Admin can't have a CONNECTOR_ID yet (Portal only issues one after they submit the public
+    // key this mode exists to produce). Prints the key and exits; no Portal/Agent/Registry
+    // calls, no auto-submission - the admin still copies it into Portal's Deploy Connector
+    // screen themselves (Konyk, TT-1886 comment 63217).
+    if std::env::args().any(|arg| arg == "--generate-identity") {
+        return generate_identity();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -190,6 +200,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// TT-1886: generates (or loads, if one already exists) the Connector's identity keypair and
+/// prints just the public key, then returns - touches `identity.rs` only, no config beyond
+/// `CONNECTOR_IDENTITY_KEY_PATH` and no network calls. Printed alone on its own line (no label)
+/// so it stays scriptable for the eventual install flow (TT-1875), same convention as `wg genkey`.
+fn generate_identity() -> anyhow::Result<()> {
+    let path = config::identity_key_path_from_env();
+    let identity = identity::load_or_generate(&path)?;
+    println!("{}", identity.public_key_base64);
+    Ok(())
 }
 
 /// Returns the Connector's own control-channel address if this heartbeat carried one - `main`

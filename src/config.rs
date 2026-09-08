@@ -39,6 +39,17 @@ pub struct Config {
 const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
 const AGENT_SIGNATURE_VALIDITY_SECONDS: u64 = 300;
 
+/// Shared with the standalone `--generate-identity` mode (TT-1886), which prints the Connector's
+/// public key without the rest of `Config::from_env`'s required env vars (`CONNECTOR_ID` doesn't
+/// exist yet at that point in the real admin flow - Portal only issues it after the admin submits
+/// this key).
+pub fn identity_key_path_from_env() -> PathBuf {
+    PathBuf::from(
+        env::var("CONNECTOR_IDENTITY_KEY_PATH")
+            .unwrap_or_else(|_| "/var/skipr/connector/.keys/identity.key".to_string()),
+    )
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
@@ -46,10 +57,7 @@ impl Config {
             agent_base_url: require_env("AGENT_BASE_URL")?,
             agent_ip_address: require_env("AGENT_IP_ADDRESS")?,
             registry_base_url: require_env("REGISTRY_BASE_URL")?,
-            identity_key_path: PathBuf::from(
-                env::var("CONNECTOR_IDENTITY_KEY_PATH")
-                    .unwrap_or_else(|_| "/var/skipr/connector/.keys/identity.key".to_string()),
-            ),
+            identity_key_path: identity_key_path_from_env(),
             audit_log_path: PathBuf::from(
                 env::var("CONNECTOR_AUDIT_LOG_PATH")
                     .unwrap_or_else(|_| "/var/skipr/connector/audit/audit.log".to_string()),
