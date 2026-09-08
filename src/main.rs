@@ -31,16 +31,50 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use tunnel::{TunnelEvent, TunnelManager};
 
+/// Explicit CLI modes - checked before tracing init or `Config::from_env` (TT-1886). Matches argv
+/// exactly rather than just scanning for `--generate-identity` anywhere in it: a typo'd flag or
+/// `--help` used to silently fall through to the normal startup path and hit the exact
+/// `CONNECTOR_ID` dead-end this mode exists to remove (PR #5 review, Tasneem). `args_os` avoids a
+/// panic on non-UTF-8 argv that `std::env::args` would produce (same review, nit).
+enum CliMode {
+    Normal,
+    GenerateIdentity,
+    Help,
+}
+
+const USAGE: &str = "Usage: secure_connect_connector [--generate-identity | --help]\n\n\
+With no arguments, runs the Connector daemon (reads its config from the environment).\n\
+  --generate-identity  Generate (or load) this Connector's identity keypair, print its\n\
+                       public key, and exit. No other config or network calls required.\n\
+  --help, -h           Show this message and exit.";
+
+fn parse_cli_mode(args: std::env::ArgsOs) -> Result<CliMode, String> {
+    // `.to_str()` (not `.to_string_lossy()`/`args()`) so a non-UTF-8 argument is gracefully
+    // reported as unrecognized instead of panicking or silently mangling it into a match.
+    let rest: Vec<std::ffi::OsString> = args.skip(1).collect();
+    match rest.as_slice() {
+        [] => Ok(CliMode::Normal),
+        [only] => match only.to_str() {
+            Some("--generate-identity") => Ok(CliMode::GenerateIdentity),
+            Some("--help") | Some("-h") => Ok(CliMode::Help),
+            _ => Err(format!("unrecognized argument: {only:?}\n\n{USAGE}")),
+        },
+        [first, ..] => Err(format!(
+            "too many arguments (starting at {first:?}): only one flag is accepted\n\n{USAGE}"
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // TT-1886: checked before tracing init or Config::from_env - this mode must not require
-    // CONNECTOR_ID/AGENT_BASE_URL/AGENT_IP_ADDRESS/REGISTRY_BASE_URL, since a real Enterprise
-    // Admin can't have a CONNECTOR_ID yet (Portal only issues one after they submit the public
-    // key this mode exists to produce). Prints the key and exits; no Portal/Agent/Registry
-    // calls, no auto-submission - the admin still copies it into Portal's Deploy Connector
-    // screen themselves (Konyk, TT-1886 comment 63217).
-    if std::env::args().any(|arg| arg == "--generate-identity") {
-        return generate_identity();
+    match parse_cli_mode(std::env::args_os()) {
+        Ok(CliMode::GenerateIdentity) => return generate_identity(),
+        Ok(CliMode::Help) => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Ok(CliMode::Normal) => {}
+        Err(message) => anyhow::bail!(message),
     }
 
     tracing_subscriber::fmt()
@@ -204,11 +238,16 @@ async fn main() -> anyhow::Result<()> {
 
 /// TT-1886: generates (or loads, if one already exists) the Connector's identity keypair and
 /// prints just the public key, then returns - touches `identity.rs` only, no config beyond
-/// `CONNECTOR_IDENTITY_KEY_PATH` and no network calls. Printed alone on its own line (no label)
-/// so it stays scriptable for the eventual install flow (TT-1875), same convention as `wg genkey`.
+/// `CONNECTOR_IDENTITY_KEY_PATH` and no network calls. The public key is printed alone on its own
+/// line on stdout (no label) so it stays scriptable for the eventual install flow (TT-1875), same
+/// convention as `wg genkey`. The resolved key path goes to stderr instead (PR #5 review,
+/// Tasneem) - useful diagnostic (e.g. confirms whether the default, root-owned
+/// `/var/skipr/connector/.keys/identity.key` was actually writable) without breaking stdout's
+/// scriptability.
 fn generate_identity() -> anyhow::Result<()> {
     let path = config::identity_key_path_from_env();
     let identity = identity::load_or_generate(&path)?;
+    eprintln!("identity key path: {}", path.display());
     println!("{}", identity.public_key_base64);
     Ok(())
 }
