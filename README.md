@@ -58,6 +58,17 @@ Requires these environment variables:
 | `CONNECTOR_TUN_NETMASK`          | no       | `255.255.255.0`                               |
 | `HEARTBEAT_INTERVAL_SECONDS`     | no       | `60`                                          |
 
+**`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** - it is
+not persisted anywhere by itself. Portal's install command sets it inline for that one command
+only (e.g. `$HOME/.skipr/connector-identity.key`); a later shell, systemd unit, or a different user
+does not inherit it. Starting the daemon without repeating the exact same value generates a
+second, unregistered identity - the daemon will log a loud warning if this happens, but the fix is
+to export it explicitly first (PR #278 review, Tasneem):
+
+```sh
+export CONNECTOR_IDENTITY_KEY_PATH=$HOME/.skipr/connector-identity.key
+```
+
 ```sh
 secure_connect_connector
 ```

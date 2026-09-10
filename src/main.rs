@@ -82,12 +82,34 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    // Checked before the call, not derived from its result: load_or_generate's return shape is
+    // the same either way, and the distinction matters here specifically - the daemon generating
+    // a fresh identity at normal startup (as opposed to via --generate-identity) almost certainly
+    // means the key Portal registered isn't the one about to be used. The Connector will still
+    // heartbeat, just with a public key Portal doesn't recognize, and the gateway silently never
+    // activates - a $HOME (or any path) mismatch between whoever ran --generate-identity and
+    // whatever starts this daemon is exactly what makes this survivable to reach production
+    // (PR #278 review, Tasneem).
+    let identity_key_existed_already = config.identity_key_path.exists();
     let connector_identity = identity::load_or_generate(&config.identity_key_path)?;
-    info!(
-        connector_id = %config.connector_id,
-        public_key = %connector_identity.public_key_base64,
-        "Connector identity ready"
-    );
+    if identity_key_existed_already {
+        info!(
+            connector_id = %config.connector_id,
+            public_key = %connector_identity.public_key_base64,
+            "Connector identity ready"
+        );
+    } else {
+        warn!(
+            connector_id = %config.connector_id,
+            public_key = %connector_identity.public_key_base64,
+            path = %config.identity_key_path.display(),
+            "Connector identity ready, but no key file existed at this path - generated a brand \
+             new identity. If this Connector was already registered with Portal under a \
+             different key, it will heartbeat but the gateway will never activate. Run \
+             --generate-identity once and confirm CONNECTOR_IDENTITY_KEY_PATH matches exactly \
+             what starts this daemon."
+        );
+    }
 
     let http = reqwest::Client::new();
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
