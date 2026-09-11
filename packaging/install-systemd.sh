@@ -25,17 +25,30 @@ if [ ! -x "$BINARY_PATH" ]; then
 fi
 
 sudo mkdir -p "$ENV_DIR"
+sudo install -d -o "$RUN_AS_USER" -m 750 /var/skipr/connector/audit /var/skipr/connector/.keys
 if [ ! -f "$ENV_FILE" ]; then
   sudo tee "$ENV_FILE" > /dev/null <<'EOF'
 # Filled in by the admin - see the README's "Running the Connector daemon" table
 # for what each of these means. CONNECTOR_IDENTITY_KEY_PATH must match exactly
 # what --generate-identity used, or the daemon generates a second, unregistered
 # identity (it will warn loudly if this happens).
-CONNECTOR_ID=
-AGENT_BASE_URL=
-AGENT_IP_ADDRESS=
-REGISTRY_BASE_URL=
-CONNECTOR_IDENTITY_KEY_PATH=
+#
+# Leave a line commented out to use its documented default. systemd parses an
+# uncommented `VAR=` as VAR being *set* to an empty string, not unset - which
+# defeats both the defaults below and the required-variable check, so don't
+# just erase the value, uncomment the line and fill it in.
+#CONNECTOR_ID=
+#AGENT_BASE_URL=
+#AGENT_IP_ADDRESS=
+#REGISTRY_BASE_URL=
+# CONNECTOR_IDENTITY_KEY_PATH must be an ABSOLUTE path - systemd does not expand
+# $HOME or ~ in this file, and the unit's working directory is /, so a value
+# copied verbatim from the README's `export` line will NOT resolve.
+#CONNECTOR_IDENTITY_KEY_PATH=
+
+# Log level for the daemon. Without this only ERROR-level lines reach the
+# journal, including the fresh-identity warning above.
+RUST_LOG=info
 EOF
   sudo chmod 600 "$ENV_FILE"
   echo "Created $ENV_FILE - fill in its values before starting the service."
@@ -72,6 +85,6 @@ sudo systemctl daemon-reload
 
 echo ""
 echo "Installed. Next steps:"
-echo "  1. sudo nano $ENV_FILE   # fill in CONNECTOR_ID and the rest"
+echo "  1. sudo nano $ENV_FILE   # uncomment and fill in CONNECTOR_ID and the rest"
 echo "  2. sudo systemctl enable --now $SERVICE_NAME"
 echo "  3. journalctl -u $SERVICE_NAME -f   # watch it start"

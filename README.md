@@ -90,7 +90,10 @@ survives every rebuild and restart without ever running the daemon as root:
 ```
 
 Fill in `/etc/skipr/connector/connector.env` with the values from the table
-above, then:
+above. Note that this file is read by systemd, not a shell: use absolute paths
+only, since `$HOME` and `~` are not expanded (e.g. write
+`/home/ubuntu/.skipr/connector-identity.key`, not
+`$HOME/.skipr/connector-identity.key`). Then:
 
 ```sh
 sudo systemctl enable --now secure-connect-connector
