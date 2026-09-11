@@ -73,6 +73,30 @@ export CONNECTOR_IDENTITY_KEY_PATH=$HOME/.skipr/connector-identity.key
 secure_connect_connector
 ```
 
+### Running it as a systemd service (recommended)
+
+Running the raw binary directly requires either root or manually granting it
+`CAP_NET_ADMIN` (`sudo setcap cap_net_admin+ep target/release/secure_connect_connector`)
+every single time it's rebuilt, since that capability is a property of the binary
+file and gets wiped out on every new build - easy to forget, and a real admin has
+no reason to know it's needed at all (creating the Connector's TUN device is a
+privileged kernel operation, `Operation not permitted` otherwise).
+
+The systemd install script grants that one capability declaratively, once, so it
+survives every rebuild and restart without ever running the daemon as root:
+
+```sh
+./packaging/install-systemd.sh
+```
+
+Fill in `/etc/skipr/connector/connector.env` with the values from the table
+above, then:
+
+```sh
+sudo systemctl enable --now secure-connect-connector
+journalctl -u secure-connect-connector -f
+```
+
 ## Development
 
 ```sh
