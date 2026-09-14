@@ -27,7 +27,7 @@
 //! inferred) is the only thing this Connector can trust for that lookup.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::Ipv4Addr;
 
 use crate::dto::PolicyBundleEndpoint;
 
@@ -45,13 +45,12 @@ struct AdmittedFlow {
     /// The entitled gateway's configured internal endpoints, from the same
     /// `PolicyBundle.endpoints` `AccessDecision::Allowed` already resolved at
     /// admission time (TT-2046). Being admitted only proves the device is
-    /// entitled to this *gateway* - it says nothing about which address the
-    /// gateway is actually supposed to expose. Without checking a forwarded
-    /// packet's real destination against this list, `main`'s TUN-based
-    /// forwarding loop would relay traffic to whatever destination a packet
-    /// happens to carry, not just the admin-configured endpoint (the gap
-    /// `access.rs`'s own module doc flagged as "the endpoints an Allowed
-    /// decision names aren't dialed anywhere yet").
+    /// entitled to this *gateway* - it says nothing about which internal
+    /// address the gateway is actually configured to expose. `forward_target`
+    /// uses this both to refuse a packet outright and to know what address to
+    /// rewrite an allowed one to - the address the packet already carries on
+    /// arrival is never the real endpoint (see `forward_target`'s doc
+    /// comment), so nothing downstream can work at all without this.
     endpoints: Vec<PolicyBundleEndpoint>,
 }
 
@@ -171,8 +170,9 @@ impl FlowTable {
     /// `None` if there's no matching admitted flow at all - callers must
     /// treat that as "refuse", never as "admit anyway". Not called by
     /// production code any more (TT-2046): `run_wireguard_receive_loop`'s
-    /// real gate is now `destination_allowed`, which is admission-checking
-    /// plus destination-checking in one call. Kept and still genuinely
+    /// real gate is now `forward_target`, which is admission-checking,
+    /// endpoint-matching, and address resolution in one call. Kept and still
+    /// genuinely
     /// useful: most existing tests are about admission/eviction bookkeeping
     /// itself, not endpoint enforcement, and asserting on the resolved
     /// gateway_id directly is more precise there than routing everything
@@ -184,28 +184,39 @@ impl FlowTable {
             .map(|flow| flow.gateway_id.as_str())
     }
 
-    /// Whether a packet is not just admitted (TT-1732 review, Tasneem finding
-    /// #1 - `gateway_for`) but destined to one of the addresses the entitled
-    /// gateway is actually configured to expose (TT-2046). Being admitted
-    /// only proves the device is entitled to *this gateway*; it says nothing
-    /// about which internal address the gateway is supposed to reach.
-    /// `false` for an unadmitted (node_id, port) too - callers don't need to
-    /// call `gateway_for` separately first.
+    /// Resolves the real internal address a forwarded packet should be
+    /// rewritten to reach, or `None` if it can't be forwarded at all - either
+    /// (node_id, port) isn't an admitted flow (TT-1732 review, Tasneem
+    /// finding #1 - same check `gateway_for` used to do), or it is admitted
+    /// but none of its gateway's configured endpoints match.
     ///
-    /// `PolicyBundleEndpoint.host` is compared as a literal IP only (v1
+    /// Matched by `packet_destination_port` alone, **not** by the packet's
+    /// current destination *address* (TT-2046): on arrival that address is
+    /// never the real endpoint - it's the fake, per-node virtual address
+    /// Gatekeeper invented for DNS resolution purposes only
+    /// (`GatewayVirtualAddressRegistry` on the Gatekeeper side: "zero
+    /// relationship to any real internal address - the whole point is
+    /// Gatekeeper never learns the internal host:port allowlist"). Gatekeeper
+    /// never translates the destination *port*, though - the client dials
+    /// the real target port directly - so it's the only part of "where is
+    /// this packet headed" that's trustworthy at this point, and the actual
+    /// address rewrite (`tunnel::rewrite_destination_ipv4`) happens after
+    /// this call, using the `Ipv4Addr` this returns.
+    ///
+    /// `PolicyBundleEndpoint.host` is resolved as a literal IPv4 only (v1
     /// scope, TT-2046) - a host that doesn't parse as one can never match,
     /// which is the safe direction to fail in (refuse, not silently admit).
-    pub fn destination_allowed(&self, node_id: &str, port: u16, destination: SocketAddr) -> bool {
-        let Some(flow) = self.flows.get(&(node_id.to_string(), port)) else {
-            return false;
-        };
-        flow.endpoints.iter().any(|endpoint| {
-            endpoint.port == destination.port()
-                && endpoint
-                    .host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|ip| ip == destination.ip())
-        })
+    pub fn forward_target(
+        &self,
+        node_id: &str,
+        port: u16,
+        packet_destination_port: u16,
+    ) -> Option<Ipv4Addr> {
+        let flow = self.flows.get(&(node_id.to_string(), port))?;
+        flow.endpoints
+            .iter()
+            .find(|endpoint| endpoint.port == packet_destination_port)
+            .and_then(|endpoint| endpoint.host.parse::<Ipv4Addr>().ok())
     }
 
     /// Reverse of admission (TT-1847): given only a port - all a reply packet
@@ -715,14 +726,14 @@ mod tests {
     }
 
     #[test]
-    fn destination_allowed_is_false_for_an_unadmitted_flow() {
+    fn forward_target_is_none_for_an_unadmitted_flow() {
         let table = FlowTable::new();
 
-        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.5:443".parse().unwrap()));
+        assert_eq!(table.forward_target("n-1", 40001, 443), None);
     }
 
     #[test]
-    fn destination_allowed_matches_a_configured_endpoint() {
+    fn forward_target_resolves_a_configured_endpoints_real_address() {
         let mut table = FlowTable::new();
         table.admit(
             "n-1".to_string(),
@@ -733,14 +744,17 @@ mod tests {
             vec![endpoint("10.0.0.5", 443)],
         );
 
-        assert!(table.destination_allowed("n-1", 40001, "10.0.0.5:443".parse().unwrap()));
+        assert_eq!(
+            table.forward_target("n-1", 40001, 443),
+            Some("10.0.0.5".parse().unwrap())
+        );
     }
 
     #[test]
-    fn destination_allowed_refuses_a_different_address_even_though_the_flow_is_admitted() {
+    fn forward_target_is_none_when_the_flow_is_admitted_but_no_endpoint_matches_the_port() {
         // TT-2046: the sharpest case - the flow itself is legitimately
-        // admitted (the user is entitled to the gateway), but the packet is
-        // headed somewhere the gateway was never configured to expose.
+        // admitted (the user is entitled to the gateway), but the client
+        // dialed a port the gateway was never configured to expose.
         let mut table = FlowTable::new();
         table.admit(
             "n-1".to_string(),
@@ -751,26 +765,11 @@ mod tests {
             vec![endpoint("10.0.0.5", 443)],
         );
 
-        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.9:443".parse().unwrap()));
+        assert_eq!(table.forward_target("n-1", 40001, 8080), None);
     }
 
     #[test]
-    fn destination_allowed_refuses_the_right_host_on_the_wrong_port() {
-        let mut table = FlowTable::new();
-        table.admit(
-            "n-1".to_string(),
-            40001,
-            "gw-1".to_string(),
-            "flow-1".to_string(),
-            "dev-1".to_string(),
-            vec![endpoint("10.0.0.5", 443)],
-        );
-
-        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.5:8080".parse().unwrap()));
-    }
-
-    #[test]
-    fn destination_allowed_matches_any_one_of_several_configured_endpoints() {
+    fn forward_target_matches_the_right_one_of_several_configured_endpoints_by_port() {
         let mut table = FlowTable::new();
         table.admit(
             "n-1".to_string(),
@@ -781,11 +780,14 @@ mod tests {
             vec![endpoint("10.0.0.5", 443), endpoint("10.0.0.6", 8443)],
         );
 
-        assert!(table.destination_allowed("n-1", 40001, "10.0.0.6:8443".parse().unwrap()));
+        assert_eq!(
+            table.forward_target("n-1", 40001, 8443),
+            Some("10.0.0.6".parse().unwrap())
+        );
     }
 
     #[test]
-    fn destination_allowed_refuses_a_non_ip_literal_host_rather_than_matching_it() {
+    fn forward_target_is_none_for_a_non_ip_literal_host_rather_than_matching_it() {
         // v1 scope (TT-2046): only literal-IP endpoint hosts are enforceable.
         // A hostname must never silently pass - refuse, the safe direction.
         let mut table = FlowTable::new();
@@ -798,6 +800,6 @@ mod tests {
             vec![endpoint("crm.internal.example.com", 443)],
         );
 
-        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.5:443".parse().unwrap()));
+        assert_eq!(table.forward_target("n-1", 40001, 443), None);
     }
 }

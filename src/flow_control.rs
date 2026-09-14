@@ -388,16 +388,14 @@ mod tests {
         handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
 
         // store_with_entitled_device's gw-1 bundle configures 10.0.0.5:443.
-        assert!(table.lock().unwrap().destination_allowed(
-            "n-1",
-            51820,
-            "10.0.0.5:443".parse().unwrap()
-        ));
-        assert!(!table.lock().unwrap().destination_allowed(
-            "n-1",
-            51820,
-            "10.0.0.9:443".parse().unwrap()
-        ));
+        assert_eq!(
+            table.lock().unwrap().forward_target("n-1", 51820, 443),
+            Some("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            table.lock().unwrap().forward_target("n-1", 51820, 8080),
+            None
+        );
     }
 
     #[tokio::test]

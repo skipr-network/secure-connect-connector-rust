@@ -13,6 +13,7 @@ mod signature_binding;
 mod tun_device;
 mod tunnel;
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -483,13 +484,19 @@ async fn dial_new_nodes(
 ///   #1: decrypting successfully proves the packet came from a genuine node
 ///   tunnel, but says nothing about whether Gatekeeper's flow-admission
 ///   relay ever admitted this specific device/gateway; before that fix, ANY
-///   decrypted traffic was forwarded regardless) - and, since TT-2046, also
-///   on the packet's real destination matching one of the entitled gateway's
-///   configured internal endpoints. Being admitted only proves the device is
-///   entitled to *a* gateway; nothing previously checked that the traffic
-///   was actually headed to the address that gateway is configured to
-///   expose, so an admitted flow could reach anywhere this host can route
-///   to.
+///   decrypted traffic was forwarded regardless) - and, since TT-2046,
+///   rewritten to the entitled gateway's real configured internal endpoint
+///   before being written to the TUN device. The address this packet
+///   carries on arrival is never that real endpoint: it's Gatekeeper's
+///   invented, unroutable per-gateway virtual address (DNS-resolution
+///   only - see `flow_table::forward_target`'s doc comment), so writing it
+///   to TUN unchanged could never have reached anywhere real even before
+///   TT-2046's admission check existed. `forward_target` resolves the real
+///   address by matching the packet's destination *port* (never translated
+///   by Gatekeeper, so it's the client's real intent) against the entitled
+///   gateway's configured endpoints; `tunnel::rewrite_destination_ipv4` does
+///   the actual byte-level rewrite, including the checksum fixups a raw
+///   address change requires.
 ///
 /// Runs for the lifetime of the process; a single receive error is logged
 /// and the loop continues - one bad datagram must not take down every
@@ -520,7 +527,10 @@ async fn run_wireguard_receive_loop(
         let event = tunnel.receive(&buf[..len]);
         drop(manager);
 
-        let mut forwardable = false;
+        // `Some(real_dst)`: rewrite to this real endpoint before forwarding. `Some(None)`: this
+        // *is* the control-channel packet itself - forward unchanged, no rewrite. `None`: don't
+        // forward at all.
+        let mut forward: Option<Option<Ipv4Addr>> = None;
         if let TunnelEvent::DecryptedData(ref packet) = event {
             if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
                 // Addressed to the Connector's own control-channel address (TT-1838) - Gatekeeper
@@ -531,32 +541,31 @@ async fn run_wireguard_receive_loop(
                 // the trust boundary here (Konyk, TT-1732 thread) - now a real one, since this
                 // address is no longer reachable by anything other than the genuine peer whose
                 // wg0 allowed-ips include it.
-                forwardable = true;
+                forward = Some(None);
             } else {
                 match (
                     tunnel::parse_source_port(packet),
-                    Tunn::dst_address(packet),
                     tunnel::parse_destination_port(packet),
                 ) {
-                    (Some(source_port), Some(dst_ip), Some(dst_port)) => {
-                        let destination = std::net::SocketAddr::new(dst_ip, dst_port);
-                        let allowed = flow_table
+                    (Some(source_port), Some(dst_port)) => {
+                        let target = flow_table
                             .lock()
                             .expect("flow table lock poisoned")
-                            .destination_allowed(&node_id, source_port, destination);
-                        if allowed {
-                            forwardable = true;
-                        } else {
-                            warn!(
-                                %node_id, source_port, %destination,
-                                "decrypted packet is not an admitted flow to a configured endpoint - dropping"
-                            );
+                            .forward_target(&node_id, source_port, dst_port);
+                        match target {
+                            Some(real_dst) => forward = Some(Some(real_dst)),
+                            None => {
+                                warn!(
+                                    %node_id, source_port, dst_port,
+                                    "decrypted packet is not an admitted flow to a configured endpoint - dropping"
+                                );
+                            }
                         }
                     }
                     _ => {
                         warn!(
                             %node_id,
-                            "decrypted packet has no parseable source port and/or destination - dropping"
+                            "decrypted packet has no parseable source and/or destination port - dropping"
                         );
                     }
                 }
@@ -569,8 +578,17 @@ async fn run_wireguard_receive_loop(
                     error!(%error, %src, "failed to send WireGuard response packet");
                 }
             }
-            TunnelEvent::DecryptedData(packet) => {
-                if forwardable && let Err(error) = tun_writer.write_packet(&packet).await {
+            TunnelEvent::DecryptedData(mut packet) => {
+                let Some(rewrite_to) = forward else {
+                    continue;
+                };
+                if let Some(real_dst) = rewrite_to
+                    && !tunnel::rewrite_destination_ipv4(&mut packet, real_dst)
+                {
+                    warn!(%node_id, %real_dst, "failed to rewrite decrypted packet's destination - dropping");
+                    continue;
+                }
+                if let Err(error) = tun_writer.write_packet(&packet).await {
                     error!(%error, node_id = %node_id, "failed to write decrypted packet to TUN device");
                 }
             }
