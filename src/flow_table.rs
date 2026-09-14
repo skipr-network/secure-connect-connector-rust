@@ -27,6 +27,9 @@
 //! inferred) is the only thing this Connector can trust for that lookup.
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+
+use crate::dto::PolicyBundleEndpoint;
 
 #[derive(Debug, Clone, PartialEq)]
 struct AdmittedFlow {
@@ -39,6 +42,17 @@ struct AdmittedFlow {
     /// flows on this gateway" without anything Gatekeeper's release contract
     /// already carries (`flow_id`/`port` alone can't answer "which user").
     device_public_key: String,
+    /// The entitled gateway's configured internal endpoints, from the same
+    /// `PolicyBundle.endpoints` `AccessDecision::Allowed` already resolved at
+    /// admission time (TT-2046). Being admitted only proves the device is
+    /// entitled to this *gateway* - it says nothing about which address the
+    /// gateway is actually supposed to expose. Without checking a forwarded
+    /// packet's real destination against this list, `main`'s TUN-based
+    /// forwarding loop would relay traffic to whatever destination a packet
+    /// happens to carry, not just the admin-configured endpoint (the gap
+    /// `access.rs`'s own module doc flagged as "the endpoints an Allowed
+    /// decision names aren't dialed anywhere yet").
+    endpoints: Vec<PolicyBundleEndpoint>,
 }
 
 #[derive(Default)]
@@ -65,6 +79,7 @@ impl FlowTable {
         gateway_id: String,
         flow_id: String,
         device_public_key: String,
+        endpoints: Vec<PolicyBundleEndpoint>,
     ) {
         self.nodes_by_port
             .entry(port)
@@ -76,6 +91,7 @@ impl FlowTable {
                 gateway_id,
                 flow_id,
                 device_public_key,
+                endpoints,
             },
         );
     }
@@ -153,11 +169,43 @@ impl FlowTable {
 
     /// The gateway this (node_id, port) pair is currently admitted for, or
     /// `None` if there's no matching admitted flow at all - callers must
-    /// treat that as "refuse", never as "admit anyway".
+    /// treat that as "refuse", never as "admit anyway". Not called by
+    /// production code any more (TT-2046): `run_wireguard_receive_loop`'s
+    /// real gate is now `destination_allowed`, which is admission-checking
+    /// plus destination-checking in one call. Kept and still genuinely
+    /// useful: most existing tests are about admission/eviction bookkeeping
+    /// itself, not endpoint enforcement, and asserting on the resolved
+    /// gateway_id directly is more precise there than routing everything
+    /// through a destination match.
+    #[allow(dead_code)]
     pub fn gateway_for(&self, node_id: &str, port: u16) -> Option<&str> {
         self.flows
             .get(&(node_id.to_string(), port))
             .map(|flow| flow.gateway_id.as_str())
+    }
+
+    /// Whether a packet is not just admitted (TT-1732 review, Tasneem finding
+    /// #1 - `gateway_for`) but destined to one of the addresses the entitled
+    /// gateway is actually configured to expose (TT-2046). Being admitted
+    /// only proves the device is entitled to *this gateway*; it says nothing
+    /// about which internal address the gateway is supposed to reach.
+    /// `false` for an unadmitted (node_id, port) too - callers don't need to
+    /// call `gateway_for` separately first.
+    ///
+    /// `PolicyBundleEndpoint.host` is compared as a literal IP only (v1
+    /// scope, TT-2046) - a host that doesn't parse as one can never match,
+    /// which is the safe direction to fail in (refuse, not silently admit).
+    pub fn destination_allowed(&self, node_id: &str, port: u16, destination: SocketAddr) -> bool {
+        let Some(flow) = self.flows.get(&(node_id.to_string(), port)) else {
+            return false;
+        };
+        flow.endpoints.iter().any(|endpoint| {
+            endpoint.port == destination.port()
+                && endpoint
+                    .host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip == destination.ip())
+        })
     }
 
     /// Reverse of admission (TT-1847): given only a port - all a reply packet
@@ -206,6 +254,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         assert_eq!(table.gateway_for("n-1", 40001), Some("gw-1"));
@@ -220,6 +269,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         assert!(table.gateway_for("n-2", 40001).is_none());
@@ -234,6 +284,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.release("flow-1");
@@ -250,6 +301,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.release("flow-does-not-exist");
@@ -266,6 +318,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         table.admit(
             "n-1".to_string(),
@@ -273,6 +326,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.release("flow-1");
@@ -297,6 +351,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         assert_eq!(table.node_for_port(40001), Some("n-1"));
@@ -316,6 +371,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         table.admit(
             "n-2".to_string(),
@@ -323,6 +379,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         assert!(table.node_for_port(40001).is_none());
@@ -337,6 +394,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         table.admit(
             "n-2".to_string(),
@@ -344,6 +402,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.release("flow-2");
@@ -360,6 +419,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         table.admit(
             "n-1".to_string(),
@@ -367,6 +427,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         assert_eq!(table.node_for_port(40001), Some("n-1"));
@@ -382,6 +443,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         table.admit(
             "n-1".to_string(),
@@ -389,6 +451,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.evict_node("n-1");
@@ -406,6 +469,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         table.admit(
             "n-2".to_string(),
@@ -413,6 +477,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.evict_node("n-1");
@@ -432,6 +497,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         table.admit(
             "n-2".to_string(),
@@ -439,6 +505,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
         assert!(table.node_for_port(40001).is_none());
 
@@ -456,6 +523,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.evict_node("n-does-not-exist");
@@ -477,6 +545,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         table.release("flow-1");
@@ -486,6 +555,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         assert_eq!(table.node_for_port(40001), Some("n-2"));
@@ -500,6 +570,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         table.admit(
             "n-1".to_string(),
@@ -507,6 +578,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-2".to_string(),
             "dev-B".to_string(),
+            vec![],
         );
 
         let evicted = table.evict_gateway_device("gw-1", "dev-A");
@@ -528,6 +600,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         table.admit(
             "n-1".to_string(),
@@ -535,6 +608,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
 
         table.evict_gateway_device("gw-1", "dev-A");
@@ -555,6 +629,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         table.admit(
             "n-1".to_string(),
@@ -562,6 +637,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-2".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
 
         let evicted = table.evict_gateway_device("gw-1", "dev-A");
@@ -580,6 +656,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
 
         table.evict_gateway_device("gw-1", "dev-A");
@@ -589,6 +666,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-B".to_string(),
+            vec![],
         );
 
         assert_eq!(table.node_for_port(40001), Some("n-2"));
@@ -612,6 +690,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         // The port is reused for a new flow (e.g. after the first was
@@ -622,8 +701,103 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-1".to_string(),
+            vec![],
         );
 
         assert_eq!(table.gateway_for("n-1", 40001), Some("gw-2"));
+    }
+
+    fn endpoint(host: &str, port: u16) -> PolicyBundleEndpoint {
+        PolicyBundleEndpoint {
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn destination_allowed_is_false_for_an_unadmitted_flow() {
+        let table = FlowTable::new();
+
+        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.5:443".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_allowed_matches_a_configured_endpoint() {
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![endpoint("10.0.0.5", 443)],
+        );
+
+        assert!(table.destination_allowed("n-1", 40001, "10.0.0.5:443".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_allowed_refuses_a_different_address_even_though_the_flow_is_admitted() {
+        // TT-2046: the sharpest case - the flow itself is legitimately
+        // admitted (the user is entitled to the gateway), but the packet is
+        // headed somewhere the gateway was never configured to expose.
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![endpoint("10.0.0.5", 443)],
+        );
+
+        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.9:443".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_allowed_refuses_the_right_host_on_the_wrong_port() {
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![endpoint("10.0.0.5", 443)],
+        );
+
+        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.5:8080".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_allowed_matches_any_one_of_several_configured_endpoints() {
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![endpoint("10.0.0.5", 443), endpoint("10.0.0.6", 8443)],
+        );
+
+        assert!(table.destination_allowed("n-1", 40001, "10.0.0.6:8443".parse().unwrap()));
+    }
+
+    #[test]
+    fn destination_allowed_refuses_a_non_ip_literal_host_rather_than_matching_it() {
+        // v1 scope (TT-2046): only literal-IP endpoint hosts are enforceable.
+        // A hostname must never silently pass - refuse, the safe direction.
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![endpoint("crm.internal.example.com", 443)],
+        );
+
+        assert!(!table.destination_allowed("n-1", 40001, "10.0.0.5:443".parse().unwrap()));
     }
 }

@@ -483,7 +483,13 @@ async fn dial_new_nodes(
 ///   #1: decrypting successfully proves the packet came from a genuine node
 ///   tunnel, but says nothing about whether Gatekeeper's flow-admission
 ///   relay ever admitted this specific device/gateway; before that fix, ANY
-///   decrypted traffic was forwarded regardless).
+///   decrypted traffic was forwarded regardless) - and, since TT-2046, also
+///   on the packet's real destination matching one of the entitled gateway's
+///   configured internal endpoints. Being admitted only proves the device is
+///   entitled to *a* gateway; nothing previously checked that the traffic
+///   was actually headed to the address that gateway is configured to
+///   expose, so an admitted flow could reach anywhere this host can route
+///   to.
 ///
 /// Runs for the lifetime of the process; a single receive error is logged
 /// and the loop continues - one bad datagram must not take down every
@@ -527,24 +533,31 @@ async fn run_wireguard_receive_loop(
                 // wg0 allowed-ips include it.
                 forwardable = true;
             } else {
-                match tunnel::parse_source_port(packet) {
-                    Some(source_port) => {
-                        let is_admitted = flow_table
+                match (
+                    tunnel::parse_source_port(packet),
+                    Tunn::dst_address(packet),
+                    tunnel::parse_destination_port(packet),
+                ) {
+                    (Some(source_port), Some(dst_ip), Some(dst_port)) => {
+                        let destination = std::net::SocketAddr::new(dst_ip, dst_port);
+                        let allowed = flow_table
                             .lock()
                             .expect("flow table lock poisoned")
-                            .gateway_for(&node_id, source_port)
-                            .is_some();
-                        if is_admitted {
+                            .destination_allowed(&node_id, source_port, destination);
+                        if allowed {
                             forwardable = true;
                         } else {
                             warn!(
-                                %node_id, source_port,
-                                "decrypted packet has no matching admitted flow - dropping"
+                                %node_id, source_port, %destination,
+                                "decrypted packet is not an admitted flow to a configured endpoint - dropping"
                             );
                         }
                     }
-                    None => {
-                        warn!(%node_id, "decrypted packet has no parseable source port - dropping");
+                    _ => {
+                        warn!(
+                            %node_id,
+                            "decrypted packet has no parseable source port and/or destination - dropping"
+                        );
                     }
                 }
             }
@@ -1145,6 +1158,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         let old_bundles = vec![bundle("gw-1", &["dev-A"])];
         let new_bundles = vec![bundle("gw-1", &[])];
@@ -1169,6 +1183,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         let old_bundles = vec![bundle("gw-1", &["dev-A"])];
         let new_bundles = vec![bundle("gw-1", &["dev-A"])];
@@ -1192,6 +1207,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         flow_table.lock().unwrap().admit(
             "n-1".to_string(),
@@ -1199,6 +1215,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         let old_bundles = vec![bundle("gw-1", &["dev-A"]), bundle("gw-2", &["dev-A"])];
         let new_bundles = vec![bundle("gw-1", &[]), bundle("gw-2", &["dev-A"])];
@@ -1227,6 +1244,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         let old_bundles = vec![bundle("gw-1", &["dev-A"])];
         let new_bundles: Vec<PolicyBundle> = vec![];
@@ -1326,6 +1344,7 @@ mod tests {
             "gw-1".to_string(),
             "flow-1".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
         flow_table.lock().unwrap().admit(
             "n-1".to_string(),
@@ -1333,6 +1352,7 @@ mod tests {
             "gw-2".to_string(),
             "flow-2".to_string(),
             "dev-A".to_string(),
+            vec![],
         );
 
         let result = run_heartbeat(
