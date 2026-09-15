@@ -13,7 +13,6 @@ mod signature_binding;
 mod tun_device;
 mod tunnel;
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -469,34 +468,87 @@ async fn dial_new_nodes(
     }
 }
 
-/// Drives every node tunnel's WireGuard session from the network side:
-/// receives a datagram, matches it to the node it came from, feeds it to
-/// that tunnel, and either sends back whatever the tunnel produces in
-/// response (e.g. the initiator's post-handshake keepalive) or, for real
-/// decrypted payload data, writes it to the TUN device so the OS's own IP
-/// stack delivers it onward. Two distinct cases (TT-1838), gated
-/// differently:
-/// - Addressed to `connector_virtual_ip` itself: Gatekeeper's flow-admission/
-///   release control channel, always forwarded - see the inline comment at
-///   the gate for why no flow_table check applies here.
-/// - Addressed anywhere else: forwarded traffic for admitted user flows,
-///   still gated on `flow_table` (TT-1827, TT-1732 review, Tasneem finding
-///   #1: decrypting successfully proves the packet came from a genuine node
-///   tunnel, but says nothing about whether Gatekeeper's flow-admission
-///   relay ever admitted this specific device/gateway; before that fix, ANY
-///   decrypted traffic was forwarded regardless) - and, since TT-2046,
-///   rewritten to the entitled gateway's real configured internal endpoint
-///   before being written to the TUN device. The address this packet
-///   carries on arrival is never that real endpoint: it's Gatekeeper's
-///   invented, unroutable per-gateway virtual address (DNS-resolution
-///   only - see `flow_table::forward_target`'s doc comment), so writing it
-///   to TUN unchanged could never have reached anywhere real even before
-///   TT-2046's admission check existed. `forward_target` resolves the real
-///   address by matching the packet's destination *port* (never translated
-///   by Gatekeeper, so it's the client's real intent) against the entitled
-///   gateway's configured endpoints; `tunnel::rewrite_destination_ipv4` does
-///   the actual byte-level rewrite, including the checksum fixups a raw
-///   address change requires.
+/// Decides what to do with one decrypted packet, and does the address rewrite in place if
+/// forwarding it - the entire admission/endpoint gate for `run_wireguard_receive_loop`,
+/// factored out as a synchronous, sans-I/O function (no socket, no TUN device) specifically so
+/// the forward/drop/rewrite decision itself is directly unit-testable (TT-2046 review) rather
+/// than only reachable by running the whole daemon against a real socket. Two distinct cases
+/// (TT-1838), gated differently:
+/// - Addressed to `connector_virtual_ip` itself: Gatekeeper's flow-admission/release control
+///   channel, always forwarded unchanged - the flow_table gate below exists to authorize
+///   *forwarded* traffic; it has no entry for this because this packet *is* the thing that
+///   would create one. Reachability through the tunnel is itself the trust boundary here
+///   (Konyk, TT-1732 thread) - a real one, since this address is no longer reachable by
+///   anything other than the genuine peer whose wg0 allowed-ips include it.
+/// - Addressed anywhere else: forwarded traffic for admitted user flows, gated on `flow_table`
+///   (TT-1827, TT-1732 review: decrypting successfully proves the packet came from a genuine
+///   node tunnel, but says nothing about whether Gatekeeper's flow-admission relay ever
+///   admitted this specific device/gateway; before that fix, ANY decrypted traffic was
+///   forwarded regardless) - and, since TT-2046, rewritten to the entitled gateway's real
+///   configured internal endpoint. The address this packet carries on arrival is never that
+///   real endpoint: it's Gatekeeper's invented, unroutable per-gateway virtual address
+///   (DNS-resolution only - see `flow_table::forward_target`'s doc comment), so forwarding it
+///   unchanged could never have reached anywhere real even before TT-2046's admission check
+///   existed. `forward_target` resolves the real address by matching the packet's destination
+///   *port* (never translated by Gatekeeper, so it's the client's real intent) against the
+///   entitled gateway's configured endpoints; `tunnel::rewrite_destination_ipv4` does the
+///   actual byte-level rewrite, including the checksum fixups a raw address change requires.
+///
+/// Returns `true` (packet mutated in place if a rewrite was needed, ready to write to TUN
+/// as-is) or `false` (packet must not be forwarded - contents are unspecified, e.g. partially
+/// rewritten).
+fn prepare_decrypted_packet_for_forwarding(
+    packet: &mut [u8],
+    node_id: &str,
+    connector_virtual_ip: std::net::IpAddr,
+    flow_table: &FlowTable,
+) -> bool {
+    if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
+        return true;
+    }
+
+    let (Some(source_port), Some(dst_port)) = (
+        tunnel::parse_source_port(packet),
+        tunnel::parse_destination_port(packet),
+    ) else {
+        warn!(
+            %node_id,
+            "decrypted packet has no parseable source and/or destination port - dropping"
+        );
+        return false;
+    };
+
+    let Some(real_dst) = flow_table.forward_target(node_id, source_port, dst_port) else {
+        warn!(
+            %node_id, source_port, dst_port,
+            "decrypted packet is not an admitted flow to a configured endpoint - dropping"
+        );
+        return false;
+    };
+
+    if tunnel::rewrite_destination_ipv4(packet, real_dst) {
+        return true;
+    }
+
+    // Distinguish the known v1 scope boundary (IPv6 - `rewrite_destination_ipv4` always
+    // rejects it) from a genuinely unexpected rewrite failure, so this doesn't read as a bug
+    // to chase during on-call debugging of a dual-stack customer network.
+    if packet.first().is_some_and(|&byte| byte >> 4 == 6) {
+        warn!(
+            %node_id, %real_dst,
+            "decrypted packet is IPv6 - endpoint rewriting only supports IPv4 in this version, dropping"
+        );
+    } else {
+        warn!(%node_id, %real_dst, "failed to rewrite decrypted packet's destination - dropping");
+    }
+    false
+}
+
+/// Drives every node tunnel's WireGuard session from the network side: receives a datagram,
+/// matches it to the node it came from, feeds it to that tunnel, and either sends back
+/// whatever the tunnel produces in response (e.g. the initiator's post-handshake keepalive)
+/// or, for real decrypted payload data, hands it to `prepare_decrypted_packet_for_forwarding`
+/// and writes it to the TUN device if that says to.
 ///
 /// Runs for the lifetime of the process; a single receive error is logged
 /// and the loop continues - one bad datagram must not take down every
@@ -527,51 +579,6 @@ async fn run_wireguard_receive_loop(
         let event = tunnel.receive(&buf[..len]);
         drop(manager);
 
-        // `Some(real_dst)`: rewrite to this real endpoint before forwarding. `Some(None)`: this
-        // *is* the control-channel packet itself - forward unchanged, no rewrite. `None`: don't
-        // forward at all.
-        let mut forward: Option<Option<Ipv4Addr>> = None;
-        if let TunnelEvent::DecryptedData(ref packet) = event {
-            if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
-                // Addressed to the Connector's own control-channel address (TT-1838) - Gatekeeper
-                // calling this Connector's own flow-admission/release API, not traffic being
-                // forwarded onward to some internal endpoint. The flow_table gate below exists to
-                // authorize *forwarded* traffic; it has no entry for this because this packet
-                // *is* the thing that would create one. Reachability through the tunnel is itself
-                // the trust boundary here (Konyk, TT-1732 thread) - now a real one, since this
-                // address is no longer reachable by anything other than the genuine peer whose
-                // wg0 allowed-ips include it.
-                forward = Some(None);
-            } else {
-                match (
-                    tunnel::parse_source_port(packet),
-                    tunnel::parse_destination_port(packet),
-                ) {
-                    (Some(source_port), Some(dst_port)) => {
-                        let target = flow_table
-                            .lock()
-                            .expect("flow table lock poisoned")
-                            .forward_target(&node_id, source_port, dst_port);
-                        match target {
-                            Some(real_dst) => forward = Some(Some(real_dst)),
-                            None => {
-                                warn!(
-                                    %node_id, source_port, dst_port,
-                                    "decrypted packet is not an admitted flow to a configured endpoint - dropping"
-                                );
-                            }
-                        }
-                    }
-                    _ => {
-                        warn!(
-                            %node_id,
-                            "decrypted packet has no parseable source and/or destination port - dropping"
-                        );
-                    }
-                }
-            }
-        }
-
         match event {
             TunnelEvent::SendToNode(packet) => {
                 if let Err(error) = wg_socket.send_to(&packet, src).await {
@@ -579,13 +586,19 @@ async fn run_wireguard_receive_loop(
                 }
             }
             TunnelEvent::DecryptedData(mut packet) => {
-                let Some(rewrite_to) = forward else {
-                    continue;
+                // Block-scoped (not a manual `drop`) so the std::sync::MutexGuard - not Send -
+                // provably can't be held across the `.await` below, which tokio::spawn's Send
+                // bound on the whole future requires.
+                let should_forward = {
+                    let table = flow_table.lock().expect("flow table lock poisoned");
+                    prepare_decrypted_packet_for_forwarding(
+                        &mut packet,
+                        &node_id,
+                        connector_virtual_ip,
+                        &table,
+                    )
                 };
-                if let Some(real_dst) = rewrite_to
-                    && !tunnel::rewrite_destination_ipv4(&mut packet, real_dst)
-                {
-                    warn!(%node_id, %real_dst, "failed to rewrite decrypted packet's destination - dropping");
+                if !should_forward {
                     continue;
                 }
                 if let Err(error) = tun_writer.write_packet(&packet).await {
@@ -724,6 +737,172 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Minimal IPv4/UDP packet - no payload, checksums left at 0 (UDP's "none computed", left
+    /// alone by `rewrite_destination_ipv4` too), since `prepare_decrypted_packet_for_forwarding`
+    /// never validates a checksum, only `tunnel::rewrite_destination_ipv4` does (covered by its
+    /// own tests in `tunnel.rs`).
+    fn udp_packet(
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet[24..26].copy_from_slice(&8u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn prepare_decrypted_packet_forwards_a_control_channel_packet_unchanged() {
+        let connector_virtual_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1));
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            std::net::Ipv4Addr::new(10, 98, 0, 1),
+            51234,
+            8443,
+        );
+        let original = packet.clone();
+        let flow_table = FlowTable::new();
+
+        assert!(prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            "n-1",
+            connector_virtual_ip,
+            &flow_table
+        ));
+        assert_eq!(
+            packet, original,
+            "control-channel packet must be forwarded byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn prepare_decrypted_packet_drops_a_packet_for_an_unadmitted_flow() {
+        let connector_virtual_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1));
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            std::net::Ipv4Addr::new(10, 99, 0, 1), // Gatekeeper's fake virtual address - never admitted under it
+            51234,
+            443,
+        );
+        let flow_table = FlowTable::new();
+
+        assert!(!prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            "n-1",
+            connector_virtual_ip,
+            &flow_table
+        ));
+    }
+
+    #[test]
+    fn prepare_decrypted_packet_drops_an_admitted_flows_packet_to_an_unconfigured_port() {
+        let connector_virtual_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1));
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            std::net::Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            8080, // not one of the gateway's configured endpoints below
+        );
+        let mut flow_table = FlowTable::new();
+        flow_table.admit(
+            "n-1".to_string(),
+            51234,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 443,
+            }],
+        );
+
+        assert!(!prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            "n-1",
+            connector_virtual_ip,
+            &flow_table
+        ));
+    }
+
+    #[test]
+    fn prepare_decrypted_packet_rewrites_and_forwards_an_admitted_flows_packet() {
+        // The integration case this whole function exists to cover (TT-2046 review): an
+        // admitted flow's packet must actually come out rewritten to the gateway's real
+        // configured endpoint, not just "allowed" in the abstract.
+        let connector_virtual_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1));
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            std::net::Ipv4Addr::new(10, 99, 0, 1), // Gatekeeper's fake virtual address on arrival
+            51234,
+            443,
+        );
+        let mut flow_table = FlowTable::new();
+        flow_table.admit(
+            "n-1".to_string(),
+            51234,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 443,
+            }],
+        );
+
+        assert!(prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            "n-1",
+            connector_virtual_ip,
+            &flow_table
+        ));
+        assert_eq!(
+            &packet[16..20],
+            &[10, 0, 0, 5],
+            "must be rewritten to the real configured endpoint, not left on the fake virtual address"
+        );
+    }
+
+    #[test]
+    fn prepare_decrypted_packet_drops_an_ipv6_packet_even_when_a_matching_flow_would_admit_it() {
+        // v1 scope (TT-2046): rewrite_destination_ipv4 always rejects IPv6, so an admitted
+        // flow's IPv6 traffic must still be dropped, not forwarded unrewritten.
+        let connector_virtual_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1));
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60; // IPv6
+        packet[6] = 17; // next header: UDP
+        packet[7] = 64; // hop limit
+        packet[40..42].copy_from_slice(&51234u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&443u16.to_be_bytes());
+        let mut flow_table = FlowTable::new();
+        flow_table.admit(
+            "n-1".to_string(),
+            51234,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 443,
+            }],
+        );
+
+        assert!(!prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            "n-1",
+            connector_virtual_ip,
+            &flow_table
+        ));
     }
 
     #[tokio::test]

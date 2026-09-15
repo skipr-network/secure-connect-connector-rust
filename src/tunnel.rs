@@ -231,7 +231,10 @@ fn checksum_adjust(old_checksum: u16, old_word: u16, new_word: u16) -> u16 {
 /// `checksum_adjust`'s incremental update, not a full recompute, so this
 /// never needs to read or understand the L4 payload itself. UDP's checksum
 /// is optional (RFC 768): a `0` there means "none computed" and is left
-/// alone; TCP's is mandatory and always updated.
+/// alone; TCP's is mandatory and always updated. For UDP specifically, if
+/// the *updated* checksum itself computes to `0`, it's written as `0xFFFF`
+/// instead (RFC 768's own rule for a genuinely-zero checksum) - otherwise
+/// it would be indistinguishable from "no checksum computed".
 ///
 /// v1 scope: IPv4 only (matches every real endpoint example seen so far -
 /// `PolicyBundleEndpoint.host` as a literal IPv4). Returns `false` (packet
@@ -281,6 +284,14 @@ pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
     if protocol == 6 || l4_checksum != 0 {
         let l4_checksum = checksum_adjust(l4_checksum, old_dst_hi, new_dst_hi);
         let l4_checksum = checksum_adjust(l4_checksum, old_dst_lo, new_dst_lo);
+        // RFC 768: a UDP checksum that genuinely computes to 0 must be transmitted as
+        // 0xFFFF - 0x0000 on the wire means "no checksum was computed" instead. TCP has
+        // no such rule (0 is a plain valid TCP checksum), so this only applies to UDP.
+        let l4_checksum = if protocol == 17 && l4_checksum == 0 {
+            0xFFFF
+        } else {
+            l4_checksum
+        };
         write_u16(packet, l4_checksum_offset, l4_checksum);
     }
 
@@ -964,6 +975,59 @@ mod tests {
         ));
 
         assert_eq!(&packet[26..28], &[0, 0]);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_maps_a_genuinely_zero_computed_udp_checksum_to_0xffff() {
+        // RFC 768: when the *computed* checksum happens to be 0x0000, the sender must
+        // transmit 0xFFFF instead - 0x0000 on the wire means "no checksum was computed",
+        // which would misrepresent a packet that genuinely has one. Search the space of
+        // destination addresses for one that actually lands on this rare case for a fixed
+        // src/ports, rather than relying on a hand-picked value that might stop
+        // reproducing it if the packet template above ever changes.
+        let src = Ipv4Addr::new(10, 66, 66, 1);
+        let dst = Ipv4Addr::new(10, 99, 0, 1);
+        let packet_template = valid_ipv4_udp_packet(src, dst, 51234, 443);
+        let old_dst_hi = read_u16(&packet_template, 16);
+        let old_dst_lo = read_u16(&packet_template, 18);
+        let old_l4_checksum = read_u16(&packet_template, 26);
+
+        let new_dst = (0..=255u8)
+            .flat_map(|a| (0..=255u8).map(move |b| Ipv4Addr::new(10, 0, a, b)))
+            .find(|candidate| {
+                let octets = candidate.octets();
+                let new_hi = u16::from_be_bytes([octets[0], octets[1]]);
+                let new_lo = u16::from_be_bytes([octets[2], octets[3]]);
+                let adjusted = checksum_adjust(
+                    checksum_adjust(old_l4_checksum, old_dst_hi, new_hi),
+                    old_dst_lo,
+                    new_lo,
+                );
+                adjusted == 0
+            })
+            .expect("a destination producing a zero computed UDP checksum must exist in this search space");
+
+        let mut packet = packet_template;
+        assert!(rewrite_destination_ipv4(&mut packet, new_dst));
+
+        assert_eq!(
+            &packet[26..28],
+            &[0xFF, 0xFF],
+            "a genuinely-zero-computed UDP checksum must be transmitted as 0xFFFF, not 0x0000"
+        );
+
+        // The verification trick still holds for the substituted 0xFFFF value: a checksum
+        // field containing either ones'-complement representation of zero (0x0000 or
+        // 0xFFFF) folds the full sum to 0xFFFF.
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&src.octets());
+        pseudo_and_segment.extend_from_slice(&new_dst.octets());
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(17);
+        let udp_len = (packet.len() - 20) as u16;
+        pseudo_and_segment.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..]);
+        assert_eq!(reference_ones_complement_sum(&pseudo_and_segment), 0xFFFF);
     }
 
     fn valid_ipv4_tcp_packet(
