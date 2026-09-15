@@ -16,6 +16,15 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// Bounds a single hostname's lookup so a hanging/unreachable DNS server can never stall the
+/// whole `refresh` call - `refresh` runs synchronously inside `main::run_heartbeat`, so an
+/// un-timed lookup would otherwise block that entire heartbeat cycle (policy application, node
+/// dialing, entitlement-revocation reconciliation) indefinitely, for every gateway this Connector
+/// serves, not just the one with the bad DNS. Generous relative to real DNS latency, short
+/// relative to the heartbeat interval (60s default).
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub struct DnsCache {
@@ -67,7 +76,17 @@ impl DnsCache {
             .collect();
 
         for host in &wanted {
-            match lookup(host.clone()).await {
+            let Ok(lookup_result) =
+                tokio::time::timeout(LOOKUP_TIMEOUT, lookup(host.clone())).await
+            else {
+                tracing::warn!(
+                    host,
+                    timeout = ?LOOKUP_TIMEOUT,
+                    "DNS resolution timed out - keeping any previously cached value"
+                );
+                continue;
+            };
+            match lookup_result {
                 Ok(addrs) => match addrs.into_iter().next() {
                     Some(ip) => {
                         self.resolved
@@ -179,6 +198,30 @@ mod tests {
         cache
             .refresh_with(["crm.internal.example.com".to_string()], |_host| async {
                 Err(std::io::Error::other("temporary DNS failure"))
+            })
+            .await;
+
+        assert_eq!(
+            cache.resolve("crm.internal.example.com"),
+            Some(Ipv4Addr::new(10, 0, 0, 5))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_times_out_a_hanging_lookup_and_keeps_the_previously_cached_value() {
+        // A lookup that never resolves must not stall refresh (and, in production, the whole
+        // heartbeat cycle) forever - time is paused/auto-advanced here so this test doesn't
+        // actually wait out the real timeout.
+        let cache = DnsCache::new();
+        cache
+            .refresh_with(["crm.internal.example.com".to_string()], |_host| async {
+                Ok(vec![Ipv4Addr::new(10, 0, 0, 5)])
+            })
+            .await;
+
+        cache
+            .refresh_with(["crm.internal.example.com".to_string()], |_host| {
+                std::future::pending::<std::io::Result<Vec<Ipv4Addr>>>()
             })
             .await;
 
