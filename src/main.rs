@@ -1,5 +1,6 @@
 mod access;
 mod audit;
+mod ca_trust;
 mod config;
 mod crypto;
 mod dto;
@@ -111,7 +112,18 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let http = reqwest::Client::new();
+    // TT-2027: CONNECTOR_CA_BUNDLE_PATH, when set, adds one or more extra trusted root CAs on
+    // top of the default trust (Mozilla's bundled roots plus, via rustls-tls-native-roots, the
+    // box's own OS trust store) - never a replacement for it, and never `danger_accept_invalid_certs`.
+    let mut http_builder = reqwest::Client::builder();
+    if let Some(ca_bundle_path) = &config.ca_bundle_path {
+        for certificate in ca_trust::load_extra_root_certificates(ca_bundle_path)? {
+            http_builder = http_builder.add_root_certificate(certificate);
+        }
+    }
+    let http = http_builder
+        .build()
+        .context("failed to build the HTTP client")?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
     let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
     let policy_store = Arc::new(PolicyStore::new());
@@ -677,6 +689,7 @@ mod tests {
             control_plane_port: 0,
             tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
+            ca_bundle_path: None,
         }
     }
 

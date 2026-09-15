@@ -57,6 +57,14 @@ Requires these environment variables:
 | `CONNECTOR_CONTROL_PLANE_PORT`   | no       | `8443`                                        |
 | `CONNECTOR_TUN_NETMASK`          | no       | `255.255.255.0`                               |
 | `HEARTBEAT_INTERVAL_SECONDS`     | no       | `60`                                          |
+| `CONNECTOR_CA_BUNDLE_PATH`       | no       | unset                                         |
+
+**`CONNECTOR_CA_BUNDLE_PATH`** - a PEM bundle (one or more certificates) of extra root CAs to
+trust for the Agent/Registry connections, for an Agent running behind a private/internal CA. Not
+usually needed: if the CA is already installed in the box's own OS trust store (the standard
+on-prem procedure), the Connector trusts it automatically with no configuration at all. Set this
+only when that isn't the case. An unreadable file or invalid PEM fails the daemon at startup
+rather than silently falling back to the default trust.
 
 **`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** - it is
 not persisted anywhere by itself. Portal's install command sets it inline for that one command
