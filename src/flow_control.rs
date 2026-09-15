@@ -388,12 +388,19 @@ mod tests {
         handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
 
         // store_with_entitled_device's gw-1 bundle configures 10.0.0.5:443.
+        let dns_cache = crate::dns_cache::DnsCache::new();
         assert_eq!(
-            table.lock().unwrap().forward_target("n-1", 51820, 443),
+            table
+                .lock()
+                .unwrap()
+                .forward_target("n-1", 51820, 443, &dns_cache),
             Some("10.0.0.5".parse().unwrap())
         );
         assert_eq!(
-            table.lock().unwrap().forward_target("n-1", 51820, 8080),
+            table
+                .lock()
+                .unwrap()
+                .forward_target("n-1", 51820, 8080, &dns_cache),
             None
         );
     }

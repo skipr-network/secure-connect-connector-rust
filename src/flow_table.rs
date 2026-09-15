@@ -203,20 +203,23 @@ impl FlowTable {
     /// address rewrite (`tunnel::rewrite_destination_ipv4`) happens after
     /// this call, using the `Ipv4Addr` this returns.
     ///
-    /// `PolicyBundleEndpoint.host` is resolved as a literal IPv4 only (v1
-    /// scope, TT-2046) - a host that doesn't parse as one can never match,
-    /// which is the safe direction to fail in (refuse, not silently admit).
+    /// `PolicyBundleEndpoint.host` is resolved via `dns_cache` (TT-2066) - a literal IPv4
+    /// resolves to itself with no lookup; a hostname resolves to whatever `dns_cache` last
+    /// successfully looked up for it (refreshed once per heartbeat, never synchronously here -
+    /// see `dns_cache`'s module doc), or `None` if it's never resolved successfully, which is
+    /// the safe direction to fail in (refuse, not silently admit).
     pub fn forward_target(
         &self,
         node_id: &str,
         port: u16,
         packet_destination_port: u16,
+        dns_cache: &crate::dns_cache::DnsCache,
     ) -> Option<Ipv4Addr> {
         let flow = self.flows.get(&(node_id.to_string(), port))?;
         flow.endpoints
             .iter()
             .find(|endpoint| endpoint.port == packet_destination_port)
-            .and_then(|endpoint| endpoint.host.parse::<Ipv4Addr>().ok())
+            .and_then(|endpoint| dns_cache.resolve(&endpoint.host))
     }
 
     /// Reverse of admission (TT-1847): given only a port - all a reply packet
@@ -728,8 +731,9 @@ mod tests {
     #[test]
     fn forward_target_is_none_for_an_unadmitted_flow() {
         let table = FlowTable::new();
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
-        assert_eq!(table.forward_target("n-1", 40001, 443), None);
+        assert_eq!(table.forward_target("n-1", 40001, 443, &dns_cache), None);
     }
 
     #[test]
@@ -743,9 +747,10 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("10.0.0.5", 443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             Some("10.0.0.5".parse().unwrap())
         );
     }
@@ -764,8 +769,9 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("10.0.0.5", 443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
-        assert_eq!(table.forward_target("n-1", 40001, 8080), None);
+        assert_eq!(table.forward_target("n-1", 40001, 8080, &dns_cache), None);
     }
 
     #[test]
@@ -779,17 +785,18 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("10.0.0.5", 443), endpoint("10.0.0.6", 8443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 8443),
+            table.forward_target("n-1", 40001, 8443, &dns_cache),
             Some("10.0.0.6".parse().unwrap())
         );
     }
 
     #[test]
-    fn forward_target_is_none_for_a_non_ip_literal_host_rather_than_matching_it() {
-        // v1 scope (TT-2046): only literal-IP endpoint hosts are enforceable.
-        // A hostname must never silently pass - refuse, the safe direction.
+    fn forward_target_is_none_for_a_hostname_not_yet_resolved_in_the_dns_cache() {
+        // TT-2066: a hostname endpoint is enforceable once resolved, but never trusted before
+        // that - refuse, the safe direction, same as an unadmitted flow.
         let mut table = FlowTable::new();
         table.admit(
             "n-1".to_string(),
@@ -799,7 +806,34 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("crm.internal.example.com", 443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
-        assert_eq!(table.forward_target("n-1", 40001, 443), None);
+        assert_eq!(table.forward_target("n-1", 40001, 443, &dns_cache), None);
+    }
+
+    #[tokio::test]
+    async fn forward_target_resolves_a_hostname_endpoint_once_the_dns_cache_has_it() {
+        // TT-2066: the whole point - a hostname endpoint (Portal always allowed configuring one)
+        // now actually forwards, once the Connector's own DNS cache has resolved it.
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![endpoint("crm.internal.example.com", 443)],
+        );
+        let dns_cache = crate::dns_cache::DnsCache::new();
+        dns_cache
+            .refresh_with(["crm.internal.example.com".to_string()], |_host| async {
+                Ok(vec!["10.0.0.5".parse().unwrap()])
+            })
+            .await;
+
+        assert_eq!(
+            table.forward_target("n-1", 40001, 443, &dns_cache),
+            Some("10.0.0.5".parse().unwrap())
+        );
     }
 }

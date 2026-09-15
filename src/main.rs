@@ -2,6 +2,7 @@ mod access;
 mod audit;
 mod config;
 mod crypto;
+mod dns_cache;
 mod dto;
 mod flow_control;
 mod flow_table;
@@ -135,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
     // device) since run_heartbeat's node-dialing needs it too, to evict a departed node's flows
     // (TT-1732 review, Tasneem, TT-1847 finding #1).
     let flow_table = Arc::new(std::sync::Mutex::new(FlowTable::new()));
+    // Refreshed once per heartbeat cycle in `run_heartbeat`, read synchronously on every
+    // decrypted packet in `run_wireguard_receive_loop` (TT-2066) - see `dns_cache`'s module doc.
+    let dns_cache = Arc::new(dns_cache::DnsCache::new());
 
     // TT-1838: the TUN device's own address is connector_virtual_ip - Portal's registered,
     // per-Connector control-channel address - not a locally guessed default anymore, so it can
@@ -152,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await
         {
@@ -183,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         tun_writer,
         flow_table.clone(),
         std::net::IpAddr::V4(connector_virtual_ip),
+        dns_cache.clone(),
     ));
     tokio::spawn(run_tun_send_loop(
         tun_reader,
@@ -237,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await
         {
@@ -292,6 +299,7 @@ async fn run_heartbeat(
     tunnel_manager: &Mutex<TunnelManager>,
     wg_socket: &UdpSocket,
     flow_table: &std::sync::Mutex<FlowTable>,
+    dns_cache: &dns_cache::DnsCache,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
     let agent_public_key = registry_client
         .get_agent_permitted_key(&config.agent_ip_address)
@@ -359,6 +367,17 @@ async fn run_heartbeat(
     if let Some(old_bundles) = old_bundles {
         reconcile_dropped_entitlements(flow_table, &old_bundles, &new_bundles);
     }
+
+    // TT-2066: re-resolve every currently-configured endpoint hostname off this same heartbeat
+    // cycle - new_bundles is the full, current set of every attached gateway's endpoints, so this
+    // also naturally drops a hostname's cache entry once it's no longer configured anywhere (see
+    // dns_cache::refresh's pruning). Never blocks/slows packet forwarding itself - that only ever
+    // reads the cache this populates, in flow_table::forward_target.
+    let endpoint_hosts = new_bundles
+        .iter()
+        .flat_map(|bundle| bundle.endpoints.iter())
+        .map(|endpoint| endpoint.host.clone());
+    dns_cache.refresh(endpoint_hosts).await;
 
     Ok(connector_virtual_ip)
 }
@@ -502,6 +521,7 @@ fn prepare_decrypted_packet_for_forwarding(
     node_id: &str,
     connector_virtual_ip: std::net::IpAddr,
     flow_table: &FlowTable,
+    dns_cache: &dns_cache::DnsCache,
 ) -> bool {
     if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
         return true;
@@ -518,7 +538,8 @@ fn prepare_decrypted_packet_for_forwarding(
         return false;
     };
 
-    let Some(real_dst) = flow_table.forward_target(node_id, source_port, dst_port) else {
+    let Some(real_dst) = flow_table.forward_target(node_id, source_port, dst_port, dns_cache)
+    else {
         warn!(
             %node_id, source_port, dst_port,
             "decrypted packet is not an admitted flow to a configured endpoint - dropping"
@@ -559,6 +580,7 @@ async fn run_wireguard_receive_loop(
     mut tun_writer: tun_device::TunWriter,
     flow_table: Arc<std::sync::Mutex<FlowTable>>,
     connector_virtual_ip: std::net::IpAddr,
+    dns_cache: Arc<dns_cache::DnsCache>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -596,6 +618,7 @@ async fn run_wireguard_receive_loop(
                         &node_id,
                         connector_virtual_ip,
                         &table,
+                        &dns_cache,
                     )
                 };
                 if !should_forward {
@@ -773,12 +796,14 @@ mod tests {
         );
         let original = packet.clone();
         let flow_table = FlowTable::new();
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &flow_table,
+            &dns_cache
         ));
         assert_eq!(
             packet, original,
@@ -796,12 +821,14 @@ mod tests {
             443,
         );
         let flow_table = FlowTable::new();
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(!prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &flow_table,
+            &dns_cache
         ));
     }
 
@@ -826,12 +853,14 @@ mod tests {
                 port: 443,
             }],
         );
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(!prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &flow_table,
+            &dns_cache
         ));
     }
 
@@ -859,12 +888,14 @@ mod tests {
                 port: 443,
             }],
         );
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &flow_table,
+            &dns_cache
         ));
         assert_eq!(
             &packet[16..20],
@@ -896,12 +927,14 @@ mod tests {
                 port: 443,
             }],
         );
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(!prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &flow_table,
+            &dns_cache
         ));
     }
 
@@ -944,6 +977,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -954,6 +988,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1007,6 +1042,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1017,6 +1053,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1044,6 +1081,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1054,6 +1092,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1104,6 +1143,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1114,6 +1154,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1163,6 +1204,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1173,6 +1215,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1222,6 +1265,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         // Nodes-without-key is only a warning, not a failure - the cycle still
         // succeeds (there's simply nothing to dial yet for that node).
@@ -1234,6 +1278,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1301,6 +1346,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1311,6 +1357,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1520,6 +1567,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         run_heartbeat(
             &config,
@@ -1530,6 +1578,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await
         .unwrap();
@@ -1561,6 +1610,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
