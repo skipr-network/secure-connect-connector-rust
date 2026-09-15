@@ -232,6 +232,12 @@ async fn main() -> anyhow::Result<()> {
     // immediately, re-running a heartbeat right away instead of waiting a
     // full interval like every subsequent one does.
     interval.reset();
+    // Default MissedTickBehavior::Burst fires every missed tick back-to-back the moment a slow
+    // heartbeat falls behind (PR #10 review) - e.g. several unresolvable endpoint hostnames each
+    // burning their full DNS lookup timeout. Delay only ever schedules the next tick relative to
+    // when the current one actually finished, so a slow cycle just pushes later ones back instead
+    // of compounding into a burst of immediately-repeated heartbeats.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         match run_heartbeat(
@@ -373,13 +379,25 @@ async fn run_heartbeat(
     // also naturally drops a hostname's cache entry once it's no longer configured anywhere (see
     // dns_cache::refresh's pruning). Never blocks/slows packet forwarding itself - that only ever
     // reads the cache this populates, in flow_table::forward_target.
-    let endpoint_hosts = new_bundles
-        .iter()
-        .flat_map(|bundle| bundle.endpoints.iter())
-        .map(|endpoint| endpoint.host.clone());
-    dns_cache.refresh(endpoint_hosts).await;
+    dns_cache
+        .refresh(collect_endpoint_hosts(&new_bundles))
+        .await;
 
     Ok(connector_virtual_ip)
+}
+
+/// Every currently-configured endpoint host across every attached gateway - the input to
+/// `dns_cache.refresh`. Factored out of `run_heartbeat` as its own pure function specifically so
+/// this exact piece of wiring has a direct test (PR #10 review: every `run_heartbeat` test only
+/// threads a fresh `DnsCache` through and asserts nothing about it - swapping `new_bundles` for
+/// `old_bundles` at the call site, or reading a gateway's own `hostname` field instead of
+/// `endpoints[].host`, would still pass the entire suite without this).
+fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
+    bundles
+        .iter()
+        .flat_map(|bundle| bundle.endpoints.iter())
+        .map(|endpoint| endpoint.host.clone())
+        .collect()
 }
 
 /// Tears down every already-admitted flow whose device dropped out of its gateway's entitlement
@@ -1374,6 +1392,157 @@ mod tests {
                 .unwrap();
         assert!(len > 0);
         assert_eq!(from, wg_socket.local_addr().unwrap());
+    }
+
+    #[test]
+    fn collect_endpoint_hosts_returns_every_endpoint_across_every_bundle() {
+        let bundles = vec![
+            PolicyBundle {
+                gateway_id: "gw-1".to_string(),
+                location: "Amsterdam".to_string(),
+                hostname: "crm.internal.example.com".to_string(),
+                access_mode: "SELECTED_USERS".to_string(),
+                endpoints: vec![
+                    dto::PolicyBundleEndpoint {
+                        host: "10.0.0.5".to_string(),
+                        port: 443,
+                    },
+                    dto::PolicyBundleEndpoint {
+                        host: "erp.internal.example.com".to_string(),
+                        port: 8443,
+                    },
+                ],
+                entitlement_list: vec![],
+            },
+            PolicyBundle {
+                gateway_id: "gw-2".to_string(),
+                location: "Amsterdam".to_string(),
+                hostname: "erp.internal.example.com".to_string(),
+                access_mode: "SELECTED_USERS".to_string(),
+                endpoints: vec![dto::PolicyBundleEndpoint {
+                    host: "files.internal.example.com".to_string(),
+                    port: 445,
+                }],
+                entitlement_list: vec![],
+            },
+        ];
+
+        let hosts = collect_endpoint_hosts(&bundles);
+
+        assert_eq!(
+            hosts,
+            vec![
+                "10.0.0.5".to_string(),
+                "erp.internal.example.com".to_string(),
+                "files.internal.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_heartbeat_refreshes_the_dns_cache_from_this_heartbeats_bundles_not_the_previous_ones()
+     {
+        // PR #10 review: the sharpest version of the wiring gap - an already-admitted gateway's
+        // endpoint from a *previous* heartbeat (old_bundles) must never leak into what this
+        // heartbeat resolves. DnsCache::with_lookup records every host it's actually asked to
+        // resolve, so this proves the real production call site (not a hand-called refresh_with)
+        // reads new_bundles, not old_bundles or something else entirely (a gateway's own
+        // `hostname` field, say) - without ever touching the real OS resolver (PR #10 review: a
+        // hostname fixture here must not risk a real, slow DNS lookup in CI).
+        let agent_identity = crypto::generate_keypair();
+        let old_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"old.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let old_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, old_body.as_bytes());
+        let new_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"new.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let new_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, new_body.as_bytes());
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(old_body, "application/json")
+                    .insert_header("X-Signature", old_signature.as_str()),
+            )
+            .up_to_n_times(1)
+            .mount(&agent_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(new_body, "application/json")
+                    .insert_header("X-Signature", new_signature.as_str()),
+            )
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri(), agent_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let requested_hosts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requested_hosts_in_lookup = requested_hosts.clone();
+        let dns_cache = dns_cache::DnsCache::with_lookup(move |host: String| {
+            requested_hosts_in_lookup.lock().unwrap().push(host);
+            async { Ok(vec![std::net::Ipv4Addr::new(10, 0, 0, 7)]) }
+        });
+
+        // First heartbeat: applies old_bundles as the *current* policy_store state, so the second
+        // call below has real old_bundles/new_bundles to diff between - not None vs. something.
+        run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+        )
+        .await
+        .unwrap();
+        requested_hosts.lock().unwrap().clear();
+
+        run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+        )
+        .await
+        .unwrap();
+
+        // Only this heartbeat's own endpoint host - old.internal.example.com must never appear,
+        // proving the call site reads new_bundles and not old_bundles.
+        assert_eq!(
+            *requested_hosts.lock().unwrap(),
+            vec!["new.internal.example.com".to_string()]
+        );
     }
 
     fn bundle(gateway_id: &str, entitled_device_keys: &[&str]) -> PolicyBundle {
