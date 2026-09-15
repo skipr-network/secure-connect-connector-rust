@@ -82,7 +82,7 @@ impl Config {
 fn require_env(name: &str) -> Result<String> {
     // A systemd EnvironmentFile line like `VAR=` sets VAR to the empty string, not unset - an
     // admin who left a required placeholder blank must still fail here, not start with an empty
-    // value (PR #8 review, Tasneem).
+    // value.
     env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())

@@ -24,14 +24,17 @@ if [ ! -x "$BINARY_PATH" ]; then
   exit 1
 fi
 
+DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
+
 sudo mkdir -p "$ENV_DIR"
 sudo install -d -o "$RUN_AS_USER" -m 750 /var/skipr/connector/audit /var/skipr/connector/.keys
 if [ ! -f "$ENV_FILE" ]; then
   sudo tee "$ENV_FILE" > /dev/null <<'EOF'
 # Filled in by the admin - see the README's "Running the Connector daemon" table
-# for what each of these means. CONNECTOR_IDENTITY_KEY_PATH must match exactly
-# what --generate-identity used, or the daemon generates a second, unregistered
-# identity (it will warn loudly if this happens).
+# for what each of these means. This install script already generates the
+# Connector's identity for you at CONNECTOR_IDENTITY_KEY_PATH's default (or
+# whatever you set it to below, if you re-run this script after changing it) -
+# leave it commented out unless you deliberately want a non-default location.
 #
 # Leave a line commented out to use its documented default. systemd parses an
 # uncommented `VAR=` as VAR being *set* to an empty string, not unset - which
@@ -53,6 +56,22 @@ EOF
   sudo chmod 600 "$ENV_FILE"
   echo "Created $ENV_FILE - fill in its values before starting the service."
 fi
+
+# Generate the identity against the exact path the daemon will load - not a separate,
+# admin-run `--generate-identity` step against whatever path their shell happens to have
+# exported. Now that .keys/ above is writable by RUN_AS_USER, leaving
+# CONNECTOR_IDENTITY_KEY_PATH unset would otherwise let the daemon silently generate its own,
+# unregistered identity at first start instead of failing - generating it here first means the
+# right file already exists by the time that happens, for both the default path and a custom
+# one the admin already uncommented in $ENV_FILE. Safe to re-run: load_or_generate loads an
+# existing key file rather than overwriting it.
+CONFIGURED_IDENTITY_KEY_PATH="$(grep -E '^CONNECTOR_IDENTITY_KEY_PATH=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+IDENTITY_KEY_PATH="${CONFIGURED_IDENTITY_KEY_PATH:-$DEFAULT_IDENTITY_KEY_PATH}"
+sudo install -d -o "$RUN_AS_USER" -m 750 "$(dirname "$IDENTITY_KEY_PATH")"
+IDENTITY_PUBLIC_KEY="$(sudo -u "$RUN_AS_USER" env CONNECTOR_IDENTITY_KEY_PATH="$IDENTITY_KEY_PATH" "$BINARY_PATH" --generate-identity)"
+echo "Connector identity ready at $IDENTITY_KEY_PATH"
+echo "Public key (register this in Portal's Deploy Connector screen if you haven't already):"
+echo "  $IDENTITY_PUBLIC_KEY"
 
 sudo tee "$UNIT_PATH" > /dev/null <<EOF
 [Unit]
