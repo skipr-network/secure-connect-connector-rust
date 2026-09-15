@@ -390,11 +390,11 @@ mod tests {
         // store_with_entitled_device's gw-1 bundle configures 10.0.0.5:443.
         assert_eq!(
             table.lock().unwrap().forward_target("n-1", 51820, 443),
-            Some("10.0.0.5".parse().unwrap())
+            crate::flow_table::ForwardOutcome::Forward("10.0.0.5".parse().unwrap())
         );
         assert_eq!(
             table.lock().unwrap().forward_target("n-1", 51820, 8080),
-            None
+            crate::flow_table::ForwardOutcome::PortNotConfigured
         );
     }
 

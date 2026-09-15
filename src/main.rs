@@ -22,7 +22,7 @@ use boringtun::noise::Tunn;
 use config::Config;
 use dto::{HeartbeatNode, PolicyBundle};
 use flow_control::ControlPlaneState;
-use flow_table::FlowTable;
+use flow_table::{FlowTable, ForwardOutcome};
 use heartbeat::HeartbeatClient;
 use policy::PolicyStore;
 use registry_client::RegistryClient;
@@ -359,6 +359,7 @@ async fn run_heartbeat(
     if let Some(old_bundles) = old_bundles {
         reconcile_dropped_entitlements(flow_table, &old_bundles, &new_bundles);
     }
+    reconcile_endpoint_changes(flow_table, &new_bundles);
 
     Ok(connector_virtual_ip)
 }
@@ -410,6 +411,23 @@ fn reconcile_dropped_entitlements(
                 );
             }
         }
+    }
+}
+
+/// Refreshes already-admitted flows' remembered endpoint config to this heartbeat's freshly-applied
+/// bundles (TT-2046 review finding #4): unlike entitlements, endpoints were only ever snapshotted
+/// once at admission and never revisited, so an admin repointing or removing a gateway's endpoint
+/// kept every flow admitted before the change forwarding to the old address until the flow ended on
+/// its own. Runs every heartbeat, independent of `old_bundles` (there's no diffing to do - this
+/// just always brings `flow_table` up to date with the latest configured endpoints, a no-op for any
+/// gateway with nothing currently admitted). See `FlowTable::update_endpoints`.
+fn reconcile_endpoint_changes(
+    flow_table: &std::sync::Mutex<FlowTable>,
+    new_bundles: &[PolicyBundle],
+) {
+    let mut table = flow_table.lock().expect("flow table lock poisoned");
+    for bundle in new_bundles {
+        table.update_endpoints(&bundle.gateway_id, &bundle.endpoints);
     }
 }
 
@@ -495,13 +513,14 @@ async fn dial_new_nodes(
 ///   actual byte-level rewrite, including the checksum fixups a raw address change requires.
 ///
 /// Returns `true` (packet mutated in place if a rewrite was needed, ready to write to TUN
-/// as-is) or `false` (packet must not be forwarded - contents are unspecified, e.g. partially
-/// rewritten).
+/// as-is) or `false` (packet must not be forwarded - left completely untouched: every check here
+/// and in `tunnel::rewrite_destination_ipv4` runs before either one writes a single byte, so
+/// there's no partial-rewrite state to worry about).
 fn prepare_decrypted_packet_for_forwarding(
     packet: &mut [u8],
     node_id: &str,
     connector_virtual_ip: std::net::IpAddr,
-    flow_table: &FlowTable,
+    flow_table: &mut FlowTable,
 ) -> bool {
     if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
         return true;
@@ -518,13 +537,38 @@ fn prepare_decrypted_packet_for_forwarding(
         return false;
     };
 
-    let Some(real_dst) = flow_table.forward_target(node_id, source_port, dst_port) else {
-        warn!(
-            %node_id, source_port, dst_port,
-            "decrypted packet is not an admitted flow to a configured endpoint - dropping"
-        );
-        return false;
+    let real_dst = match flow_table.forward_target(node_id, source_port, dst_port) {
+        ForwardOutcome::Forward(real_dst) => real_dst,
+        // Three genuinely different situations (TT-2046 review finding #5), each its own
+        // message: an unadmitted flow is a security event, an admitted-but-unconfigured port is
+        // misconfiguration or probing, an ambiguous match is a Portal config mistake, and an
+        // unsupported host silently black-holes every packet for that gateway until fixed - none
+        // of these should be indistinguishable to whoever's reading the log on-call.
+        ForwardOutcome::NotAdmitted => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node/port - dropping");
+            return false;
+        }
+        ForwardOutcome::PortNotConfigured => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no endpoint configured on this port - dropping");
+            return false;
+        }
+        ForwardOutcome::AmbiguousEndpoint => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one configured endpoint shares this port - refusing to guess, dropping");
+            return false;
+        }
+        ForwardOutcome::UnsupportedHost => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and the port matches, but the configured endpoint host isn't a literal IPv4 address (v1 scope) - dropping");
+            return false;
+        }
     };
+
+    // Recorded from the packet's own pre-rewrite destination - the fake/virtual address the
+    // client actually dialed - so the reverse path can restore it on a reply's source before
+    // sending it back out (TT-2046 review finding #1). Must happen before the rewrite below,
+    // which overwrites this same field.
+    if let Some(std::net::IpAddr::V4(virtual_address)) = Tunn::dst_address(packet) {
+        flow_table.record_virtual_address(node_id, source_port, virtual_address);
+    }
 
     if tunnel::rewrite_destination_ipv4(packet, real_dst) {
         return true;
@@ -590,12 +634,12 @@ async fn run_wireguard_receive_loop(
                 // provably can't be held across the `.await` below, which tokio::spawn's Send
                 // bound on the whole future requires.
                 let should_forward = {
-                    let table = flow_table.lock().expect("flow table lock poisoned");
+                    let mut table = flow_table.lock().expect("flow table lock poisoned");
                     prepare_decrypted_packet_for_forwarding(
                         &mut packet,
                         &node_id,
                         connector_virtual_ip,
-                        &table,
+                        &mut table,
                     )
                 };
                 if !should_forward {
@@ -611,6 +655,61 @@ async fn run_wireguard_receive_loop(
             TunnelEvent::Nothing => {}
         }
     }
+}
+
+/// Decides whether one outbound packet read from the TUN device (e.g. a reply from the internal
+/// endpoint) should be forwarded, and restores its source address in place if so - factored out of
+/// `run_tun_send_loop` for the same reason as `prepare_decrypted_packet_for_forwarding`: a
+/// synchronous, sans-I/O function so this decision is directly unit-testable, rather than only
+/// reachable by running the whole daemon against a real TUN device (TT-2046 review finding #1 -
+/// this exact reverse-path rewrite was missing entirely before this fix).
+///
+/// `destination_port` is the reply's own destination port - the same translated port the original
+/// request's flow was admitted on (TT-1847) - already parsed by the caller, since it's also
+/// needed there for logging regardless of the outcome here.
+///
+/// Returns the node_id to route this packet to if it should be forwarded (packet mutated in place
+/// with its restored source address), or `None` if it must be dropped - left completely untouched,
+/// for the same reason as `prepare_decrypted_packet_for_forwarding`: every check runs before
+/// `tunnel::rewrite_source_ipv4` writes anything, so there's no partial-rewrite state to worry
+/// about.
+fn prepare_reply_packet_for_forwarding(
+    packet: &mut [u8],
+    destination_port: u16,
+    flow_table: &FlowTable,
+) -> Option<String> {
+    let node_id = match flow_table.node_for_port(destination_port) {
+        Some(node_id) => node_id.to_string(),
+        None => {
+            warn!(
+                destination_port,
+                "no unambiguous admitted node for outbound packet's port - dropping"
+            );
+            return None;
+        }
+    };
+    // Restores the source address a reply packet must carry to reach the client at all - the real
+    // internal endpoint's own address (what this packet arrived from) is never what the client
+    // dialed, so sending it back unchanged means the client's own network stack discards a
+    // response from an address it never contacted (TT-2046 review finding #1: real kernel DNAT
+    // reverses this automatically via conntrack; this userspace rewrite has no conntrack entry to
+    // reverse it with, so it has to be done explicitly, symmetrically to the forward-direction
+    // rewrite in `prepare_decrypted_packet_for_forwarding`).
+    let Some(virtual_address) = flow_table.virtual_address_for(&node_id, destination_port) else {
+        warn!(
+            %node_id, destination_port,
+            "no virtual address recorded for this flow yet - the client would never accept this reply anyway, dropping"
+        );
+        return None;
+    };
+    if !tunnel::rewrite_source_ipv4(packet, virtual_address) {
+        warn!(
+            %node_id, destination_port, %virtual_address,
+            "failed to rewrite outbound packet's source address back to the virtual address - dropping"
+        );
+        return None;
+    }
+    Some(node_id)
 }
 
 /// Reads outbound IP packets the OS routed to the TUN device (e.g. return
@@ -651,15 +750,9 @@ async fn run_tun_send_loop(
         let mut manager = tunnel_manager.lock().await;
         let node_id = {
             let table = flow_table.lock().expect("flow table lock poisoned");
-            match table.node_for_port(destination_port) {
-                Some(node_id) => node_id.to_string(),
-                None => {
-                    warn!(
-                        destination_port,
-                        "no unambiguous admitted node for outbound packet's port - dropping"
-                    );
-                    continue;
-                }
+            match prepare_reply_packet_for_forwarding(&mut buf[..len], destination_port, &table) {
+                Some(node_id) => node_id,
+                None => continue,
             }
         };
         let Some(tunnel) = manager.tunnel_for(&node_id) else {
@@ -772,13 +865,13 @@ mod tests {
             8443,
         );
         let original = packet.clone();
-        let flow_table = FlowTable::new();
+        let mut flow_table = FlowTable::new();
 
         assert!(prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &mut flow_table
         ));
         assert_eq!(
             packet, original,
@@ -795,13 +888,13 @@ mod tests {
             51234,
             443,
         );
-        let flow_table = FlowTable::new();
+        let mut flow_table = FlowTable::new();
 
         assert!(!prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &mut flow_table
         ));
     }
 
@@ -831,7 +924,7 @@ mod tests {
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &mut flow_table
         ));
     }
 
@@ -864,12 +957,19 @@ mod tests {
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &mut flow_table
         ));
         assert_eq!(
             &packet[16..20],
             &[10, 0, 0, 5],
             "must be rewritten to the real configured endpoint, not left on the fake virtual address"
+        );
+        // TT-2046 review finding #1: the packet's pre-rewrite (fake) destination must be recorded
+        // so the reverse path can restore it on a reply - without this, no real request/response
+        // can ever complete (the client discards a reply from an address it never contacted).
+        assert_eq!(
+            flow_table.virtual_address_for("n-1", 51234),
+            Some(std::net::Ipv4Addr::new(10, 99, 0, 1))
         );
     }
 
@@ -901,8 +1001,132 @@ mod tests {
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &flow_table
+            &mut flow_table
         ));
+    }
+
+    #[test]
+    fn prepare_reply_packet_drops_when_no_admitted_node_for_the_port() {
+        let flow_table = FlowTable::new();
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut packet, 51234, &flow_table),
+            None
+        );
+    }
+
+    #[test]
+    fn prepare_reply_packet_drops_when_no_virtual_address_has_been_recorded_yet() {
+        // TT-2046 review finding #1: a reply for a flow whose forward direction never ran (or
+        // raced ahead of it) has nothing to restore its source to - the client would reject it
+        // anyway (it never dialed the real internal address), so there's nowhere defensible to
+        // send it, same reasoning as node_for_port's own ambiguity refusal.
+        let mut flow_table = FlowTable::new();
+        flow_table.admit(
+            "n-1".to_string(),
+            51234,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![],
+        );
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut packet, 51234, &flow_table),
+            None
+        );
+    }
+
+    #[test]
+    fn prepare_reply_packet_restores_the_recorded_virtual_address_as_the_source_and_returns_the_node_id()
+     {
+        let mut flow_table = FlowTable::new();
+        flow_table.admit(
+            "n-1".to_string(),
+            51234,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![],
+        );
+        flow_table.record_virtual_address("n-1", 51234, std::net::Ipv4Addr::new(10, 99, 0, 1));
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+
+        let node_id = prepare_reply_packet_for_forwarding(&mut packet, 51234, &flow_table);
+
+        assert_eq!(node_id, Some("n-1".to_string()));
+        assert_eq!(
+            &packet[12..16],
+            &[10, 99, 0, 1],
+            "reply's source must be restored to the virtual address the client dialed"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_packets_virtual_address_is_exactly_what_its_reply_gets_restored_to() {
+        // The actual round-trip this whole fix is about (TT-2046 review finding #1): whatever
+        // virtual address a request arrived addressed to is exactly what its reply must be
+        // restored to carry as its source - proven end to end through both real functions
+        // together, not just each one in isolation. Without this, the client's own network stack
+        // discards the reply as coming from an address it never contacted, and no real
+        // request/response can ever complete.
+        let connector_virtual_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1));
+        let mut request = udp_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            std::net::Ipv4Addr::new(10, 99, 0, 1), // the virtual address the client actually dialed
+            51234,
+            443,
+        );
+        let mut flow_table = FlowTable::new();
+        flow_table.admit(
+            "n-1".to_string(),
+            51234,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 443,
+            }],
+        );
+        assert!(prepare_decrypted_packet_for_forwarding(
+            &mut request,
+            "n-1",
+            connector_virtual_ip,
+            &mut flow_table
+        ));
+
+        let mut reply = udp_packet(
+            std::net::Ipv4Addr::new(10, 0, 0, 5), // the real internal endpoint's own address
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+        let node_id = prepare_reply_packet_for_forwarding(&mut reply, 51234, &flow_table);
+
+        assert_eq!(node_id, Some("n-1".to_string()));
+        assert_eq!(
+            &reply[12..16],
+            &[10, 99, 0, 1],
+            "reply's source must be the exact virtual address the client dialed, not the real internal endpoint's own address"
+        );
     }
 
     #[tokio::test]
@@ -1462,6 +1686,71 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
 
         reconcile_dropped_entitlements(&flow_table, &[], &[bundle("gw-1", &["dev-A"])]);
+    }
+
+    fn bundle_with_endpoint(gateway_id: &str, host: &str, port: u16) -> PolicyBundle {
+        PolicyBundle {
+            endpoints: vec![dto::PolicyBundleEndpoint {
+                host: host.to_string(),
+                port,
+            }],
+            ..bundle(gateway_id, &[])
+        }
+    }
+
+    #[test]
+    fn reconcile_endpoint_changes_updates_an_already_admitted_flows_forwarding_target() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.1".to_string(),
+                port: 443,
+            }],
+        );
+        let new_bundles = vec![bundle_with_endpoint("gw-1", "10.0.0.2", 443)];
+
+        reconcile_endpoint_changes(&flow_table, &new_bundles);
+
+        assert_eq!(
+            flow_table.lock().unwrap().forward_target("n-1", 40001, 443),
+            ForwardOutcome::Forward("10.0.0.2".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn reconcile_endpoint_changes_leaves_a_different_gateways_flow_alone() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.1".to_string(),
+                port: 443,
+            }],
+        );
+        let new_bundles = vec![bundle_with_endpoint("gw-2", "10.0.0.2", 443)];
+
+        reconcile_endpoint_changes(&flow_table, &new_bundles);
+
+        assert_eq!(
+            flow_table.lock().unwrap().forward_target("n-1", 40001, 443),
+            ForwardOutcome::Forward("10.0.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn reconcile_endpoint_changes_with_no_bundles_is_a_no_op() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+
+        reconcile_endpoint_changes(&flow_table, &[]);
     }
 
     /// End-to-end through two real `run_heartbeat` calls: entitlement present on the first, dropped
