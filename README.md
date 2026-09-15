@@ -108,6 +108,12 @@ sudo systemctl enable --now secure-connect-connector
 journalctl -u secure-connect-connector -f
 ```
 
+Re-running `install-systemd.sh` after a rebuild or an env-file change picks up the new binary/config and restarts the service if it's already running. To remove it entirely (`connector.env` is left in place):
+
+```sh
+./packaging/install-systemd.sh --uninstall
+```
+
 ## Development
 
 ```sh
