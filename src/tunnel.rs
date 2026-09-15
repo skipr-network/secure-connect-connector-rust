@@ -141,19 +141,38 @@ impl NodeTunnel {
     }
 }
 
+/// Only the first fragment of a fragmented IPv4 datagram carries a transport-layer header - later
+/// fragments are pure payload continuation, with no port fields, checksum, or anything else this
+/// module expects to find at these offsets (TT-2046 review finding #2). Nothing upstream of this
+/// checks for fragmentation, so without this, a later fragment's raw payload bytes get silently
+/// misread as port numbers on the parse side, and on the rewrite side a "checksum fixup" write can
+/// land on and corrupt real payload bytes. `packet` must already be confirmed IPv4 (version
+/// nibble already checked) before calling this - it doesn't re-check that itself. Too short to
+/// even read the field is treated as "yes, a later fragment" - the safe direction (refuse), not
+/// "assume it's fine".
+fn is_non_first_ipv4_fragment(packet: &[u8]) -> bool {
+    match (packet.get(6), packet.get(7)) {
+        (Some(&byte6), Some(&byte7)) => (u16::from(byte6 & 0x1F) << 8 | u16::from(byte7)) != 0,
+        _ => true,
+    }
+}
+
 /// Shared TCP/UDP header parsing for `parse_source_port`/`parse_destination_port` -
 /// `field_offset` is 0 for the source port, 2 for the destination port (the two
 /// fields are adjacent, first 4 bytes of either header). Same pragmatic scope
 /// throughout: IPv4 accounts for a variable IHL, IPv6 assumes no extension
-/// headers. `None` for anything that isn't TCP or UDP, or too short to contain
-/// the requested port field - callers must treat that as "can't identify a
-/// flow" (refuse), never as "no flow" (allow).
+/// headers. `None` for anything that isn't TCP or UDP, too short to contain
+/// the requested port field, or (IPv4) a non-first fragment - callers must
+/// treat that as "can't identify a flow" (refuse), never as "no flow" (allow).
 fn parse_l4_port(packet: &[u8], field_offset: usize) -> Option<u16> {
     let first_byte = *packet.first()?;
     let (protocol, l4_offset) = match first_byte >> 4 {
         4 => {
             let ihl = usize::from(first_byte & 0x0F) * 4;
             if ihl < 20 || packet.len() < ihl + 4 {
+                return None;
+            }
+            if is_non_first_ipv4_fragment(packet) {
                 return None;
             }
             (*packet.get(9)?, ihl)
@@ -217,32 +236,27 @@ fn checksum_adjust(old_checksum: u16, old_word: u16, new_word: u16) -> u16 {
     !(sum as u16)
 }
 
-/// Rewrites a decrypted packet's IPv4 destination address in place - the
-/// step that actually makes forwarded traffic reach a Private Gateway's real
-/// configured internal endpoint, rather than Gatekeeper's invented,
-/// unroutable virtual gateway address (TT-2046; see `GatewayVirtualAddressRegistry`
-/// on the Gatekeeper side - "zero relationship to any real internal address,
-/// the whole point is Gatekeeper never learns the internal host:port
-/// allowlist"). `flow_table::forward_target` resolves *which* real address to
-/// rewrite to; this does the actual byte-level rewrite.
+/// Shared implementation for `rewrite_destination_ipv4`/`rewrite_source_ipv4` - `field_offset` is
+/// 16 for the destination address, 12 for the source, the only difference between the two calls:
+/// both the IPv4 header checksum and the TCP/UDP pseudo-header checksum cover either address
+/// field identically, so the same incremental update applies regardless of which one changed.
 ///
-/// Updates the IPv4 header checksum and, for TCP/UDP, the L4 checksum too
-/// (its pseudo-header covers the destination address) - both via
-/// `checksum_adjust`'s incremental update, not a full recompute, so this
-/// never needs to read or understand the L4 payload itself. UDP's checksum
-/// is optional (RFC 768): a `0` there means "none computed" and is left
-/// alone; TCP's is mandatory and always updated. For UDP specifically, if
-/// the *updated* checksum itself computes to `0`, it's written as `0xFFFF`
-/// instead (RFC 768's own rule for a genuinely-zero checksum) - otherwise
-/// it would be indistinguishable from "no checksum computed".
+/// Updates the IPv4 header checksum and, for TCP/UDP, the L4 checksum too (its pseudo-header
+/// covers both address fields) - both via `checksum_adjust`'s incremental update, not a full
+/// recompute, so this never needs to read or understand the L4 payload itself. UDP's checksum is
+/// optional (RFC 768): a `0` there means "none computed" and is left alone; TCP's is mandatory and
+/// always updated. For UDP specifically, if the *updated* checksum itself computes to `0`, it's
+/// written as `0xFFFF` instead (RFC 768's own rule for a genuinely-zero checksum) - otherwise it
+/// would be indistinguishable from "no checksum computed".
 ///
-/// v1 scope: IPv4 packets only - `new_dst` itself is always a concrete `Ipv4Addr` by the time
+/// v1 scope: IPv4 packets only - `new_addr` itself is always a concrete `Ipv4Addr` by the time
 /// this is called, whether the configured `PolicyBundleEndpoint.host` was a literal IP or a
 /// hostname `dns_cache` already resolved (TT-2066); this function never sees the host string
 /// itself. Returns `false` (packet left completely untouched) for an IPv6 *packet*, a non-TCP/UDP
-/// protocol, or anything too short to safely contain the fields being touched - callers must
-/// treat that as "can't forward this", never as "forwarded unchanged".
-pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
+/// protocol, a non-first IPv4 fragment (TT-2046 review finding #2 - no L4 header to update at
+/// all), or anything too short to safely contain the fields being touched - callers must treat
+/// that as "can't forward this", never as "forwarded unchanged".
+fn rewrite_ipv4_address(packet: &mut [u8], field_offset: usize, new_addr: Ipv4Addr) -> bool {
     let Some(&first_byte) = packet.first() else {
         return false;
     };
@@ -251,6 +265,9 @@ pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
     }
     let ihl = usize::from(first_byte & 0x0F) * 4;
     if ihl < 20 || packet.len() < ihl {
+        return false;
+    }
+    if is_non_first_ipv4_fragment(packet) {
         return false;
     }
     let Some(&protocol) = packet.get(9) else {
@@ -268,23 +285,23 @@ pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
         return false;
     }
 
-    let old_dst_hi = read_u16(packet, 16);
-    let old_dst_lo = read_u16(packet, 18);
-    let new_dst_octets = new_dst.octets();
-    let new_dst_hi = u16::from_be_bytes([new_dst_octets[0], new_dst_octets[1]]);
-    let new_dst_lo = u16::from_be_bytes([new_dst_octets[2], new_dst_octets[3]]);
+    let old_hi = read_u16(packet, field_offset);
+    let old_lo = read_u16(packet, field_offset + 2);
+    let new_octets = new_addr.octets();
+    let new_hi = u16::from_be_bytes([new_octets[0], new_octets[1]]);
+    let new_lo = u16::from_be_bytes([new_octets[2], new_octets[3]]);
 
     // IPv4 header checksum - fixed offset 10..12, always inside the base
     // 20-byte header regardless of IHL.
     let ip_checksum = read_u16(packet, 10);
-    let ip_checksum = checksum_adjust(ip_checksum, old_dst_hi, new_dst_hi);
-    let ip_checksum = checksum_adjust(ip_checksum, old_dst_lo, new_dst_lo);
+    let ip_checksum = checksum_adjust(ip_checksum, old_hi, new_hi);
+    let ip_checksum = checksum_adjust(ip_checksum, old_lo, new_lo);
     write_u16(packet, 10, ip_checksum);
 
     let l4_checksum = read_u16(packet, l4_checksum_offset);
     if protocol == 6 || l4_checksum != 0 {
-        let l4_checksum = checksum_adjust(l4_checksum, old_dst_hi, new_dst_hi);
-        let l4_checksum = checksum_adjust(l4_checksum, old_dst_lo, new_dst_lo);
+        let l4_checksum = checksum_adjust(l4_checksum, old_hi, new_hi);
+        let l4_checksum = checksum_adjust(l4_checksum, old_lo, new_lo);
         // RFC 768: a UDP checksum that genuinely computes to 0 must be transmitted as
         // 0xFFFF - 0x0000 on the wire means "no checksum was computed" instead. TCP has
         // no such rule (0 is a plain valid TCP checksum), so this only applies to UDP.
@@ -296,8 +313,34 @@ pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
         write_u16(packet, l4_checksum_offset, l4_checksum);
     }
 
-    packet[16..20].copy_from_slice(&new_dst_octets);
+    packet[field_offset..field_offset + 4].copy_from_slice(&new_octets);
     true
+}
+
+/// Rewrites a decrypted packet's IPv4 destination address in place - the
+/// step that actually makes forwarded traffic reach a Private Gateway's real
+/// configured internal endpoint, rather than Gatekeeper's invented,
+/// unroutable virtual gateway address (TT-2046; see `GatewayVirtualAddressRegistry`
+/// on the Gatekeeper side - "zero relationship to any real internal address,
+/// the whole point is Gatekeeper never learns the internal host:port
+/// allowlist"). `flow_table::forward_target` resolves *which* real address to
+/// rewrite to; this does the actual byte-level rewrite. See `rewrite_ipv4_address`
+/// for the shared mechanics and full behavior contract.
+pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
+    rewrite_ipv4_address(packet, 16, new_dst)
+}
+
+/// Rewrites a reply packet's IPv4 *source* address in place, on the way back out to a node
+/// (`main::run_tun_send_loop`) - the other half of TT-2046's translation, without which a reply
+/// arrives at the client carrying the real internal address as its source instead of the virtual
+/// address the client actually dialed. A real kernel DNAT gets this reversal for free via
+/// conntrack; this rewrite happens in userspace with no conntrack entry to reverse it
+/// automatically, so it has to be done explicitly, symmetrically to `rewrite_destination_ipv4`
+/// (TT-2046 review finding #1). `flow_table`'s recorded `virtual_address` for the flow is what
+/// `new_src` should be. See `rewrite_ipv4_address` for the shared mechanics and full behavior
+/// contract.
+pub fn rewrite_source_ipv4(packet: &mut [u8], new_src: Ipv4Addr) -> bool {
+    rewrite_ipv4_address(packet, 12, new_src)
 }
 
 /// Builds and maintains one `NodeTunnel` per node currently reachable in the
@@ -1124,6 +1167,137 @@ mod tests {
             &mut packet,
             Ipv4Addr::new(10, 0, 0, 5)
         ));
+    }
+
+    #[test]
+    fn rewrite_source_ipv4_writes_the_new_source_address() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+
+        assert!(rewrite_source_ipv4(
+            &mut packet,
+            Ipv4Addr::new(172, 16, 0, 9)
+        ));
+
+        assert_eq!(&packet[12..16], &[172, 16, 0, 9]);
+    }
+
+    #[test]
+    fn rewrite_source_ipv4_keeps_the_ip_header_and_udp_checksums_valid() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+        let new_src = Ipv4Addr::new(172, 16, 0, 9);
+
+        assert!(rewrite_source_ipv4(&mut packet, new_src));
+
+        assert_eq!(reference_ones_complement_sum(&packet[0..20]), 0xFFFF);
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&new_src.octets());
+        pseudo_and_segment.extend_from_slice(&[10, 66, 66, 1]);
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(17);
+        let udp_len = (packet.len() - 20) as u16;
+        pseudo_and_segment.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..]);
+        assert_eq!(reference_ones_complement_sum(&pseudo_and_segment), 0xFFFF);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_returns_false_for_a_non_first_ipv4_fragment() {
+        // TT-2046 review finding #2: only the first fragment of a fragmented datagram carries a
+        // real L4 header - a non-zero fragment offset means later fragments must never be treated
+        // as if they had one (misreading payload as ports, or worse, corrupting payload bytes by
+        // writing a "checksum fixup" into them).
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 (in 8-byte units) - not the first fragment
+        let original = packet.clone();
+
+        assert!(!rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+        assert_eq!(
+            packet, original,
+            "a non-first fragment must be left completely untouched"
+        );
+    }
+
+    #[test]
+    fn rewrite_source_ipv4_returns_false_for_a_non_first_ipv4_fragment() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 - not the first fragment
+
+        assert!(!rewrite_source_ipv4(
+            &mut packet,
+            Ipv4Addr::new(172, 16, 0, 9)
+        ));
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_still_rewrites_the_first_fragment_of_a_fragmented_datagram() {
+        // The first fragment (offset 0) DOES carry a real L4 header, even with the "more
+        // fragments" flag set - only later fragments (offset != 0) are the ones to reject.
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x20; // MF flag set, fragment offset = 0 - this IS the first fragment
+
+        assert!(rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+        assert_eq!(&packet[16..20], &[10, 0, 0, 5]);
+    }
+
+    #[test]
+    fn parse_source_port_returns_none_for_a_non_first_ipv4_fragment() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 - not the first fragment
+
+        assert_eq!(parse_source_port(&packet), None);
+    }
+
+    #[test]
+    fn parse_destination_port_returns_none_for_a_non_first_ipv4_fragment() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 - not the first fragment
+
+        assert_eq!(parse_destination_port(&packet), None);
     }
 
     #[test]
