@@ -66,6 +66,12 @@ fi
 # one the admin already uncommented in $ENV_FILE. Safe to re-run: load_or_generate loads an
 # existing key file rather than overwriting it.
 CONFIGURED_IDENTITY_KEY_PATH="$(grep -E '^CONNECTOR_IDENTITY_KEY_PATH=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+# systemd's EnvironmentFile parser strips a matching pair of leading/trailing quotes
+# (CONNECTOR_IDENTITY_KEY_PATH="/path" or ='/path') before the daemon ever sees the value - grep
+# + cut above doesn't, so an admin who quotes the value (a natural thing to do) would otherwise
+# get a path here that still has the quote characters in it, generating the identity at a path
+# the daemon itself never actually resolves to.
+CONFIGURED_IDENTITY_KEY_PATH="$(printf '%s' "$CONFIGURED_IDENTITY_KEY_PATH" | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
 IDENTITY_KEY_PATH="${CONFIGURED_IDENTITY_KEY_PATH:-$DEFAULT_IDENTITY_KEY_PATH}"
 sudo install -d -o "$RUN_AS_USER" -m 750 "$(dirname "$IDENTITY_KEY_PATH")"
 IDENTITY_PUBLIC_KEY="$(sudo -u "$RUN_AS_USER" env CONNECTOR_IDENTITY_KEY_PATH="$IDENTITY_KEY_PATH" "$BINARY_PATH" --generate-identity)"
