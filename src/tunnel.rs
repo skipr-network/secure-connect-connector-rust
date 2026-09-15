@@ -16,7 +16,7 @@
 //! namespaces (TT-1732 session notes, 2026-08-27).
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,19 +141,38 @@ impl NodeTunnel {
     }
 }
 
+/// Only the first fragment of a fragmented IPv4 datagram carries a transport-layer header - later
+/// fragments are pure payload continuation, with no port fields, checksum, or anything else this
+/// module expects to find at these offsets (TT-2046 review finding #2). Nothing upstream of this
+/// checks for fragmentation, so without this, a later fragment's raw payload bytes get silently
+/// misread as port numbers on the parse side, and on the rewrite side a "checksum fixup" write can
+/// land on and corrupt real payload bytes. `packet` must already be confirmed IPv4 (version
+/// nibble already checked) before calling this - it doesn't re-check that itself. Too short to
+/// even read the field is treated as "yes, a later fragment" - the safe direction (refuse), not
+/// "assume it's fine".
+fn is_non_first_ipv4_fragment(packet: &[u8]) -> bool {
+    match (packet.get(6), packet.get(7)) {
+        (Some(&byte6), Some(&byte7)) => (u16::from(byte6 & 0x1F) << 8 | u16::from(byte7)) != 0,
+        _ => true,
+    }
+}
+
 /// Shared TCP/UDP header parsing for `parse_source_port`/`parse_destination_port` -
 /// `field_offset` is 0 for the source port, 2 for the destination port (the two
 /// fields are adjacent, first 4 bytes of either header). Same pragmatic scope
 /// throughout: IPv4 accounts for a variable IHL, IPv6 assumes no extension
-/// headers. `None` for anything that isn't TCP or UDP, or too short to contain
-/// the requested port field - callers must treat that as "can't identify a
-/// flow" (refuse), never as "no flow" (allow).
+/// headers. `None` for anything that isn't TCP or UDP, too short to contain
+/// the requested port field, or (IPv4) a non-first fragment - callers must
+/// treat that as "can't identify a flow" (refuse), never as "no flow" (allow).
 fn parse_l4_port(packet: &[u8], field_offset: usize) -> Option<u16> {
     let first_byte = *packet.first()?;
     let (protocol, l4_offset) = match first_byte >> 4 {
         4 => {
             let ihl = usize::from(first_byte & 0x0F) * 4;
             if ihl < 20 || packet.len() < ihl + 4 {
+                return None;
+            }
+            if is_non_first_ipv4_fragment(packet) {
                 return None;
             }
             (*packet.get(9)?, ihl)
@@ -193,6 +212,132 @@ pub fn parse_source_port(packet: &[u8]) -> Option<u16> {
 /// carries no node identity at all.
 pub fn parse_destination_port(packet: &[u8]) -> Option<u16> {
     parse_l4_port(packet, 2)
+}
+
+fn read_u16(packet: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([packet[offset], packet[offset + 1]])
+}
+
+fn write_u16(packet: &mut [u8], offset: usize, value: u16) {
+    packet[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+}
+
+/// RFC 1624 incremental checksum update: the standard technique for updating
+/// a ones-complement checksum (an IPv4 header checksum, or a TCP/UDP
+/// checksum via its pseudo-header) after replacing one 16-bit word, without
+/// needing to re-sum anything else the checksum covers - in particular,
+/// without ever touching an L4 payload that could be arbitrarily large.
+/// `HC' = ~(~HC + ~m + m')`.
+fn checksum_adjust(old_checksum: u16, old_word: u16, new_word: u16) -> u16 {
+    let mut sum = u32::from(!old_checksum) + u32::from(!old_word) + u32::from(new_word);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Shared implementation for `rewrite_destination_ipv4`/`rewrite_source_ipv4` - `field_offset` is
+/// 16 for the destination address, 12 for the source, the only difference between the two calls:
+/// both the IPv4 header checksum and the TCP/UDP pseudo-header checksum cover either address
+/// field identically, so the same incremental update applies regardless of which one changed.
+///
+/// Updates the IPv4 header checksum and, for TCP/UDP, the L4 checksum too (its pseudo-header
+/// covers both address fields) - both via `checksum_adjust`'s incremental update, not a full
+/// recompute, so this never needs to read or understand the L4 payload itself. UDP's checksum is
+/// optional (RFC 768): a `0` there means "none computed" and is left alone; TCP's is mandatory and
+/// always updated. For UDP specifically, if the *updated* checksum itself computes to `0`, it's
+/// written as `0xFFFF` instead (RFC 768's own rule for a genuinely-zero checksum) - otherwise it
+/// would be indistinguishable from "no checksum computed".
+///
+/// v1 scope: IPv4 only. Returns `false` (packet left completely untouched) for IPv6, a non-TCP/UDP
+/// protocol, a non-first IPv4 fragment (TT-2046 review finding #2 - no L4 header to update at all),
+/// or anything too short to safely contain the fields being touched - callers must treat that as
+/// "can't forward this", never as "forwarded unchanged".
+fn rewrite_ipv4_address(packet: &mut [u8], field_offset: usize, new_addr: Ipv4Addr) -> bool {
+    let Some(&first_byte) = packet.first() else {
+        return false;
+    };
+    if first_byte >> 4 != 4 {
+        return false;
+    }
+    let ihl = usize::from(first_byte & 0x0F) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return false;
+    }
+    if is_non_first_ipv4_fragment(packet) {
+        return false;
+    }
+    let Some(&protocol) = packet.get(9) else {
+        return false;
+    };
+    if protocol != 6 && protocol != 17 {
+        return false;
+    }
+    let l4_checksum_offset = match protocol {
+        6 => ihl + 16, // TCP
+        17 => ihl + 6, // UDP
+        _ => unreachable!("checked above"),
+    };
+    if packet.len() < l4_checksum_offset + 2 {
+        return false;
+    }
+
+    let old_hi = read_u16(packet, field_offset);
+    let old_lo = read_u16(packet, field_offset + 2);
+    let new_octets = new_addr.octets();
+    let new_hi = u16::from_be_bytes([new_octets[0], new_octets[1]]);
+    let new_lo = u16::from_be_bytes([new_octets[2], new_octets[3]]);
+
+    // IPv4 header checksum - fixed offset 10..12, always inside the base
+    // 20-byte header regardless of IHL.
+    let ip_checksum = read_u16(packet, 10);
+    let ip_checksum = checksum_adjust(ip_checksum, old_hi, new_hi);
+    let ip_checksum = checksum_adjust(ip_checksum, old_lo, new_lo);
+    write_u16(packet, 10, ip_checksum);
+
+    let l4_checksum = read_u16(packet, l4_checksum_offset);
+    if protocol == 6 || l4_checksum != 0 {
+        let l4_checksum = checksum_adjust(l4_checksum, old_hi, new_hi);
+        let l4_checksum = checksum_adjust(l4_checksum, old_lo, new_lo);
+        // RFC 768: a UDP checksum that genuinely computes to 0 must be transmitted as
+        // 0xFFFF - 0x0000 on the wire means "no checksum was computed" instead. TCP has
+        // no such rule (0 is a plain valid TCP checksum), so this only applies to UDP.
+        let l4_checksum = if protocol == 17 && l4_checksum == 0 {
+            0xFFFF
+        } else {
+            l4_checksum
+        };
+        write_u16(packet, l4_checksum_offset, l4_checksum);
+    }
+
+    packet[field_offset..field_offset + 4].copy_from_slice(&new_octets);
+    true
+}
+
+/// Rewrites a decrypted packet's IPv4 destination address in place - the
+/// step that actually makes forwarded traffic reach a Private Gateway's real
+/// configured internal endpoint, rather than Gatekeeper's invented,
+/// unroutable virtual gateway address (TT-2046; see `GatewayVirtualAddressRegistry`
+/// on the Gatekeeper side - "zero relationship to any real internal address,
+/// the whole point is Gatekeeper never learns the internal host:port
+/// allowlist"). `flow_table::forward_target` resolves *which* real address to
+/// rewrite to; this does the actual byte-level rewrite. See `rewrite_ipv4_address`
+/// for the shared mechanics and full behavior contract.
+pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
+    rewrite_ipv4_address(packet, 16, new_dst)
+}
+
+/// Rewrites a reply packet's IPv4 *source* address in place, on the way back out to a node
+/// (`main::run_tun_send_loop`) - the other half of TT-2046's translation, without which a reply
+/// arrives at the client carrying the real internal address as its source instead of the virtual
+/// address the client actually dialed. A real kernel DNAT gets this reversal for free via
+/// conntrack; this rewrite happens in userspace with no conntrack entry to reverse it
+/// automatically, so it has to be done explicitly, symmetrically to `rewrite_destination_ipv4`
+/// (TT-2046 review finding #1). `flow_table`'s recorded `virtual_address` for the flow is what
+/// `new_src` should be. See `rewrite_ipv4_address` for the shared mechanics and full behavior
+/// contract.
+pub fn rewrite_source_ipv4(packet: &mut [u8], new_src: Ipv4Addr) -> bool {
+    rewrite_ipv4_address(packet, 12, new_src)
 }
 
 /// Builds and maintains one `NodeTunnel` per node currently reachable in the
@@ -723,6 +868,433 @@ mod tests {
             parse_destination_port(&[0x45, 0, 0, 0, 0, 0, 0, 0, 0, 17]),
             None
         );
+    }
+
+    #[test]
+    fn checksum_adjust_matches_a_hand_computed_example() {
+        // old_checksum is the correct ones'-complement checksum of just {0x1234, 0x5678}:
+        // sum = 0x68AC, checksum = !0x68AC = 0x9753. Replacing the first word with 0x1235 (the
+        // destination-address-rewrite case, one word of a multi-word field) must produce exactly
+        // the checksum a full recompute over {0x1235, 0x5678} would give: sum = 0x68AD,
+        // checksum = 0x9752.
+        assert_eq!(checksum_adjust(0x9753, 0x1234, 0x1235), 0x9752);
+    }
+
+    /// Independent reference implementation (deliberately not calling any production checksum
+    /// code) of the standard ones'-complement checksum sum - used two ways: computed over bytes
+    /// with the checksum field zeroed, `!result` is the value to write there; computed over bytes
+    /// that already contain a correct checksum, `result` itself must equal `0xFFFF` exactly (the
+    /// standard verification trick, since a word and its ones'-complement always sum to all-ones).
+    fn reference_ones_complement_sum(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u32::from(u16::from_be_bytes(*c)))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// Builds a well-formed IPv4/UDP packet with genuinely correct checksums (both the IP header
+    /// and the UDP checksum), computed via `reference_ones_complement_sum` - not by calling
+    /// anything `rewrite_destination_ipv4` itself depends on.
+    fn valid_ipv4_udp_packet(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let payload = b"ping";
+        let udp_len = 8 + payload.len();
+        let total_len = 20 + udp_len;
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        let ip_checksum = !reference_ones_complement_sum(&packet[0..20]);
+        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        packet[28..28 + payload.len()].copy_from_slice(payload);
+
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&src.octets());
+        pseudo_and_segment.extend_from_slice(&dst.octets());
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(17);
+        pseudo_and_segment.extend_from_slice(&(udp_len as u16).to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..20 + udp_len]);
+        let udp_checksum = !reference_ones_complement_sum(&pseudo_and_segment);
+        packet[26..28].copy_from_slice(&udp_checksum.to_be_bytes());
+
+        packet
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_writes_the_new_destination_address() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+
+        assert!(rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+
+        assert_eq!(&packet[16..20], &[10, 0, 0, 5]);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_keeps_the_ip_header_checksum_valid() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+
+        assert!(rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+
+        // The standard verification trick: summing a header that already contains its own
+        // correct checksum always yields all-ones (0xFFFF), independent of what the header's
+        // other contents are.
+        assert_eq!(reference_ones_complement_sum(&packet[0..20]), 0xFFFF);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_keeps_the_udp_checksum_valid() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        let new_dst = Ipv4Addr::new(10, 0, 0, 5);
+
+        assert!(rewrite_destination_ipv4(&mut packet, new_dst));
+
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&[10, 66, 66, 1]);
+        pseudo_and_segment.extend_from_slice(&new_dst.octets());
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(17);
+        let udp_len = (packet.len() - 20) as u16;
+        pseudo_and_segment.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..]);
+        assert_eq!(reference_ones_complement_sum(&pseudo_and_segment), 0xFFFF);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_leaves_a_zero_udp_checksum_as_zero() {
+        // RFC 768: 0 means "no checksum computed" for UDP - must never turn a genuinely
+        // checksum-less packet into one with a checksum that doesn't cover its own payload.
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[26..28].copy_from_slice(&0u16.to_be_bytes());
+
+        assert!(rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+
+        assert_eq!(&packet[26..28], &[0, 0]);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_maps_a_genuinely_zero_computed_udp_checksum_to_0xffff() {
+        // RFC 768: when the *computed* checksum happens to be 0x0000, the sender must
+        // transmit 0xFFFF instead - 0x0000 on the wire means "no checksum was computed",
+        // which would misrepresent a packet that genuinely has one. Search the space of
+        // destination addresses for one that actually lands on this rare case for a fixed
+        // src/ports, rather than relying on a hand-picked value that might stop
+        // reproducing it if the packet template above ever changes.
+        let src = Ipv4Addr::new(10, 66, 66, 1);
+        let dst = Ipv4Addr::new(10, 99, 0, 1);
+        let packet_template = valid_ipv4_udp_packet(src, dst, 51234, 443);
+        let old_dst_hi = read_u16(&packet_template, 16);
+        let old_dst_lo = read_u16(&packet_template, 18);
+        let old_l4_checksum = read_u16(&packet_template, 26);
+
+        let new_dst = (0..=255u8)
+            .flat_map(|a| (0..=255u8).map(move |b| Ipv4Addr::new(10, 0, a, b)))
+            .find(|candidate| {
+                let octets = candidate.octets();
+                let new_hi = u16::from_be_bytes([octets[0], octets[1]]);
+                let new_lo = u16::from_be_bytes([octets[2], octets[3]]);
+                let adjusted = checksum_adjust(
+                    checksum_adjust(old_l4_checksum, old_dst_hi, new_hi),
+                    old_dst_lo,
+                    new_lo,
+                );
+                adjusted == 0
+            })
+            .expect("a destination producing a zero computed UDP checksum must exist in this search space");
+
+        let mut packet = packet_template;
+        assert!(rewrite_destination_ipv4(&mut packet, new_dst));
+
+        assert_eq!(
+            &packet[26..28],
+            &[0xFF, 0xFF],
+            "a genuinely-zero-computed UDP checksum must be transmitted as 0xFFFF, not 0x0000"
+        );
+
+        // The verification trick still holds for the substituted 0xFFFF value: a checksum
+        // field containing either ones'-complement representation of zero (0x0000 or
+        // 0xFFFF) folds the full sum to 0xFFFF.
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&src.octets());
+        pseudo_and_segment.extend_from_slice(&new_dst.octets());
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(17);
+        let udp_len = (packet.len() - 20) as u16;
+        pseudo_and_segment.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..]);
+        assert_eq!(reference_ones_complement_sum(&pseudo_and_segment), 0xFFFF);
+    }
+
+    fn valid_ipv4_tcp_packet(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let tcp_len = 20; // no options, no payload
+        let total_len = 20 + tcp_len;
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6; // TCP
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        let ip_checksum = !reference_ones_complement_sum(&packet[0..20]);
+        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet[32] = 0x50; // data offset = 5 words, no flags
+
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&src.octets());
+        pseudo_and_segment.extend_from_slice(&dst.octets());
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(6);
+        pseudo_and_segment.extend_from_slice(&(tcp_len as u16).to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..20 + tcp_len]);
+        let tcp_checksum = !reference_ones_complement_sum(&pseudo_and_segment);
+        packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+        packet
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_keeps_the_tcp_checksum_valid() {
+        let mut packet = valid_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        let new_dst = Ipv4Addr::new(10, 0, 0, 5);
+
+        assert!(rewrite_destination_ipv4(&mut packet, new_dst));
+
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&[10, 66, 66, 1]);
+        pseudo_and_segment.extend_from_slice(&new_dst.octets());
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(6);
+        let tcp_len = (packet.len() - 20) as u16;
+        pseudo_and_segment.extend_from_slice(&tcp_len.to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..]);
+        assert_eq!(reference_ones_complement_sum(&pseudo_and_segment), 0xFFFF);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_returns_false_for_a_non_tcp_udp_protocol() {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = 1; // ICMP
+
+        assert!(!rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+        // Left completely untouched, including the destination address.
+        assert_eq!(&packet[16..20], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_returns_false_for_an_ipv6_packet() {
+        let mut packet = vec![0u8; 44];
+        packet[0] = 0x60; // IPv6
+
+        assert!(!rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_returns_false_for_a_packet_too_short_to_hold_a_checksum_field() {
+        let mut packet = vec![0u8; 24]; // IPv4 header + 4 bytes, short of UDP's 8-byte header
+        packet[0] = 0x45;
+        packet[9] = 17;
+
+        assert!(!rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+    }
+
+    #[test]
+    fn rewrite_source_ipv4_writes_the_new_source_address() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+
+        assert!(rewrite_source_ipv4(
+            &mut packet,
+            Ipv4Addr::new(172, 16, 0, 9)
+        ));
+
+        assert_eq!(&packet[12..16], &[172, 16, 0, 9]);
+    }
+
+    #[test]
+    fn rewrite_source_ipv4_keeps_the_ip_header_and_udp_checksums_valid() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+        let new_src = Ipv4Addr::new(172, 16, 0, 9);
+
+        assert!(rewrite_source_ipv4(&mut packet, new_src));
+
+        assert_eq!(reference_ones_complement_sum(&packet[0..20]), 0xFFFF);
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&new_src.octets());
+        pseudo_and_segment.extend_from_slice(&[10, 66, 66, 1]);
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(17);
+        let udp_len = (packet.len() - 20) as u16;
+        pseudo_and_segment.extend_from_slice(&udp_len.to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..]);
+        assert_eq!(reference_ones_complement_sum(&pseudo_and_segment), 0xFFFF);
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_returns_false_for_a_non_first_ipv4_fragment() {
+        // TT-2046 review finding #2: only the first fragment of a fragmented datagram carries a
+        // real L4 header - a non-zero fragment offset means later fragments must never be treated
+        // as if they had one (misreading payload as ports, or worse, corrupting payload bytes by
+        // writing a "checksum fixup" into them).
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 (in 8-byte units) - not the first fragment
+        let original = packet.clone();
+
+        assert!(!rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+        assert_eq!(
+            packet, original,
+            "a non-first fragment must be left completely untouched"
+        );
+    }
+
+    #[test]
+    fn rewrite_source_ipv4_returns_false_for_a_non_first_ipv4_fragment() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(10, 66, 66, 1),
+            443,
+            51234,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 - not the first fragment
+
+        assert!(!rewrite_source_ipv4(
+            &mut packet,
+            Ipv4Addr::new(172, 16, 0, 9)
+        ));
+    }
+
+    #[test]
+    fn rewrite_destination_ipv4_still_rewrites_the_first_fragment_of_a_fragmented_datagram() {
+        // The first fragment (offset 0) DOES carry a real L4 header, even with the "more
+        // fragments" flag set - only later fragments (offset != 0) are the ones to reject.
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x20; // MF flag set, fragment offset = 0 - this IS the first fragment
+
+        assert!(rewrite_destination_ipv4(
+            &mut packet,
+            Ipv4Addr::new(10, 0, 0, 5)
+        ));
+        assert_eq!(&packet[16..20], &[10, 0, 0, 5]);
+    }
+
+    #[test]
+    fn parse_source_port_returns_none_for_a_non_first_ipv4_fragment() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 - not the first fragment
+
+        assert_eq!(parse_source_port(&packet), None);
+    }
+
+    #[test]
+    fn parse_destination_port_returns_none_for_a_non_first_ipv4_fragment() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 1),
+            51234,
+            443,
+        );
+        packet[6] = 0x00;
+        packet[7] = 0x01; // fragment offset = 1 - not the first fragment
+
+        assert_eq!(parse_destination_port(&packet), None);
     }
 
     #[test]

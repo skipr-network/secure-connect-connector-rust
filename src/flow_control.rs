@@ -183,20 +183,25 @@ async fn handle_flow_admission(
     .await;
 
     match decision {
-        AccessDecision::Allowed { .. } => {
+        AccessDecision::Allowed { endpoints, .. } => {
             // The real forwarding loops (`main`) only forward traffic for a
             // (node_id, port) pair present here, in both directions
             // (forward: TT-1732 review finding #1 - "a refused, or never
             // checked, device's traffic could still be forwarded once its
             // IP was learned"; reverse/reply routing: TT-1847) - nothing is
             // forwardable or routable until it's recorded as admitted right
-            // here.
+            // here. `endpoints` rides along so the forwarding loop can also
+            // check *where* traffic is headed, not just that the flow is
+            // admitted (TT-2046) - being entitled to a gateway says nothing
+            // about which address that gateway is actually configured to
+            // expose.
             flow_table.lock().expect("flow table lock poisoned").admit(
                 request.node_id.clone(),
                 request.port,
                 request.gateway_id.clone(),
                 request.flow_id.clone(),
                 request.user_public_key.clone(),
+                endpoints,
             );
             FlowAdmissionResponse {
                 flow_id: request.flow_id,
@@ -359,6 +364,37 @@ mod tests {
         assert_eq!(
             table.lock().unwrap().gateway_for("n-1", 51820),
             Some("gw-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_flows_endpoints_flow_through_to_the_flow_table_for_destination_enforcement()
+     {
+        // TT-2046: `AccessDecision::Allowed`'s endpoints must actually reach
+        // `FlowTable`, not just gateway_id/flow_id - otherwise the real
+        // forwarding loop has nothing to check a packet's destination
+        // against.
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+
+        // store_with_entitled_device's gw-1 bundle configures 10.0.0.5:443.
+        assert_eq!(
+            table.lock().unwrap().forward_target("n-1", 51820, 443),
+            crate::flow_table::ForwardOutcome::Forward("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            table.lock().unwrap().forward_target("n-1", 51820, 8080),
+            crate::flow_table::ForwardOutcome::PortNotConfigured
         );
     }
 
