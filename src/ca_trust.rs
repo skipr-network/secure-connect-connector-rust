@@ -51,27 +51,41 @@ pub fn load_extra_root_certificates(path: &Path) -> Result<Vec<reqwest::Certific
 
     // Parsed a second time, independently, purely for the subject/expiry logged below -
     // reqwest::Certificate deliberately doesn't expose parsed metadata, it just carries the raw
-    // bytes through to the TLS backend.
+    // bytes through to the TLS backend. Best-effort: x509-parser does full RFC 5280 semantic
+    // parsing, stricter than the DER-level parse reqwest just used to successfully load these as
+    // trust anchors above, so a certificate that's already proven usable for TLS must never be
+    // rejected at startup only because this purely cosmetic logging step couldn't describe it -
+    // that would invert the whole point of failing at startup (catch an untrusted certificate,
+    // not add a second, unrelated way to fail on a valid one).
     for pem in x509_parser::pem::Pem::iter_from_buffer(&pem_bytes) {
-        let pem = pem.with_context(|| {
-            format!(
-                "failed to re-read a certificate in {} for logging",
-                path.display()
-            )
-        })?;
-        let (_, parsed) =
-            x509_parser::parse_x509_certificate(&pem.contents).with_context(|| {
-                format!(
-                    "failed to parse a certificate's metadata in {}",
-                    path.display()
-                )
-            })?;
-        tracing::info!(
-            path = %path.display(),
-            subject = %parsed.subject(),
-            not_after = %parsed.validity().not_after,
-            "trusting an extra root CA for Agent/Registry TLS (CONNECTOR_CA_BUNDLE_PATH)"
-        );
+        let pem = match pem {
+            Ok(pem) => pem,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "trusting an extra root CA for Agent/Registry TLS (CONNECTOR_CA_BUNDLE_PATH), but could not re-read a certificate to log its subject/expiry"
+                );
+                continue;
+            }
+        };
+        match x509_parser::parse_x509_certificate(&pem.contents) {
+            Ok((_, parsed)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    subject = %parsed.subject(),
+                    not_after = %parsed.validity().not_after,
+                    "trusting an extra root CA for Agent/Registry TLS (CONNECTOR_CA_BUNDLE_PATH)"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "trusting an extra root CA for Agent/Registry TLS (CONNECTOR_CA_BUNDLE_PATH), but could not parse its subject/expiry to log them"
+                );
+            }
+        }
     }
 
     Ok(certificates)
