@@ -23,6 +23,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 boringtun = { version = "0.7.1", default-features = false }
 tun = { version = "0.8.14", features = ["async"] }
 x509-parser = "0.16"
+# TT-2027 review finding #2: reads the OS trust store purely to log how many anchors it found -
+# already resolved transitively via reqwest's rustls-tls-native-roots feature (Cargo.lock), so this
+# adds no new dependency to the tree, just a direct name for a crate already being built.
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -32,6 +36,9 @@ http-body-util = "0.1"
 # Test-only: both already in the tree transitively via reqwest's rustls-tls backend (Cargo.lock
 # already resolves tokio-rustls 0.26.4) - used to spin up a real TLS server in ca_trust's tests so
 # `add_root_certificate` keeping hostname verification enforced (PR #11 review finding #4) is
-# proven end to end, not just asserted in a comment.
-rustls = "0.23"
-tokio-rustls = "0.26"
+# proven end to end, not just asserted in a comment. default-features = false + an explicit "ring"
+# feature on both: their real defaults pull in aws-lc-rs, which needs a C compiler/cmake to build
+# aws-lc-sys from source (PR #11 review) - ring is the same pure-Rust backend reqwest's own rustls
+# dependency already uses, so this doesn't change what's trusted, only what has to compile.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }

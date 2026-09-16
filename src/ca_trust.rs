@@ -19,6 +19,13 @@
 //! worst outcome here: the box looks configured (the env var is set) while nothing extra is
 //! actually trusted, and the admin has no signal anything's wrong until a real connection fails
 //! for what looks like an unrelated reason.
+//!
+//! The native-roots half of this trust model used to be completely silent (PR #11 review finding
+//! #2): only a `CONNECTOR_CA_BUNDLE_PATH` bundle ever logged anything, so an admin relying on the
+//! recommended zero-config path - the box's own OS trust store - had no visibility into whether it
+//! actually found anything at all. `log_native_root_certificate_count` closes that: a read-only,
+//! side-effect-free load purely for that one log line, entirely separate from the actual trust
+//! store `reqwest`'s own `rustls-tls-native-roots` feature builds and uses internally.
 
 use std::path::Path;
 
@@ -90,6 +97,27 @@ pub fn load_extra_root_certificates(path: &Path) -> Result<Vec<reqwest::Certific
     }
 
     Ok(certificates)
+}
+
+/// Logs how many root certificates the box's own OS trust store actually has, and any errors
+/// encountered reading it (PR #11 review finding #2) - purely for visibility, never consulted for
+/// any trust decision. `rustls-tls-native-roots` (Cargo.toml) does its own separate internal load
+/// for the trust store `reqwest`'s HTTP client actually uses; this is a second, independent read
+/// solely so the zero-config native-roots path isn't completely silent the way
+/// `CONNECTOR_CA_BUNDLE_PATH` never was. Called once at startup, not sparingly per this crate's own
+/// doc warning that it can be expensive (reading a ~300KB file on some platforms).
+pub fn log_native_root_certificate_count() {
+    let result = rustls_native_certs::load_native_certs();
+    if !result.errors.is_empty() {
+        tracing::warn!(
+            errors = ?result.errors,
+            "some certificates in the OS trust store could not be loaded"
+        );
+    }
+    tracing::info!(
+        count = result.certs.len(),
+        "OS trust store root certificates available for Agent/Registry TLS"
+    );
 }
 
 /// How far ahead of an anchor's expiry to start warning (PR #11 review finding #5, Oleksandr
@@ -230,6 +258,15 @@ mod tests {
         std::fs::write(&path, "").unwrap();
 
         assert!(load_extra_root_certificates(&path).is_err());
+    }
+
+    /// Purely a smoke test - this reads the real OS trust store (there's no fake one to inject),
+    /// so all this can prove is that it never panics, on any platform CI runs on, and returns
+    /// something rather than hanging. The logged count/errors are the actual signal for an admin,
+    /// not something a unit test can meaningfully assert on beyond "it completes at all".
+    #[test]
+    fn log_native_root_certificate_count_does_not_panic() {
+        log_native_root_certificate_count();
     }
 
     fn asn1_time_in(seconds_from_now: i64) -> x509_parser::time::ASN1Time {

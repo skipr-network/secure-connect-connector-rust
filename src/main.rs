@@ -112,6 +112,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // TT-2027 review finding #2: the native-roots half of this trust model was silent - only
+    // logged if CONNECTOR_CA_BUNDLE_PATH was also set. This makes the zero-config OS-trust-store
+    // path visible too, purely for that log line (see ca_trust's own doc).
+    ca_trust::log_native_root_certificate_count();
+
     // TT-2027: CONNECTOR_CA_BUNDLE_PATH, when set, adds one or more extra trusted root CAs on
     // top of the default trust (Mozilla's bundled roots plus, via rustls-tls-native-roots, the
     // box's own OS trust store) - never a replacement for it, and never `danger_accept_invalid_certs`.
