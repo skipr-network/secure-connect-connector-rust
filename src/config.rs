@@ -46,7 +46,9 @@ const AGENT_SIGNATURE_VALIDITY_SECONDS: u64 = 300;
 pub fn identity_key_path_from_env() -> PathBuf {
     PathBuf::from(
         env::var("CONNECTOR_IDENTITY_KEY_PATH")
-            .unwrap_or_else(|_| "/var/skipr/connector/.keys/identity.key".to_string()),
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/var/skipr/connector/.keys/identity.key".to_string()),
     )
 }
 
@@ -60,7 +62,9 @@ impl Config {
             identity_key_path: identity_key_path_from_env(),
             audit_log_path: PathBuf::from(
                 env::var("CONNECTOR_AUDIT_LOG_PATH")
-                    .unwrap_or_else(|_| "/var/skipr/connector/audit/audit.log".to_string()),
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "/var/skipr/connector/audit/audit.log".to_string()),
             ),
             control_plane_port: env::var("CONNECTOR_CONTROL_PLANE_PORT")
                 .ok()
@@ -76,7 +80,13 @@ impl Config {
 }
 
 fn require_env(name: &str) -> Result<String> {
-    env::var(name).with_context(|| format!("required environment variable {name} is not set"))
+    // A systemd EnvironmentFile line like `VAR=` sets VAR to the empty string, not unset - an
+    // admin who left a required placeholder blank must still fail here, not start with an empty
+    // value.
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("required environment variable {name} is not set"))
 }
 
 /// A zero interval reaches `tokio::time::interval` in `main`, which panics on
