@@ -57,6 +57,23 @@ Requires these environment variables:
 | `CONNECTOR_CONTROL_PLANE_PORT`   | no       | `8443`                                        |
 | `CONNECTOR_TUN_NETMASK`          | no       | `255.255.255.0`                               |
 | `HEARTBEAT_INTERVAL_SECONDS`     | no       | `60`                                          |
+| `CONNECTOR_CA_BUNDLE_PATH`       | no       | unset                                         |
+
+**`CONNECTOR_CA_BUNDLE_PATH`** - a PEM bundle (one or more certificates) of extra root CAs to
+trust for the Agent/Registry connections, for an Agent running behind a private/internal CA. Not
+usually needed: if the CA is already installed in the box's own OS trust store (the standard
+on-prem procedure), the Connector trusts it automatically with no configuration at all. Set this
+only when that isn't the case. An unreadable file or invalid PEM fails the daemon at startup
+rather than silently falling back to the default trust.
+
+**Behavior change (TT-2027):** trusting the box's own OS trust store at all is new as of this
+release - earlier versions only trusted the bundled Mozilla root set and had no way to pick up a
+CA installed locally on the box, `CONNECTOR_CA_BUNDLE_PATH` or otherwise. Every daemon startup now
+also logs an `info`/`warn` line reporting how many root certificates the OS trust store has (and
+any errors reading it), purely for visibility - not consulted for any trust decision, and not an
+exact count of what the running HTTP client ends up trusting (a certificate that fails to parse as
+a valid trust anchor is silently skipped by the client itself, the same way a native store's own
+occasional ancient or malformed entry always has been).
 
 **`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** - it is
 not persisted anywhere by itself. Portal's install command sets it inline for that one command

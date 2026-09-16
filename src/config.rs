@@ -32,6 +32,14 @@ pub struct Config {
     /// config concern (TT-1838): it's `connector_virtual_ip`, learned from the first successful
     /// heartbeat (Portal's own registered, per-Connector address), not guessed here.
     pub tun_netmask: Ipv4Addr,
+    /// Optional PEM bundle of extra root CA certificates to trust for the Agent/Registry HTTP
+    /// clients (TT-2027) - on top of, not instead of, the default trust (Mozilla's bundled roots
+    /// and, since this same fix, the box's own OS trust store). Lets an Enterprise Admin running
+    /// Agent behind a private/internal CA point the Connector at it explicitly; unset by default,
+    /// which leaves TLS validation exactly as it was before this option existed. See
+    /// `ca_trust::load_extra_root_certificates` for how this is used and why an unreadable/invalid
+    /// path fails startup rather than silently falling back to the default roots.
+    pub ca_bundle_path: Option<PathBuf>,
 }
 
 /// Konyk's answer (TT-1732 comment thread): default 60s, must stay below
@@ -75,6 +83,16 @@ impl Config {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(Ipv4Addr::new(255, 255, 255, 0)),
             heartbeat_interval: parse_heartbeat_interval(),
+            // PR #11 review: trims before use, not just before the blank-check - a value with
+            // stray leading/trailing whitespace (systemd EnvironmentFile doesn't strip it,
+            // per install-systemd.sh's own CONNECTOR_IDENTITY_KEY_PATH lesson) previously passed
+            // the blank-check but still built a PathBuf containing the whitespace, which would
+            // never resolve to the real file.
+            ca_bundle_path: env::var("CONNECTOR_CA_BUNDLE_PATH")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         })
     }
 }
@@ -142,6 +160,7 @@ mod tests {
             "CONNECTOR_CONTROL_PLANE_PORT",
             "CONNECTOR_TUN_NETMASK",
             "HEARTBEAT_INTERVAL_SECONDS",
+            "CONNECTOR_CA_BUNDLE_PATH",
         ] {
             unsafe { env::remove_var(key) };
         }
@@ -188,6 +207,76 @@ mod tests {
         assert_eq!(
             config.audit_log_path,
             PathBuf::from("/var/skipr/connector/audit/audit.log")
+        );
+        clear_all();
+    }
+
+    #[test]
+    fn defaults_the_ca_bundle_path_to_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.ca_bundle_path, None);
+        clear_all();
+    }
+
+    #[test]
+    fn reads_a_configured_ca_bundle_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+            env::set_var(
+                "CONNECTOR_CA_BUNDLE_PATH",
+                "/etc/skipr/connector/ca-bundle.pem",
+            );
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(
+            config.ca_bundle_path,
+            Some(PathBuf::from("/etc/skipr/connector/ca-bundle.pem"))
+        );
+        clear_all();
+    }
+
+    /// PR #11 review: the value must be trimmed before it becomes the path, not just before the
+    /// blank-check - a value that's only whitespace after trimming must still resolve to `None`
+    /// (already covered by `defaults_the_ca_bundle_path_to_unset`'s sibling), but a value with real
+    /// content plus stray surrounding whitespace must resolve to the trimmed path, not one that
+    /// still has the whitespace baked in (which would never exist on disk).
+    #[test]
+    fn trims_surrounding_whitespace_from_a_configured_ca_bundle_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+            env::set_var(
+                "CONNECTOR_CA_BUNDLE_PATH",
+                "  /etc/skipr/connector/ca-bundle.pem  ",
+            );
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(
+            config.ca_bundle_path,
+            Some(PathBuf::from("/etc/skipr/connector/ca-bundle.pem"))
         );
         clear_all();
     }

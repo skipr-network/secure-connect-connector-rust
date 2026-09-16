@@ -1,5 +1,6 @@
 mod access;
 mod audit;
+mod ca_trust;
 mod config;
 mod crypto;
 mod dns_cache;
@@ -112,7 +113,37 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let http = reqwest::Client::new();
+    // TT-2027 review finding #2: the native-roots half of this trust model was silent - only
+    // logged if CONNECTOR_CA_BUNDLE_PATH was also set. This makes the zero-config OS-trust-store
+    // path visible too, purely for that log line (see ca_trust's own doc).
+    ca_trust::log_native_root_certificate_count();
+
+    // TT-2027: CONNECTOR_CA_BUNDLE_PATH, when set, adds one or more extra trusted root CAs on
+    // top of the default trust (Mozilla's bundled roots plus, via rustls-tls-native-roots, the
+    // box's own OS trust store) - never a replacement for it, and never `danger_accept_invalid_certs`.
+    let mut http_builder = reqwest::Client::builder();
+    if let Some(ca_bundle_path) = &config.ca_bundle_path {
+        for certificate in ca_trust::load_extra_root_certificates(ca_bundle_path)? {
+            http_builder = http_builder.add_root_certificate(certificate);
+        }
+    }
+    // reqwest::Certificate::from_pem_bundle doesn't validate DER structure under the rustls
+    // backend - it just carries the bytes through - so a structurally-broken certificate in
+    // CONNECTOR_CA_BUNDLE_PATH passes load_extra_root_certificates above with Ok, and only fails
+    // here, once the TLS backend actually tries to load it as a trust anchor (PR #11 review
+    // finding #1). Naming the path in this error, when one was configured, is the difference
+    // between an admin immediately knowing which file to check and a bare "failed to build the
+    // HTTP client" that gives no hint the CA bundle is even involved.
+    let http = http_builder
+        .build()
+        .with_context(|| match &config.ca_bundle_path {
+            Some(path) => format!(
+                "failed to build the HTTP client - check that every certificate in \
+             CONNECTOR_CA_BUNDLE_PATH ({}) is structurally valid DER, not just well-formed PEM",
+                path.display()
+            ),
+            None => "failed to build the HTTP client".to_string(),
+        })?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
     let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
     let policy_store = Arc::new(PolicyStore::new());
@@ -855,6 +886,7 @@ mod tests {
             control_plane_port: 0,
             tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
+            ca_bundle_path: None,
         }
     }
 
