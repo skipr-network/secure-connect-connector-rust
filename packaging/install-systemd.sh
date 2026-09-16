@@ -157,21 +157,24 @@ sudo tee "$UNIT_PATH" > /dev/null <<EOF
 Description=Skipr Private Gateway Connector
 After=network-online.target
 Wants=network-online.target
+# [Unit], not [Service] - a unit-wide rate limit governing how often systemd will (re)start this
+# unit at all, not a property of the service process itself, so systemd only recognizes it here
+# (silently ignored in [Service] - no error, it just never takes effect). Paired with
+# Restart=on-failure below: a genuine runtime crash still gets retried, but a config typo or other
+# immediate, permanent failure trips this limit and leaves the unit in \`failed\` after a minute
+# instead of grinding on forever - 5-in-25s from Restart/RestartSec alone never reaches systemd's
+# default 5-in-10s limit, so without this it would just crash-loop indefinitely with the useful
+# first error scrolled out of the journal.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=${RUN_AS_USER}
 EnvironmentFile=${ENV_FILE}
 ExecStart=${INSTALLED_BINARY_PATH}
-# on-failure (not always) with a start-limit below: a genuine runtime crash still gets retried,
-# but a config typo or other immediate, permanent failure trips the limit and leaves the unit in
-# \`failed\` after a minute instead of grinding on forever - 5-in-25s from Restart/RestartSec alone
-# never reaches systemd's default 5-in-10s limit, so without this it would just crash-loop
-# indefinitely with the useful first error scrolled out of the journal.
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # The one capability this daemon actually needs (creating its TUN device) -
 # granted directly to the process, never by running it as root.
