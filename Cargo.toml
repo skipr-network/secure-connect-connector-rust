@@ -5,7 +5,7 @@ edition = "2024"
 description = "Private Gateway Connector runtime (TT-1732)"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "net", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "json"] }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 boringtun = { version = "0.7.1", default-features = false }
 tun = { version = "0.8.14", features = ["async"] }
 x509-parser = "0.16"
+futures-util = "0.3"
 # TT-2027 review finding #2: reads the OS trust store purely to log how many anchors it found -
 # already resolved transitively via reqwest's rustls-tls-native-roots feature (Cargo.lock), so this
 # adds no new dependency to the tree, just a direct name for a crate already being built.
@@ -33,6 +34,7 @@ wiremock = "0.6"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }
 # Test-only: both already in the tree transitively via reqwest's rustls-tls backend (Cargo.lock
 # already resolves tokio-rustls 0.26.4) - used to spin up a real TLS server in ca_trust's tests so
 # `add_root_certificate` keeping hostname verification enforced (PR #11 review finding #4) is

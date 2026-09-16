@@ -71,7 +71,7 @@ not persisted anywhere by itself. Portal's install command sets it inline for th
 only (e.g. `$HOME/.skipr/connector-identity.key`); a later shell, systemd unit, or a different user
 does not inherit it. Starting the daemon without repeating the exact same value generates a
 second, unregistered identity - the daemon will log a loud warning if this happens, but the fix is
-to export it explicitly first (PR #278 review, Tasneem):
+to export it explicitly first:
 
 ```sh
 export CONNECTOR_IDENTITY_KEY_PATH=$HOME/.skipr/connector-identity.key
@@ -79,6 +79,47 @@ export CONNECTOR_IDENTITY_KEY_PATH=$HOME/.skipr/connector-identity.key
 
 ```sh
 secure_connect_connector
+```
+
+### Running it as a systemd service (recommended)
+
+Running the raw binary directly requires either root or manually granting it
+`CAP_NET_ADMIN` (`sudo setcap cap_net_admin+ep target/release/secure_connect_connector`)
+every single time it's rebuilt, since that capability is a property of the binary
+file and gets wiped out on every new build - easy to forget, and a real admin has
+no reason to know it's needed at all (creating the Connector's TUN device is a
+privileged kernel operation, `Operation not permitted` otherwise).
+
+The systemd install script grants that one capability declaratively, once, so it
+survives every rebuild and restart without ever running the daemon as root. It
+also generates the Connector's identity itself, directly at the path the
+service will actually load it from - printing the public key for you to
+register in Portal, the same way the standalone `--generate-identity` mode
+above does, but without the separate manual step or the risk of the daemon
+loading from a different path than whatever shell generated the key:
+
+```sh
+./packaging/install-systemd.sh
+```
+
+Copy the printed public key into Portal's Deploy Connector screen if you
+haven't already, then fill in `/etc/skipr/connector/connector.env` with
+`CONNECTOR_ID` (the one Portal gives you back) and the rest of the required
+values from the table above - leave `CONNECTOR_IDENTITY_KEY_PATH` commented
+out unless you deliberately want a non-default location (note that this file
+is read by systemd, not a shell: use an absolute path only, since `$HOME` and
+`~` are not expanded there, and re-run `install-systemd.sh` afterwards so the
+identity gets generated at the new path before the daemon ever starts). Then:
+
+```sh
+sudo systemctl enable --now secure-connect-connector
+journalctl -u secure-connect-connector -f
+```
+
+Re-running `install-systemd.sh` after a rebuild or an env-file change picks up the new binary/config and restarts the service if it's already running. To remove it entirely (`connector.env` is left in place):
+
+```sh
+./packaging/install-systemd.sh --uninstall
 ```
 
 ## Development

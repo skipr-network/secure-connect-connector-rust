@@ -2,8 +2,11 @@ name: ci
 
 # Required status check "ci / build-and-test", same convention as the rest of the
 # fleet's ci.yml (see branch-source-guard.yml) - checks fmt, clippy (warnings as
-# errors), and the full test suite, including the cross-language Ed25519 interop
-# test against a fixed signature captured from the Java fleet's Ed25519Support.
+# errors), the full test suite (including the cross-language Ed25519 interop test
+# against a fixed signature captured from the Java fleet's Ed25519Support), and
+# shellcheck on packaging/ (TT-2030 review - shell is part of the delivered
+# product now, not just dev tooling, so it shouldn't be able to drift unchecked
+# the way `cargo fmt`/clippy already stop the Rust side from doing).
 
 on:
   pull_request:
@@ -36,3 +39,6 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets
+
+      - name: Shellcheck packaging scripts
+        run: shellcheck packaging/*.sh
