@@ -64,7 +64,17 @@ pub fn load_extra_root_certificates(path: &Path) -> Result<Vec<reqwest::Certific
     // rejected at startup only because this purely cosmetic logging step couldn't describe it -
     // that would invert the whole point of failing at startup (catch an untrusted certificate,
     // not add a second, unrelated way to fail on a valid one).
+    //
+    // `re_read_count` guards a gap the loop body's own per-iteration warnings can't (PR #11
+    // review): if x509-parser's PEM iterator disagrees with reqwest's own PEM parser badly enough
+    // to yield *zero* items here - despite `certificates` above being non-empty, i.e. reqwest
+    // really did load and trust something from this exact byte buffer - the loop body simply never
+    // runs, and without this check there would be no log line at all: not the info! that normally
+    // confirms what's trusted, not even a warn!. An admin would have no visibility that anything
+    // was trusted from this bundle, the opposite of what this whole function exists for.
+    let mut re_read_count = 0usize;
     for pem in x509_parser::pem::Pem::iter_from_buffer(&pem_bytes) {
+        re_read_count += 1;
         let pem = match pem {
             Ok(pem) => pem,
             Err(error) => {
@@ -95,17 +105,52 @@ pub fn load_extra_root_certificates(path: &Path) -> Result<Vec<reqwest::Certific
             }
         }
     }
+    if metadata_logging_found_nothing(re_read_count, certificates.len()) {
+        tracing::warn!(
+            path = %path.display(),
+            trusted_count = certificates.len(),
+            "trusting {} extra root CA(s) for Agent/Registry TLS (CONNECTOR_CA_BUNDLE_PATH), but \
+             could not re-read any of them to log their subject/expiry",
+            certificates.len()
+        );
+    }
 
     Ok(certificates)
 }
 
-/// Logs how many root certificates the box's own OS trust store actually has, and any errors
-/// encountered reading it (PR #11 review finding #2) - purely for visibility, never consulted for
-/// any trust decision. `rustls-tls-native-roots` (Cargo.toml) does its own separate internal load
-/// for the trust store `reqwest`'s HTTP client actually uses; this is a second, independent read
-/// solely so the zero-config native-roots path isn't completely silent the way
-/// `CONNECTOR_CA_BUNDLE_PATH` never was. Called once at startup, not sparingly per this crate's own
-/// doc warning that it can be expensive (reading a ~300KB file on some platforms).
+/// Whether the metadata re-read loop above found nothing at all despite `trusted_count`
+/// certificates actually being loaded and trusted (PR #11 review) - factored out as its own pure
+/// function so this specific silent gap is directly unit-testable without a log-capturing
+/// dependency this crate doesn't otherwise use.
+///
+/// Defensive, not a reproduction of a live bug: `reqwest::Certificate::from_pem_bundle` (via
+/// `rustls_pki_types::CertificateDer::pem_reader_iter`) and `x509_parser::pem::Pem::iter_from_buffer`
+/// are two independently-maintained PEM parsers, and every malformed-input variant tried while
+/// building this fix (leading whitespace, four/six-hyphen markers, a byte-order mark, trailing
+/// garbage) had both parsers agree - neither a real repro nor a guarantee they always will on
+/// every platform or future version of either crate. This guards the case where they someday
+/// don't, so that divergence fails safe (a `warn!`) instead of silently producing zero log lines
+/// for a bundle that's still fully trusted.
+fn metadata_logging_found_nothing(re_read_count: usize, trusted_count: usize) -> bool {
+    re_read_count == 0 && trusted_count > 0
+}
+
+/// Logs how many root certificates `rustls_native_certs::load_native_certs()` returns from the
+/// box's own OS trust store, and any errors encountered reading it (PR #11 review finding #2) -
+/// purely for visibility, never consulted for any trust decision. `rustls-tls-native-roots`
+/// (Cargo.toml) does its own separate internal load for the trust store `reqwest`'s HTTP client
+/// actually uses; this is a second, independent read solely so the zero-config native-roots path
+/// isn't completely silent the way `CONNECTOR_CA_BUNDLE_PATH` never was. Called once at startup,
+/// not sparingly per this crate's own doc warning that it can be expensive (reading a ~300KB file
+/// on some platforms).
+///
+/// The logged count is an upper bound on what ends up trusted, not a guarantee (PR #11 review):
+/// `reqwest` runs its own, separate `load_native_certs()` call and then adds each returned
+/// certificate to its actual `RootCertStore` one at a time, silently skipping (`log::debug!` only)
+/// any that fail that add - malformed DER, an unsupported curve, and similar are common in native
+/// stores, which is also why `reqwest` itself only treats that as a hard error when *every* one
+/// fails. So this number is "how many the OS reported", not "how many `reqwest` is actually
+/// trusting" - close enough for the visibility this exists for, but not exact.
 pub fn log_native_root_certificate_count() {
     let result = rustls_native_certs::load_native_certs();
     if !result.errors.is_empty() {
@@ -116,7 +161,8 @@ pub fn log_native_root_certificate_count() {
     }
     tracing::info!(
         count = result.certs.len(),
-        "OS trust store root certificates available for Agent/Registry TLS"
+        "OS trust store reports this many root certificates - reqwest's own client may trust \
+         slightly fewer if any fail to parse as a valid trust anchor"
     );
 }
 
@@ -235,6 +281,24 @@ mod tests {
     }
 
     #[test]
+    fn metadata_logging_found_nothing_is_true_when_the_re_read_finds_zero_blocks_but_something_was_trusted()
+     {
+        assert!(metadata_logging_found_nothing(0, 1));
+    }
+
+    #[test]
+    fn metadata_logging_found_nothing_is_false_when_the_re_read_found_at_least_one_block() {
+        assert!(!metadata_logging_found_nothing(1, 1));
+    }
+
+    #[test]
+    fn metadata_logging_found_nothing_is_false_when_nothing_was_trusted_either() {
+        // load_extra_root_certificates already bails before reaching this check whenever
+        // trusted_count is 0 - this only guards the pure function's own correctness in isolation.
+        assert!(!metadata_logging_found_nothing(0, 0));
+    }
+
+    #[test]
     fn fails_startup_rather_than_falling_back_when_the_file_does_not_exist() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.pem");
@@ -328,11 +392,16 @@ mod tests {
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        // rustls only auto-selects a process-wide CryptoProvider when exactly one of its
-        // backends is compiled in - both `ring` and `aws-lc-rs` end up in the dependency tree
-        // here (reqwest and this test's own tokio-rustls dev-dependency don't necessarily agree
-        // on one), so it has to be picked explicitly. Ignoring the error: a previous test in the
-        // same process may have already installed one, which is fine - only one is ever needed.
+        // `ring` is the only crypto backend compiled into this test build (Cargo.toml pins both
+        // rustls dev-dependencies to it explicitly, PR #11 review - their real defaults pull in
+        // aws-lc-rs, which needs a C compiler/cmake to build), so rustls' own auto-detection would
+        // in fact select it with no explicit call needed here (verified: removing this line still
+        // passes). Kept anyway, and explicit rather than implicit, so a future dependency change
+        // that reintroduces a second backend into the tree fails this call clearly - "provider
+        // already installed" or a compile error on a changed API - rather than resurrecting the
+        // exact "could not automatically determine the process-level CryptoProvider" panic this
+        // was originally written to fix. Ignoring the error here: a previous test in the same
+        // process may have already installed one, which is fine - only one is ever needed.
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
         let certs: Vec<CertificateDer<'static>> =

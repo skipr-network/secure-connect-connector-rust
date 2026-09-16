@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 boringtun = { version = "0.7.1", default-features = false }
 tun = { version = "0.8.14", features = ["async"] }
-x509-parser = "0.16"
+x509-parser = "0.18"
 futures-util = "0.3"
 # TT-2027 review finding #2: reads the OS trust store purely to log how many anchors it found -
 # already resolved transitively via reqwest's rustls-tls-native-roots feature (Cargo.lock), so this

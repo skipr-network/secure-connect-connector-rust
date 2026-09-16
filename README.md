@@ -66,6 +66,15 @@ on-prem procedure), the Connector trusts it automatically with no configuration 
 only when that isn't the case. An unreadable file or invalid PEM fails the daemon at startup
 rather than silently falling back to the default trust.
 
+**Behavior change (TT-2027):** trusting the box's own OS trust store at all is new as of this
+release - earlier versions only trusted the bundled Mozilla root set and had no way to pick up a
+CA installed locally on the box, `CONNECTOR_CA_BUNDLE_PATH` or otherwise. Every daemon startup now
+also logs an `info`/`warn` line reporting how many root certificates the OS trust store has (and
+any errors reading it), purely for visibility - not consulted for any trust decision, and not an
+exact count of what the running HTTP client ends up trusting (a certificate that fails to parse as
+a valid trust anchor is silently skipped by the client itself, the same way a native store's own
+occasional ancient or malformed entry always has been).
+
 **`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** - it is
 not persisted anywhere by itself. Portal's install command sets it inline for that one command
 only (e.g. `$HOME/.skipr/connector-identity.key`); a later shell, systemd unit, or a different user
