@@ -287,7 +287,7 @@ mod tests {
         let agent_identity = crypto::generate_keypair();
         let signature = crypto::sign_to_base64(&agent_identity.signing_key, SAMPLE_BODY.as_bytes());
         let request = ConnectorHeartbeatRequest {
-            unresolved_endpoint_hosts: vec!["crm.internal.example.com".to_string()],
+            unresolved_endpoint_hosts: Some(vec!["crm.internal.example.com".to_string()]),
         };
 
         let server = MockServer::start().await;

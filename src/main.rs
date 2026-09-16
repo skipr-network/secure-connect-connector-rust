@@ -319,11 +319,13 @@ async fn run_heartbeat(
     // TT-2069: report on this heartbeat whatever `old_bundles`' endpoint hosts dns_cache still
     // can't resolve, as of the *previous* cycle's refresh - this cycle's own refresh (below)
     // hasn't run yet, and can't have: the fresh set of hosts to refresh against only exists once
-    // this heartbeat's response has already arrived. Empty (not an error) on the first heartbeat.
+    // this heartbeat's response has already arrived. `None` (not `Some(vec![])`) on the first
+    // heartbeat of any process lifetime - there is no previous cycle to report on, which is a
+    // genuinely different fact than "checked, nothing unresolved" (review finding #1: collapsing
+    // the two used to make Portal read every restart as "all clear" and wipe real marks).
     let unresolved_endpoint_hosts = old_bundles
         .as_deref()
-        .map(|bundles| unresolved_endpoint_hosts(bundles, dns_cache))
-        .unwrap_or_default();
+        .map(|bundles| unresolved_hosts_in(bundles, dns_cache));
 
     let agent_public_key = registry_client
         .get_agent_permitted_key(&config.agent_ip_address)
@@ -422,18 +424,14 @@ fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
 /// Which of `bundles`' endpoint hosts `dns_cache` currently has no resolved address for - the
 /// input to `ConnectorHeartbeatRequest::unresolved_endpoint_hosts` (TT-2069). A literal IPv4 host
 /// can never appear here: `DnsCache::resolve` always resolves one immediately, with no lookup at
-/// all. Deduplicated and sorted - the same unresolved host commonly appears on more than one
-/// gateway's endpoint list, and an admin-facing report shouldn't repeat it.
-fn unresolved_endpoint_hosts(
-    bundles: &[PolicyBundle],
-    dns_cache: &dns_cache::DnsCache,
-) -> Vec<String> {
-    let mut hosts: Vec<String> = collect_endpoint_hosts(bundles)
-        .into_iter()
-        .filter(|host| dns_cache.resolve(host).is_none())
-        .collect();
+/// all. Deduplicated and sorted *before* the cache lookups (review finding #5) - the same
+/// unresolved host commonly appears on more than one gateway's endpoint list, and there is no
+/// reason to take `dns_cache`'s lock more than once per distinct host.
+fn unresolved_hosts_in(bundles: &[PolicyBundle], dns_cache: &dns_cache::DnsCache) -> Vec<String> {
+    let mut hosts = collect_endpoint_hosts(bundles);
     hosts.sort();
     hosts.dedup();
+    hosts.retain(|host| dns_cache.resolve(host).is_none());
     hosts
 }
 
@@ -1724,7 +1722,7 @@ mod tests {
         let dns_cache = dns_cache::DnsCache::new();
 
         assert_eq!(
-            unresolved_endpoint_hosts(&bundles, &dns_cache),
+            unresolved_hosts_in(&bundles, &dns_cache),
             Vec::<String>::new()
         );
     }
@@ -1735,7 +1733,7 @@ mod tests {
         let dns_cache = dns_cache::DnsCache::new();
 
         assert_eq!(
-            unresolved_endpoint_hosts(&bundles, &dns_cache),
+            unresolved_hosts_in(&bundles, &dns_cache),
             vec!["erp.internal.example.com".to_string()]
         );
     }
@@ -1749,7 +1747,7 @@ mod tests {
         dns_cache.refresh(collect_endpoint_hosts(&bundles)).await;
 
         assert_eq!(
-            unresolved_endpoint_hosts(&bundles, &dns_cache),
+            unresolved_hosts_in(&bundles, &dns_cache),
             Vec::<String>::new()
         );
     }
@@ -1768,7 +1766,7 @@ mod tests {
         let dns_cache = dns_cache::DnsCache::new();
 
         assert_eq!(
-            unresolved_endpoint_hosts(&bundles, &dns_cache),
+            unresolved_hosts_in(&bundles, &dns_cache),
             vec![
                 "a.internal.example.com".to_string(),
                 "b.internal.example.com".to_string(),
@@ -1925,7 +1923,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/connectors/c-1/heartbeat"))
             .and(body_json(&dto::ConnectorHeartbeatRequest {
-                unresolved_endpoint_hosts: vec!["erp.internal.example.com".to_string()],
+                unresolved_endpoint_hosts: Some(vec!["erp.internal.example.com".to_string()]),
             }))
             .respond_with(
                 ResponseTemplate::new(200)

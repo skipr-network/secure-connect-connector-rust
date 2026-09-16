@@ -15,13 +15,25 @@ use serde::{Deserialize, Serialize};
 /// access-control or information-disclosure issue.
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
 pub struct ConnectorHeartbeatRequest {
-    /// Endpoint hosts, from the *previous* heartbeat's policy bundles, that `dns_cache` still has
-    /// no resolved address for as of right now - never a literal IPv4 (those always resolve, see
-    /// `DnsCache::resolve`), only ever a hostname DNS hasn't answered for. Reported so Portal can
-    /// eventually show an admin that a gateway's endpoint is unreachable, instead of the only
-    /// signal being a `warn!` on this box's own log (TT-2066 review finding #8, TT-2069). Empty on
-    /// the very first heartbeat - nothing was configured yet to have failed to resolve.
-    pub unresolved_endpoint_hosts: Vec<String>,
+    /// Endpoint hosts, from the *previous* heartbeat's policy bundles, that `dns_cache` still had
+    /// no resolved address for as of the last successful `dns_cache.refresh` (not necessarily last
+    /// cycle: a heartbeat that fails before reaching `dns_cache.refresh` leaves this reporting a
+    /// cache that's a cycle or more stale - harmless, since the next successful cycle catches up,
+    /// but the field is never a live "as of right now" read). Never a literal IPv4 (those always
+    /// resolve, see `DnsCache::resolve`), only ever a hostname DNS hasn't answered for - and not
+    /// necessarily the moment DNS starts failing either: `dns_cache` deliberately keeps trusting a
+    /// hostname's last-known address for up to `MAX_CONSECUTIVE_FAILURES` refresh cycles before
+    /// evicting it, so a host only shows up here once that fail-soft window has been exhausted.
+    ///
+    /// `None` - not `Some(vec![])` - on the very first heartbeat after any process start (fresh
+    /// boot, upgrade, or crash-loop restart): there is no previous cycle's bundles to have
+    /// refreshed `dns_cache` against yet, so this Connector genuinely has no information to report,
+    /// as distinct from a confirmed "nothing is unresolved". Portal (via Agent) must treat the two
+    /// differently - `None` means "leave existing marks alone", `Some(vec![])` means "clear every
+    /// mark, everything resolves". Collapsing them into the same "clear everything" signal would
+    /// wipe a real, still-true unresolved-host warning off Portal's UI on every restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved_endpoint_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -83,7 +95,7 @@ mod tests {
     #[test]
     fn heartbeat_request_serializes_its_unresolved_hosts() {
         let request = ConnectorHeartbeatRequest {
-            unresolved_endpoint_hosts: vec!["crm.internal.example.com".to_string()],
+            unresolved_endpoint_hosts: Some(vec!["crm.internal.example.com".to_string()]),
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -95,11 +107,36 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_request_serializes_a_confirmed_empty_list_as_an_explicit_empty_array() {
+        // Some(vec![]) - "refreshed, nothing unresolved" - must stay a real `[]` on the wire, not
+        // get skipped the way `None` is: Portal treats an explicit `[]` as "clear every mark" and
+        // an absent field as "no information, leave marks alone" (TT-2069 review finding #1).
+        let request = ConnectorHeartbeatRequest {
+            unresolved_endpoint_hosts: Some(vec![]),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(json, r#"{"unresolved_endpoint_hosts":[]}"#);
+    }
+
+    #[test]
+    fn heartbeat_request_omits_the_field_entirely_when_there_is_no_previous_cycle_to_report() {
+        let request = ConnectorHeartbeatRequest {
+            unresolved_endpoint_hosts: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(json, r#"{}"#);
+    }
+
+    #[test]
     fn heartbeat_request_default_has_no_unresolved_hosts() {
         assert_eq!(
             ConnectorHeartbeatRequest::default(),
             ConnectorHeartbeatRequest {
-                unresolved_endpoint_hosts: vec![]
+                unresolved_endpoint_hosts: None
             }
         );
     }
