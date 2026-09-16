@@ -249,10 +249,13 @@ fn checksum_adjust(old_checksum: u16, old_word: u16, new_word: u16) -> u16 {
 /// written as `0xFFFF` instead (RFC 768's own rule for a genuinely-zero checksum) - otherwise it
 /// would be indistinguishable from "no checksum computed".
 ///
-/// v1 scope: IPv4 only. Returns `false` (packet left completely untouched) for IPv6, a non-TCP/UDP
-/// protocol, a non-first IPv4 fragment (TT-2046 review finding #2 - no L4 header to update at all),
-/// or anything too short to safely contain the fields being touched - callers must treat that as
-/// "can't forward this", never as "forwarded unchanged".
+/// v1 scope: IPv4 packets only - `new_addr` itself is always a concrete `Ipv4Addr` by the time
+/// this is called, whether the configured `PolicyBundleEndpoint.host` was a literal IP or a
+/// hostname `dns_cache` already resolved (TT-2066); this function never sees the host string
+/// itself. Returns `false` (packet left completely untouched) for an IPv6 *packet*, a non-TCP/UDP
+/// protocol, a non-first IPv4 fragment (TT-2046 review finding #2 - no L4 header to update at
+/// all), or anything too short to safely contain the fields being touched - callers must treat
+/// that as "can't forward this", never as "forwarded unchanged".
 fn rewrite_ipv4_address(packet: &mut [u8], field_offset: usize, new_addr: Ipv4Addr) -> bool {
     let Some(&first_byte) = packet.first() else {
         return false;

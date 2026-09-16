@@ -83,11 +83,13 @@ pub enum ForwardOutcome {
     /// at (matches `node_for_port`'s own precedent for the same shape of ambiguity: refuse, don't
     /// silently pick one).
     AmbiguousEndpoint,
-    /// Admitted, the port matches exactly one endpoint, but its host isn't a literal IPv4 (v1
-    /// scope) - silently black-holes every packet for that gateway until DNS resolution support
-    /// exists, so this needs its own loud, specific message rather than folding into a generic
-    /// "can't forward" line.
-    UnsupportedHost,
+    /// Admitted, the port matches exactly one endpoint, but `dns_cache` has no resolved address
+    /// for its host (TT-2066) - a literal IPv4 always resolves, so this only happens for a
+    /// hostname that hasn't been looked up yet, has failed every refresh so far, or was evicted
+    /// after too many consecutive failures (`dns_cache::MAX_CONSECUTIVE_FAILURES`). Silently
+    /// black-holes every packet for that gateway until it resolves, so this needs its own loud,
+    /// specific message rather than folding into a generic "can't forward" line.
+    HostUnresolved,
 }
 
 #[derive(Default)]
@@ -263,14 +265,17 @@ impl FlowTable {
     /// already refuses to guess at, for the same reason: nothing here can
     /// tell which one the client actually meant.
     ///
-    /// `PolicyBundleEndpoint.host` is resolved as a literal IPv4 only (v1
-    /// scope, TT-2046) - a host that doesn't parse as one is `UnsupportedHost`,
-    /// which is the safe direction to fail in (refuse, not silently admit).
+    /// `PolicyBundleEndpoint.host` is resolved via `dns_cache` (TT-2066) - a literal IPv4
+    /// resolves to itself with no lookup; a hostname resolves to whatever `dns_cache` last
+    /// successfully looked up for it (refreshed once per heartbeat, never synchronously here -
+    /// see `dns_cache`'s module doc), or `ForwardOutcome::HostUnresolved` if it's never resolved
+    /// successfully, which is the safe direction to fail in (refuse, not silently admit).
     pub fn forward_target(
         &self,
         node_id: &str,
         port: u16,
         packet_destination_port: u16,
+        dns_cache: &crate::dns_cache::DnsCache,
     ) -> ForwardOutcome {
         let Some(flow) = self.flows.get(&(node_id.to_string(), port)) else {
             return ForwardOutcome::NotAdmitted;
@@ -282,9 +287,9 @@ impl FlowTable {
             .collect();
         match matching.as_slice() {
             [] => ForwardOutcome::PortNotConfigured,
-            [endpoint] => match endpoint.host.parse::<Ipv4Addr>() {
-                Ok(ip) => ForwardOutcome::Forward(ip),
-                Err(_) => ForwardOutcome::UnsupportedHost,
+            [endpoint] => match dns_cache.resolve(&endpoint.host) {
+                Some(ip) => ForwardOutcome::Forward(ip),
+                None => ForwardOutcome::HostUnresolved,
             },
             _ => ForwardOutcome::AmbiguousEndpoint,
         }
@@ -823,9 +828,10 @@ mod tests {
         );
 
         table.update_endpoints("gw-1", &[endpoint("10.0.0.2", 443)]);
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.2".parse().unwrap())
         );
     }
@@ -843,9 +849,10 @@ mod tests {
         );
 
         table.update_endpoints("gw-2", &[endpoint("10.0.0.2", 443)]);
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.1".parse().unwrap())
         );
     }
@@ -855,9 +862,10 @@ mod tests {
         let mut table = FlowTable::new();
 
         table.update_endpoints("gw-1", &[endpoint("10.0.0.2", 443)]);
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::NotAdmitted
         );
     }
@@ -875,9 +883,10 @@ mod tests {
         );
 
         table.update_endpoints("gw-1", &[]);
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::PortNotConfigured
         );
     }
@@ -892,9 +901,10 @@ mod tests {
     #[test]
     fn forward_target_is_not_admitted_for_an_unadmitted_flow() {
         let table = FlowTable::new();
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::NotAdmitted
         );
     }
@@ -910,9 +920,10 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("10.0.0.5", 443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.5".parse().unwrap())
         );
     }
@@ -932,9 +943,10 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("10.0.0.5", 443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 8080),
+            table.forward_target("n-1", 40001, 8080, &dns_cache),
             ForwardOutcome::PortNotConfigured
         );
     }
@@ -950,9 +962,10 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("10.0.0.5", 443), endpoint("10.0.0.6", 8443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 8443),
+            table.forward_target("n-1", 40001, 8443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.6".parse().unwrap())
         );
     }
@@ -970,17 +983,21 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("10.0.0.5", 443), endpoint("10.0.0.6", 443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
+            table.forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::AmbiguousEndpoint
         );
     }
 
     #[test]
-    fn forward_target_is_unsupported_host_for_a_non_ip_literal_host_rather_than_matching_it() {
-        // v1 scope (TT-2046): only literal-IP endpoint hosts are enforceable.
-        // A hostname must never silently pass - refuse, the safe direction.
+    fn forward_target_is_host_unresolved_for_a_hostname_not_yet_resolved_in_the_dns_cache() {
+        // TT-2066: a hostname endpoint is enforceable once resolved, but never trusted before
+        // that - refuse, the safe direction, same as an unadmitted flow. Also covers what used to
+        // be a separate "non-IP-literal host" case (TT-2046): before TT-2066, any hostname was
+        // categorically unsupported; now it's just unresolved until a heartbeat's DNS refresh
+        // succeeds for it, so the two cases collapsed into one.
         let mut table = FlowTable::new();
         table.admit(
             "n-1".to_string(),
@@ -990,10 +1007,37 @@ mod tests {
             "dev-1".to_string(),
             vec![endpoint("crm.internal.example.com", 443)],
         );
+        let dns_cache = crate::dns_cache::DnsCache::new();
 
         assert_eq!(
-            table.forward_target("n-1", 40001, 443),
-            ForwardOutcome::UnsupportedHost
+            table.forward_target("n-1", 40001, 443, &dns_cache),
+            ForwardOutcome::HostUnresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_target_resolves_a_hostname_endpoint_once_the_dns_cache_has_it() {
+        // TT-2066: the whole point - a hostname endpoint (Portal always allowed configuring one)
+        // now actually forwards, once the Connector's own DNS cache has resolved it.
+        let mut table = FlowTable::new();
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![endpoint("crm.internal.example.com", 443)],
+        );
+        let dns_cache = crate::dns_cache::DnsCache::new();
+        dns_cache
+            .refresh_with(["crm.internal.example.com".to_string()], |_host| async {
+                Ok(vec!["10.0.0.5".parse().unwrap()])
+            })
+            .await;
+
+        assert_eq!(
+            table.forward_target("n-1", 40001, 443, &dns_cache),
+            ForwardOutcome::Forward("10.0.0.5".parse().unwrap())
         );
     }
 

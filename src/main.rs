@@ -2,6 +2,7 @@ mod access;
 mod audit;
 mod config;
 mod crypto;
+mod dns_cache;
 mod dto;
 mod flow_control;
 mod flow_table;
@@ -135,6 +136,9 @@ async fn main() -> anyhow::Result<()> {
     // device) since run_heartbeat's node-dialing needs it too, to evict a departed node's flows
     // (TT-1732 review, Tasneem, TT-1847 finding #1).
     let flow_table = Arc::new(std::sync::Mutex::new(FlowTable::new()));
+    // Refreshed once per heartbeat cycle in `run_heartbeat`, read synchronously on every
+    // decrypted packet in `run_wireguard_receive_loop` (TT-2066) - see `dns_cache`'s module doc.
+    let dns_cache = Arc::new(dns_cache::DnsCache::new());
 
     // TT-1838: the TUN device's own address is connector_virtual_ip - Portal's registered,
     // per-Connector control-channel address - not a locally guessed default anymore, so it can
@@ -152,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await
         {
@@ -183,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         tun_writer,
         flow_table.clone(),
         std::net::IpAddr::V4(connector_virtual_ip),
+        dns_cache.clone(),
     ));
     tokio::spawn(run_tun_send_loop(
         tun_reader,
@@ -226,6 +232,12 @@ async fn main() -> anyhow::Result<()> {
     // immediately, re-running a heartbeat right away instead of waiting a
     // full interval like every subsequent one does.
     interval.reset();
+    // Default MissedTickBehavior::Burst fires every missed tick back-to-back the moment a slow
+    // heartbeat falls behind (PR #10 review) - e.g. several unresolvable endpoint hostnames each
+    // burning their full DNS lookup timeout. Delay only ever schedules the next tick relative to
+    // when the current one actually finished, so a slow cycle just pushes later ones back instead
+    // of compounding into a burst of immediately-repeated heartbeats.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         match run_heartbeat(
@@ -237,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await
         {
@@ -292,6 +305,7 @@ async fn run_heartbeat(
     tunnel_manager: &Mutex<TunnelManager>,
     wg_socket: &UdpSocket,
     flow_table: &std::sync::Mutex<FlowTable>,
+    dns_cache: &dns_cache::DnsCache,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
     let agent_public_key = registry_client
         .get_agent_permitted_key(&config.agent_ip_address)
@@ -361,7 +375,30 @@ async fn run_heartbeat(
     }
     reconcile_endpoint_changes(flow_table, &new_bundles);
 
+    // TT-2066: re-resolve every currently-configured endpoint hostname off this same heartbeat
+    // cycle - new_bundles is the full, current set of every attached gateway's endpoints, so this
+    // also naturally drops a hostname's cache entry once it's no longer configured anywhere (see
+    // dns_cache::refresh's pruning). Never blocks/slows packet forwarding itself - that only ever
+    // reads the cache this populates, in flow_table::forward_target.
+    dns_cache
+        .refresh(collect_endpoint_hosts(&new_bundles))
+        .await;
+
     Ok(connector_virtual_ip)
+}
+
+/// Every currently-configured endpoint host across every attached gateway - the input to
+/// `dns_cache.refresh`. Factored out of `run_heartbeat` as its own pure function specifically so
+/// this exact piece of wiring has a direct test (PR #10 review: every `run_heartbeat` test only
+/// threads a fresh `DnsCache` through and asserts nothing about it - swapping `new_bundles` for
+/// `old_bundles` at the call site, or reading a gateway's own `hostname` field instead of
+/// `endpoints[].host`, would still pass the entire suite without this).
+fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
+    bundles
+        .iter()
+        .flat_map(|bundle| bundle.endpoints.iter())
+        .map(|endpoint| endpoint.host.clone())
+        .collect()
 }
 
 /// Tears down every already-admitted flow whose device dropped out of its gateway's entitlement
@@ -521,6 +558,7 @@ fn prepare_decrypted_packet_for_forwarding(
     node_id: &str,
     connector_virtual_ip: std::net::IpAddr,
     flow_table: &mut FlowTable,
+    dns_cache: &dns_cache::DnsCache,
 ) -> bool {
     if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
         return true;
@@ -537,13 +575,14 @@ fn prepare_decrypted_packet_for_forwarding(
         return false;
     };
 
-    let real_dst = match flow_table.forward_target(node_id, source_port, dst_port) {
+    let real_dst = match flow_table.forward_target(node_id, source_port, dst_port, dns_cache) {
         ForwardOutcome::Forward(real_dst) => real_dst,
-        // Three genuinely different situations (TT-2046 review finding #5), each its own
-        // message: an unadmitted flow is a security event, an admitted-but-unconfigured port is
-        // misconfiguration or probing, an ambiguous match is a Portal config mistake, and an
-        // unsupported host silently black-holes every packet for that gateway until fixed - none
-        // of these should be indistinguishable to whoever's reading the log on-call.
+        // Four genuinely different situations (TT-2046 review finding #5), each its own message:
+        // an unadmitted flow is a security event, an admitted-but-unconfigured port is
+        // misconfiguration or probing, an ambiguous match is a Portal config mistake, and a host
+        // that hasn't resolved to an address yet (TT-2066) silently black-holes every packet for
+        // that gateway until it does - none of these should be indistinguishable to whoever's
+        // reading the log on-call.
         ForwardOutcome::NotAdmitted => {
             warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node/port - dropping");
             return false;
@@ -556,8 +595,8 @@ fn prepare_decrypted_packet_for_forwarding(
             warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one configured endpoint shares this port - refusing to guess, dropping");
             return false;
         }
-        ForwardOutcome::UnsupportedHost => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and the port matches, but the configured endpoint host isn't a literal IPv4 address (v1 scope) - dropping");
+        ForwardOutcome::HostUnresolved => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and the port matches, but its configured endpoint host hasn't resolved to an address yet - dropping");
             return false;
         }
     };
@@ -603,6 +642,7 @@ async fn run_wireguard_receive_loop(
     mut tun_writer: tun_device::TunWriter,
     flow_table: Arc<std::sync::Mutex<FlowTable>>,
     connector_virtual_ip: std::net::IpAddr,
+    dns_cache: Arc<dns_cache::DnsCache>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -640,6 +680,7 @@ async fn run_wireguard_receive_loop(
                         &node_id,
                         connector_virtual_ip,
                         &mut table,
+                        &dns_cache,
                     )
                 };
                 if !should_forward {
@@ -866,12 +907,14 @@ mod tests {
         );
         let original = packet.clone();
         let mut flow_table = FlowTable::new();
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &mut flow_table
+            &mut flow_table,
+            &dns_cache
         ));
         assert_eq!(
             packet, original,
@@ -889,12 +932,14 @@ mod tests {
             443,
         );
         let mut flow_table = FlowTable::new();
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(!prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &mut flow_table
+            &mut flow_table,
+            &dns_cache
         ));
     }
 
@@ -919,12 +964,14 @@ mod tests {
                 port: 443,
             }],
         );
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(!prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &mut flow_table
+            &mut flow_table,
+            &dns_cache
         ));
     }
 
@@ -952,12 +999,14 @@ mod tests {
                 port: 443,
             }],
         );
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &mut flow_table
+            &mut flow_table,
+            &dns_cache
         ));
         assert_eq!(
             &packet[16..20],
@@ -996,12 +1045,14 @@ mod tests {
                 port: 443,
             }],
         );
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert!(!prepare_decrypted_packet_for_forwarding(
             &mut packet,
             "n-1",
             connector_virtual_ip,
-            &mut flow_table
+            &mut flow_table,
+            &dns_cache
         ));
     }
 
@@ -1106,11 +1157,13 @@ mod tests {
                 port: 443,
             }],
         );
+        let dns_cache = dns_cache::DnsCache::new();
         assert!(prepare_decrypted_packet_for_forwarding(
             &mut request,
             "n-1",
             connector_virtual_ip,
-            &mut flow_table
+            &mut flow_table,
+            &dns_cache
         ));
 
         let mut reply = udp_packet(
@@ -1168,6 +1221,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1178,6 +1232,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1231,6 +1286,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1241,6 +1297,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1268,6 +1325,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1278,6 +1336,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1328,6 +1387,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1338,6 +1398,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1387,6 +1448,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1397,6 +1459,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1446,6 +1509,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         // Nodes-without-key is only a warning, not a failure - the cycle still
         // succeeds (there's simply nothing to dial yet for that node).
@@ -1458,6 +1522,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1525,6 +1590,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         let result = run_heartbeat(
             &config,
@@ -1535,6 +1601,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
@@ -1551,6 +1618,157 @@ mod tests {
                 .unwrap();
         assert!(len > 0);
         assert_eq!(from, wg_socket.local_addr().unwrap());
+    }
+
+    #[test]
+    fn collect_endpoint_hosts_returns_every_endpoint_across_every_bundle() {
+        let bundles = vec![
+            PolicyBundle {
+                gateway_id: "gw-1".to_string(),
+                location: "Amsterdam".to_string(),
+                hostname: "crm.internal.example.com".to_string(),
+                access_mode: "SELECTED_USERS".to_string(),
+                endpoints: vec![
+                    dto::PolicyBundleEndpoint {
+                        host: "10.0.0.5".to_string(),
+                        port: 443,
+                    },
+                    dto::PolicyBundleEndpoint {
+                        host: "erp.internal.example.com".to_string(),
+                        port: 8443,
+                    },
+                ],
+                entitlement_list: vec![],
+            },
+            PolicyBundle {
+                gateway_id: "gw-2".to_string(),
+                location: "Amsterdam".to_string(),
+                hostname: "erp.internal.example.com".to_string(),
+                access_mode: "SELECTED_USERS".to_string(),
+                endpoints: vec![dto::PolicyBundleEndpoint {
+                    host: "files.internal.example.com".to_string(),
+                    port: 445,
+                }],
+                entitlement_list: vec![],
+            },
+        ];
+
+        let hosts = collect_endpoint_hosts(&bundles);
+
+        assert_eq!(
+            hosts,
+            vec![
+                "10.0.0.5".to_string(),
+                "erp.internal.example.com".to_string(),
+                "files.internal.example.com".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_heartbeat_refreshes_the_dns_cache_from_this_heartbeats_bundles_not_the_previous_ones()
+     {
+        // PR #10 review: the sharpest version of the wiring gap - an already-admitted gateway's
+        // endpoint from a *previous* heartbeat (old_bundles) must never leak into what this
+        // heartbeat resolves. DnsCache::with_lookup records every host it's actually asked to
+        // resolve, so this proves the real production call site (not a hand-called refresh_with)
+        // reads new_bundles, not old_bundles or something else entirely (a gateway's own
+        // `hostname` field, say) - without ever touching the real OS resolver (PR #10 review: a
+        // hostname fixture here must not risk a real, slow DNS lookup in CI).
+        let agent_identity = crypto::generate_keypair();
+        let old_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"old.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let old_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, old_body.as_bytes());
+        let new_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"new.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let new_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, new_body.as_bytes());
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(old_body, "application/json")
+                    .insert_header("X-Signature", old_signature.as_str()),
+            )
+            .up_to_n_times(1)
+            .mount(&agent_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(new_body, "application/json")
+                    .insert_header("X-Signature", new_signature.as_str()),
+            )
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri(), agent_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let requested_hosts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requested_hosts_in_lookup = requested_hosts.clone();
+        let dns_cache = dns_cache::DnsCache::with_lookup(move |host: String| {
+            requested_hosts_in_lookup.lock().unwrap().push(host);
+            async { Ok(vec![std::net::Ipv4Addr::new(10, 0, 0, 7)]) }
+        });
+
+        // First heartbeat: applies old_bundles as the *current* policy_store state, so the second
+        // call below has real old_bundles/new_bundles to diff between - not None vs. something.
+        run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+        )
+        .await
+        .unwrap();
+        requested_hosts.lock().unwrap().clear();
+
+        run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+        )
+        .await
+        .unwrap();
+
+        // Only this heartbeat's own endpoint host - old.internal.example.com must never appear,
+        // proving the call site reads new_bundles and not old_bundles.
+        assert_eq!(
+            *requested_hosts.lock().unwrap(),
+            vec!["new.internal.example.com".to_string()]
+        );
     }
 
     fn bundle(gateway_id: &str, entitled_device_keys: &[&str]) -> PolicyBundle {
@@ -1715,9 +1933,13 @@ mod tests {
         let new_bundles = vec![bundle_with_endpoint("gw-1", "10.0.0.2", 443)];
 
         reconcile_endpoint_changes(&flow_table, &new_bundles);
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert_eq!(
-            flow_table.lock().unwrap().forward_target("n-1", 40001, 443),
+            flow_table
+                .lock()
+                .unwrap()
+                .forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.2".parse().unwrap())
         );
     }
@@ -1739,9 +1961,13 @@ mod tests {
         let new_bundles = vec![bundle_with_endpoint("gw-2", "10.0.0.2", 443)];
 
         reconcile_endpoint_changes(&flow_table, &new_bundles);
+        let dns_cache = dns_cache::DnsCache::new();
 
         assert_eq!(
-            flow_table.lock().unwrap().forward_target("n-1", 40001, 443),
+            flow_table
+                .lock()
+                .unwrap()
+                .forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.1".parse().unwrap())
         );
     }
@@ -1809,6 +2035,7 @@ mod tests {
         ));
         let wg_socket = wg_socket().await;
         let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
 
         run_heartbeat(
             &config,
@@ -1819,6 +2046,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await
         .unwrap();
@@ -1850,6 +2078,7 @@ mod tests {
             &tunnel_manager,
             &wg_socket,
             &flow_table,
+            &dns_cache,
         )
         .await;
 
