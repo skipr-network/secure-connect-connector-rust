@@ -5,7 +5,24 @@
 //! field-for-field, deserialized from the exact raw bytes the signature was computed
 //! over (see `heartbeat::fetch_and_verify`).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// The heartbeat request body (TT-2069) - previously an empty `POST`, now carrying this
+/// Connector's own observed state back to Agent/Portal. Unsigned, same as the rest of this
+/// request: the endpoint already accepts a heartbeat for any `connector_id` with no per-request
+/// authentication (see `heartbeat`'s module doc), so this adds no new trust boundary - worst case
+/// a spoofed request causes a spurious "unresolved" badge in Portal's UI for a gateway, not an
+/// access-control or information-disclosure issue.
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+pub struct ConnectorHeartbeatRequest {
+    /// Endpoint hosts, from the *previous* heartbeat's policy bundles, that `dns_cache` still has
+    /// no resolved address for as of right now - never a literal IPv4 (those always resolve, see
+    /// `DnsCache::resolve`), only ever a hostname DNS hasn't answered for. Reported so Portal can
+    /// eventually show an admin that a gateway's endpoint is unreachable, instead of the only
+    /// signal being a `warn!` on this box's own log (TT-2066 review finding #8, TT-2069). Empty on
+    /// the very first heartbeat - nothing was configured yet to have failed to resolve.
+    pub unresolved_endpoint_hosts: Vec<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ConnectorHeartbeatResponse {
@@ -62,6 +79,30 @@ pub struct AgentPermittedKeyResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_request_serializes_its_unresolved_hosts() {
+        let request = ConnectorHeartbeatRequest {
+            unresolved_endpoint_hosts: vec!["crm.internal.example.com".to_string()],
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"unresolved_endpoint_hosts":["crm.internal.example.com"]}"#
+        );
+    }
+
+    #[test]
+    fn heartbeat_request_default_has_no_unresolved_hosts() {
+        assert_eq!(
+            ConnectorHeartbeatRequest::default(),
+            ConnectorHeartbeatRequest {
+                unresolved_endpoint_hosts: vec![]
+            }
+        );
+    }
 
     #[test]
     fn deserializes_a_realistic_heartbeat_response() {

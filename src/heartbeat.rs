@@ -8,12 +8,18 @@
 //! *before* any JSON deserialization, never against a re-serialized copy, which
 //! could legitimately produce different bytes (field order, whitespace) than what
 //! Agent actually signed.
+//!
+//! The request itself (`ConnectorHeartbeatRequest`, TT-2069) carries no signature the other
+//! direction - this call has never had any per-request authentication (any caller who can reach
+//! this URL for a given `connector_id` already gets back that connector's real, signed policy
+//! bundle), so a request body doesn't introduce a new trust boundary, only extends the existing
+//! one it already operates under.
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 
 use crate::crypto;
-use crate::dto::ConnectorHeartbeatResponse;
+use crate::dto::{ConnectorHeartbeatRequest, ConnectorHeartbeatResponse};
 
 const SIGNATURE_HEADER: &str = "X-Signature";
 
@@ -32,11 +38,13 @@ impl HeartbeatClient {
 
     /// Fetches, verifies, and deserializes a Connector heartbeat. `agent_public_key_hex`
     /// must be the specific paired Agent's key (Registry's per-Agent lookup, TT-1742) -
-    /// never any registered Agent's key.
+    /// never any registered Agent's key. `request` carries this Connector's own observed state
+    /// (TT-2069) - the hosts, if any, `dns_cache` still couldn't resolve as of the previous cycle.
     pub async fn fetch_and_verify(
         &self,
         connector_id: &str,
         agent_public_key_hex: &str,
+        request: &ConnectorHeartbeatRequest,
     ) -> Result<ConnectorHeartbeatResponse> {
         let url = format!(
             "{}/api/connectors/{}/heartbeat",
@@ -46,6 +54,7 @@ impl HeartbeatClient {
         let response = self
             .http
             .post(&url)
+            .json(request)
             .send()
             .await
             .with_context(|| format!("heartbeat request to {url} failed"))?;
@@ -85,7 +94,7 @@ impl HeartbeatClient {
 mod tests {
     use super::*;
     use crate::crypto;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const SAMPLE_BODY: &str = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2026-08-27T10:05:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
@@ -108,7 +117,11 @@ mod tests {
 
         let client = HeartbeatClient::new(Client::new(), server.uri());
         let result = client
-            .fetch_and_verify("c-1", &agent_identity.public_key_hex)
+            .fetch_and_verify(
+                "c-1",
+                &agent_identity.public_key_hex,
+                &ConnectorHeartbeatRequest::default(),
+            )
             .await
             .unwrap();
 
@@ -135,7 +148,11 @@ mod tests {
 
         let client = HeartbeatClient::new(Client::new(), server.uri());
         let result = client
-            .fetch_and_verify("c-1", &agent_identity.public_key_hex)
+            .fetch_and_verify(
+                "c-1",
+                &agent_identity.public_key_hex,
+                &ConnectorHeartbeatRequest::default(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -154,7 +171,11 @@ mod tests {
 
         let client = HeartbeatClient::new(Client::new(), server.uri());
         let result = client
-            .fetch_and_verify("c-1", &agent_identity.public_key_hex)
+            .fetch_and_verify(
+                "c-1",
+                &agent_identity.public_key_hex,
+                &ConnectorHeartbeatRequest::default(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -179,7 +200,11 @@ mod tests {
 
         let client = HeartbeatClient::new(Client::new(), server.uri());
         let result = client
-            .fetch_and_verify("c-1", &agent_identity.public_key_hex)
+            .fetch_and_verify(
+                "c-1",
+                &agent_identity.public_key_hex,
+                &ConnectorHeartbeatRequest::default(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -198,7 +223,11 @@ mod tests {
 
         let client = HeartbeatClient::new(Client::new(), server.uri());
         let result = client
-            .fetch_and_verify("c-1", &agent_identity.public_key_hex)
+            .fetch_and_verify(
+                "c-1",
+                &agent_identity.public_key_hex,
+                &ConnectorHeartbeatRequest::default(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -210,7 +239,11 @@ mod tests {
         let client = HeartbeatClient::new(Client::new(), "http://127.0.0.1:1".to_string());
 
         let result = client
-            .fetch_and_verify("c-1", &agent_identity.public_key_hex)
+            .fetch_and_verify(
+                "c-1",
+                &agent_identity.public_key_hex,
+                &ConnectorHeartbeatRequest::default(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -236,9 +269,48 @@ mod tests {
 
         let client = HeartbeatClient::new(Client::new(), server.uri());
         let result = client
-            .fetch_and_verify("c-1", &agent_identity.public_key_hex)
+            .fetch_and_verify(
+                "c-1",
+                &agent_identity.public_key_hex,
+                &ConnectorHeartbeatRequest::default(),
+            )
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn sends_the_unresolved_endpoint_hosts_in_the_request_body() {
+        // TT-2069: proven against the actual request Agent receives, not just that
+        // ConnectorHeartbeatRequest serializes correctly in isolation (dto.rs already covers
+        // that) - this is what closes the loop on the request ever actually reaching Agent.
+        let agent_identity = crypto::generate_keypair();
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, SAMPLE_BODY.as_bytes());
+        let request = ConnectorHeartbeatRequest {
+            unresolved_endpoint_hosts: vec!["crm.internal.example.com".to_string()],
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(body_json(&request))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(SAMPLE_BODY, "application/json")
+                    .insert_header("X-Signature", signature.as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = HeartbeatClient::new(Client::new(), server.uri());
+        let result = client
+            .fetch_and_verify("c-1", &agent_identity.public_key_hex, &request)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "request body must match exactly what was passed in, or wiremock's body_json \
+             matcher above would have refused the request with a 404"
+        );
     }
 }
