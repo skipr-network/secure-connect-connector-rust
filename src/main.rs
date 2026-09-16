@@ -121,9 +121,23 @@ async fn main() -> anyhow::Result<()> {
             http_builder = http_builder.add_root_certificate(certificate);
         }
     }
+    // reqwest::Certificate::from_pem_bundle doesn't validate DER structure under the rustls
+    // backend - it just carries the bytes through - so a structurally-broken certificate in
+    // CONNECTOR_CA_BUNDLE_PATH passes load_extra_root_certificates above with Ok, and only fails
+    // here, once the TLS backend actually tries to load it as a trust anchor (PR #11 review
+    // finding #1). Naming the path in this error, when one was configured, is the difference
+    // between an admin immediately knowing which file to check and a bare "failed to build the
+    // HTTP client" that gives no hint the CA bundle is even involved.
     let http = http_builder
         .build()
-        .context("failed to build the HTTP client")?;
+        .with_context(|| match &config.ca_bundle_path {
+            Some(path) => format!(
+                "failed to build the HTTP client - check that every certificate in \
+             CONNECTOR_CA_BUNDLE_PATH ({}) is structurally valid DER, not just well-formed PEM",
+                path.display()
+            ),
+            None => "failed to build the HTTP client".to_string(),
+        })?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
     let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
     let policy_store = Arc::new(PolicyStore::new());
