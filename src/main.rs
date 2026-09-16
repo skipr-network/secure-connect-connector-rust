@@ -338,22 +338,42 @@ async fn run_heartbeat(
     flow_table: &std::sync::Mutex<FlowTable>,
     dns_cache: &dns_cache::DnsCache,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+    // Snapshotted before `policy_store.apply(response)` replaces it and before `response` is moved
+    // (TT-1640): the entitlement lists this Connector had *before* this heartbeat, diffed after a
+    // successful apply against what it has *now* - see `reconcile_dropped_entitlements`. `None` on
+    // the very first heartbeat (nothing was ever admitted before any policy existed, so nothing to
+    // diff against). Taken before the heartbeat request goes out (not after, like it used to be)
+    // since TT-2069 also needs this same snapshot to report the *previous* cycle's unresolved
+    // hosts on the way out - `policy_store` isn't touched by anything in between, so the moment
+    // doesn't matter for `old_bundles`' own original purpose.
+    let old_bundles = policy_store.current().map(|state| state.policy_bundles);
+    // TT-2069: report on this heartbeat whatever `old_bundles`' endpoint hosts dns_cache still
+    // can't resolve, as of the *previous* cycle's refresh - this cycle's own refresh (below)
+    // hasn't run yet, and can't have: the fresh set of hosts to refresh against only exists once
+    // this heartbeat's response has already arrived. `None` (not `Some(vec![])`) on the first
+    // heartbeat of any process lifetime - there is no previous cycle to report on, which is a
+    // genuinely different fact than "checked, nothing unresolved" (review finding #1: collapsing
+    // the two used to make Portal read every restart as "all clear" and wipe real marks).
+    let unresolved_endpoint_hosts = old_bundles
+        .as_deref()
+        .map(|bundles| unresolved_hosts_in(bundles, dns_cache));
+
     let agent_public_key = registry_client
         .get_agent_permitted_key(&config.agent_ip_address)
         .await?;
     let response = heartbeat_client
-        .fetch_and_verify(&config.connector_id, &agent_public_key)
+        .fetch_and_verify(
+            &config.connector_id,
+            &agent_public_key,
+            &dto::ConnectorHeartbeatRequest {
+                unresolved_endpoint_hosts,
+            },
+        )
         .await?;
 
     let gateways = response.policy_bundles.len();
     let nodes = response.node_list.len();
     let node_list = response.node_list.clone();
-    // Snapshotted before `policy_store.apply(response)` replaces it and before `response` is moved
-    // (TT-1640): the entitlement lists this Connector had *before* this heartbeat, diffed after a
-    // successful apply against what it has *now* - see `reconcile_dropped_entitlements`. `None` on
-    // the very first heartbeat (nothing was ever admitted before any policy existed, so nothing to
-    // diff against).
-    let old_bundles = policy_store.current().map(|state| state.policy_bundles);
     let new_bundles = response.policy_bundles.clone();
     let nodes_without_key = node_list
         .iter()
@@ -430,6 +450,20 @@ fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
         .flat_map(|bundle| bundle.endpoints.iter())
         .map(|endpoint| endpoint.host.clone())
         .collect()
+}
+
+/// Which of `bundles`' endpoint hosts `dns_cache` currently has no resolved address for - the
+/// input to `ConnectorHeartbeatRequest::unresolved_endpoint_hosts` (TT-2069). A literal IPv4 host
+/// can never appear here: `DnsCache::resolve` always resolves one immediately, with no lookup at
+/// all. Deduplicated and sorted *before* the cache lookups (review finding #5) - the same
+/// unresolved host commonly appears on more than one gateway's endpoint list, and there is no
+/// reason to take `dns_cache`'s lock more than once per distinct host.
+fn unresolved_hosts_in(bundles: &[PolicyBundle], dns_cache: &dns_cache::DnsCache) -> Vec<String> {
+    let mut hosts = collect_endpoint_hosts(bundles);
+    hosts.sort();
+    hosts.dedup();
+    hosts.retain(|host| dns_cache.resolve(host).is_none());
+    hosts
 }
 
 /// Tears down every already-admitted flow whose device dropped out of its gateway's entitlement
@@ -872,7 +906,7 @@ async fn run_timer_loop(wg_socket: Arc<UdpSocket>, tunnel_manager: Arc<Mutex<Tun
 mod tests {
     use super::*;
     use dto::Entitlement;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config(registry_base_url: String, agent_base_url: String) -> Config {
@@ -1697,6 +1731,81 @@ mod tests {
         );
     }
 
+    fn bundle_with_endpoints(gateway_id: &str, hosts: &[&str]) -> PolicyBundle {
+        PolicyBundle {
+            gateway_id: gateway_id.to_string(),
+            location: "Amsterdam".to_string(),
+            hostname: "crm.internal.example.com".to_string(),
+            access_mode: "SELECTED_USERS".to_string(),
+            endpoints: hosts
+                .iter()
+                .map(|host| dto::PolicyBundleEndpoint {
+                    host: host.to_string(),
+                    port: 443,
+                })
+                .collect(),
+            entitlement_list: vec![],
+        }
+    }
+
+    #[test]
+    fn unresolved_endpoint_hosts_excludes_a_literal_ip() {
+        let bundles = vec![bundle_with_endpoints("gw-1", &["10.0.0.5"])];
+        let dns_cache = dns_cache::DnsCache::new();
+
+        assert_eq!(
+            unresolved_hosts_in(&bundles, &dns_cache),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn unresolved_endpoint_hosts_includes_a_hostname_that_has_never_resolved() {
+        let bundles = vec![bundle_with_endpoints("gw-1", &["erp.internal.example.com"])];
+        let dns_cache = dns_cache::DnsCache::new();
+
+        assert_eq!(
+            unresolved_hosts_in(&bundles, &dns_cache),
+            vec!["erp.internal.example.com".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_endpoint_hosts_excludes_a_hostname_the_cache_has_already_resolved() {
+        let bundles = vec![bundle_with_endpoints("gw-1", &["erp.internal.example.com"])];
+        let dns_cache = dns_cache::DnsCache::with_lookup(|_host| async {
+            Ok(vec!["10.0.0.5".parse().unwrap()])
+        });
+        dns_cache.refresh(collect_endpoint_hosts(&bundles)).await;
+
+        assert_eq!(
+            unresolved_hosts_in(&bundles, &dns_cache),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn unresolved_endpoint_hosts_deduplicates_and_sorts() {
+        // The same unresolved hostname commonly appears on more than one gateway's endpoint list -
+        // an admin-facing report must never repeat it.
+        let bundles = vec![
+            bundle_with_endpoints(
+                "gw-1",
+                &["b.internal.example.com", "a.internal.example.com"],
+            ),
+            bundle_with_endpoints("gw-2", &["a.internal.example.com"]),
+        ];
+        let dns_cache = dns_cache::DnsCache::new();
+
+        assert_eq!(
+            unresolved_hosts_in(&bundles, &dns_cache),
+            vec![
+                "a.internal.example.com".to_string(),
+                "b.internal.example.com".to_string(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn run_heartbeat_refreshes_the_dns_cache_from_this_heartbeats_bundles_not_the_previous_ones()
      {
@@ -1800,6 +1909,109 @@ mod tests {
         assert_eq!(
             *requested_hosts.lock().unwrap(),
             vec!["new.internal.example.com".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_heartbeat_reports_the_previous_cycles_unresolved_hosts_on_the_next_request() {
+        // TT-2069, end to end: the first heartbeat applies a gateway whose endpoint hostname the
+        // (faked) DNS lookup always fails for - the second heartbeat's own *outgoing request*
+        // must then carry that host in unresolved_endpoint_hosts, proving the real
+        // run_heartbeat/HeartbeatClient wiring, not just each piece tested in isolation.
+        let agent_identity = crypto::generate_keypair();
+        let first_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"erp.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let first_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, first_body.as_bytes());
+        let second_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[],"node_list":[]}"#;
+        let second_signature =
+            crypto::sign_to_base64(&agent_identity.signing_key, second_body.as_bytes());
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        // First request: an empty ConnectorHeartbeatRequest is all there is to report yet (no
+        // prior cycle exists).
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(body_json(dto::ConnectorHeartbeatRequest::default()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(first_body, "application/json")
+                    .insert_header("X-Signature", first_signature.as_str()),
+            )
+            .up_to_n_times(1)
+            .mount(&agent_server)
+            .await;
+        // Second request: must now report the hostname the fake resolver below always fails.
+        // Only matched if the outgoing body is exactly this - an unmatched request gets wiremock's
+        // default 404, which fetch_and_verify would surface as an error, failing this test.
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(body_json(&dto::ConnectorHeartbeatRequest {
+                unresolved_endpoint_hosts: Some(vec!["erp.internal.example.com".to_string()]),
+            }))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(second_body, "application/json")
+                    .insert_header("X-Signature", second_signature.as_str()),
+            )
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri(), agent_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        // Always "fails" (no address returned) - see dns_cache::LookupOutcome, an empty Vec
+        // means "no A record", the same as any other resolution failure.
+        let dns_cache = dns_cache::DnsCache::with_lookup(|_host| async { Ok(vec![]) });
+
+        run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+        )
+        .await
+        .unwrap();
+
+        let result = run_heartbeat(
+            &config,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "second heartbeat's request must have matched the body_json mock above, or this is \
+             an unmatched-request error instead: {result:?}"
         );
     }
 
