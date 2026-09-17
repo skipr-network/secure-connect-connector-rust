@@ -26,7 +26,7 @@
 //! admission state recorded here (told explicitly by Gatekeeper, never
 //! inferred) is the only thing this Connector can trust for that lookup.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 
 use crate::dto::PolicyBundleEndpoint;
@@ -102,11 +102,63 @@ pub struct FlowTable {
     /// the flow-admission/release control plane - would need to scan every
     /// admitted flow on this Connector on every packet.
     nodes_by_port: HashMap<u16, HashSet<String>>,
+    /// `port -> node_id` for a direct connection to *this Connector's own* control-plane API
+    /// (Gatekeeper's flow-admission/release relay, TT-1839/TT-2102) - genuinely different from
+    /// `flows`/`nodes_by_port` above: there is no gateway, no device, no endpoint and no address
+    /// rewrite involved, just "which node is on the other end of this one connection", needed
+    /// because every node in the fleet masquerades behind the identical wg0 address (see the
+    /// module doc) so a reply packet's address alone can never answer that.
+    ///
+    /// Recorded when the inbound receive loop forwards a packet addressed to
+    /// `connector_virtual_ip` itself (TT-2102: previously this branch recorded nothing at all, so
+    /// the admission *decision's own reply* had no way to ever route back to Gatekeeper, even
+    /// though the client flow it decided about was admitted correctly). Deliberately never
+    /// removed on lookup - one connection's admission request/response exchange is several
+    /// packets (SYN-ACK, then the HTTP response itself, possibly more than one segment), all of
+    /// which need this same mapping. Gatekeeper has no "I'm done with this port" signal the way
+    /// `release` gives one for admitted flows, so entries are bounded by
+    /// `MAX_TRACKED_CONTROL_CHANNEL_PORTS` and evicted oldest-first instead - these are short-lived
+    /// one-shot HTTP exchanges, not long-lived sessions, so a bounded FIFO is enough to never grow
+    /// unboundedly over a long uptime without needing real TCP-close detection.
+    control_channel_ports: HashMap<u16, String>,
+    control_channel_port_order: VecDeque<u16>,
 }
+
+/// How many distinct control-channel connections' worth of routing state to remember at once
+/// (see `control_channel_ports`'s doc) - generously above any realistic number of concurrent
+/// admission/release calls in flight on one Connector at a time.
+const MAX_TRACKED_CONTROL_CHANNEL_PORTS: usize = 256;
 
 impl FlowTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records that a direct connection to this Connector's own control-plane API on `port`
+    /// belongs to `node_id`, so a reply on that port can be routed back to the right node (TT-2102).
+    /// Safe to call repeatedly for the same port (a retried request reusing it, or the OS handing
+    /// out a recently-freed ephemeral port again) - always just overwrites in place without
+    /// growing `control_channel_port_order`.
+    pub fn record_control_channel_port(&mut self, node_id: &str, port: u16) {
+        if self
+            .control_channel_ports
+            .insert(port, node_id.to_string())
+            .is_none()
+        {
+            self.control_channel_port_order.push_back(port);
+            if self.control_channel_port_order.len() > MAX_TRACKED_CONTROL_CHANNEL_PORTS
+                && let Some(oldest) = self.control_channel_port_order.pop_front()
+            {
+                self.control_channel_ports.remove(&oldest);
+            }
+        }
+    }
+
+    /// The node a reply on this control-channel port should route back to, if any was ever
+    /// recorded (TT-2102). `None` for any ordinary port, including every admitted gateway flow's
+    /// own port - those are answered by `node_for_port` instead, never this.
+    pub fn node_for_control_channel_port(&self, port: u16) -> Option<&str> {
+        self.control_channel_ports.get(&port).map(String::as_str)
     }
 
     pub fn admit(
@@ -381,6 +433,76 @@ mod tests {
         );
 
         assert!(table.gateway_for("n-2", 40001).is_none());
+    }
+
+    #[test]
+    fn control_channel_port_has_no_node_until_recorded() {
+        let table = FlowTable::new();
+
+        assert!(table.node_for_control_channel_port(51234).is_none());
+    }
+
+    #[test]
+    fn a_recorded_control_channel_port_resolves_to_its_node() {
+        let mut table = FlowTable::new();
+
+        table.record_control_channel_port("n-1", 51234);
+
+        assert_eq!(table.node_for_control_channel_port(51234), Some("n-1"));
+    }
+
+    #[test]
+    fn recording_a_control_channel_port_twice_for_the_same_node_is_a_no_op_not_a_growth() {
+        let mut table = FlowTable::new();
+
+        table.record_control_channel_port("n-1", 51234);
+        table.record_control_channel_port("n-1", 51234);
+
+        assert_eq!(table.control_channel_port_order.len(), 1);
+    }
+
+    #[test]
+    fn re_recording_a_control_channel_port_for_a_different_node_overwrites_it() {
+        // A port genuinely can be reused for a new connection once the OS frees it - the newer
+        // node's admission traffic must win, not a stale mapping from whoever held it before.
+        let mut table = FlowTable::new();
+        table.record_control_channel_port("n-1", 51234);
+
+        table.record_control_channel_port("n-2", 51234);
+
+        assert_eq!(table.node_for_control_channel_port(51234), Some("n-2"));
+    }
+
+    #[test]
+    fn a_control_channel_port_lookup_does_not_remove_the_entry() {
+        // One connection's admission exchange is several reply packets (SYN-ACK, then the HTTP
+        // response itself) - looking one up must not forget it before the rest arrive.
+        let mut table = FlowTable::new();
+        table.record_control_channel_port("n-1", 51234);
+
+        table.node_for_control_channel_port(51234);
+
+        assert_eq!(table.node_for_control_channel_port(51234), Some("n-1"));
+    }
+
+    #[test]
+    fn the_oldest_control_channel_port_is_evicted_once_the_cap_is_exceeded() {
+        let mut table = FlowTable::new();
+        for port in 0..MAX_TRACKED_CONTROL_CHANNEL_PORTS as u16 {
+            table.record_control_channel_port("n-1", port);
+        }
+        assert!(table.node_for_control_channel_port(0).is_some());
+
+        table.record_control_channel_port("n-1", MAX_TRACKED_CONTROL_CHANNEL_PORTS as u16);
+
+        assert!(
+            table.node_for_control_channel_port(0).is_none(),
+            "the oldest entry must be evicted once the cap is exceeded"
+        );
+        assert_eq!(
+            table.node_for_control_channel_port(MAX_TRACKED_CONTROL_CHANNEL_PORTS as u16),
+            Some("n-1")
+        );
     }
 
     #[test]

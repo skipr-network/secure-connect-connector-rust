@@ -626,6 +626,13 @@ fn prepare_decrypted_packet_for_forwarding(
     dns_cache: &dns_cache::DnsCache,
 ) -> bool {
     if Tunn::dst_address(packet) == Some(connector_virtual_ip) {
+        // TT-2102: record who this direct control-plane connection belongs to, so its own reply
+        // (the admission/release decision itself) has somewhere to route back to - previously
+        // nothing was recorded here at all, so Gatekeeper's own admission call could never
+        // complete, regardless of whether the client flow it was deciding about was admitted.
+        if let Some(source_port) = tunnel::parse_source_port(packet) {
+            flow_table.record_control_channel_port(node_id, source_port);
+        }
         return true;
     }
 
@@ -784,6 +791,16 @@ fn prepare_reply_packet_for_forwarding(
     destination_port: u16,
     flow_table: &FlowTable,
 ) -> Option<String> {
+    // TT-2102: a reply to this Connector's own control-plane API (Gatekeeper's admission/release
+    // decision) needs no address rewrite at all - it was forwarded to the local server unchanged
+    // on the way in (see prepare_decrypted_packet_for_forwarding's connector_virtual_ip branch),
+    // so its reply already carries the right addresses on the way out too. Checked first, and
+    // returns immediately: node_for_port below has no entry for this port at all (control-channel
+    // connections are never admitted flows), so falling through would only ever drop it.
+    if let Some(node_id) = flow_table.node_for_control_channel_port(destination_port) {
+        return Some(node_id.to_string());
+    }
+
     let node_id = match flow_table.node_for_port(destination_port) {
         Some(node_id) => node_id.to_string(),
         None => {
@@ -986,6 +1003,11 @@ mod tests {
             packet, original,
             "control-channel packet must be forwarded byte-for-byte unchanged"
         );
+        assert_eq!(
+            flow_table.node_for_control_channel_port(51234),
+            Some("n-1"),
+            "TT-2102: the sending node must be recorded against its source port, so the reply has somewhere to route back to"
+        );
     }
 
     #[test]
@@ -1136,6 +1158,65 @@ mod tests {
             prepare_reply_packet_for_forwarding(&mut packet, 51234, &flow_table),
             None
         );
+    }
+
+    #[test]
+    fn prepare_reply_packet_routes_a_control_channel_reply_unchanged_with_no_admitted_flow_at_all()
+    {
+        // TT-2102: a reply to this Connector's own control-plane API (Gatekeeper's admission
+        // decision) must route back to the node without needing - or touching - any admitted
+        // flow state at all. flow_table here has nothing admitted on this port whatsoever, which
+        // is exactly the real situation: a control-channel connection's own port was never, and
+        // will never be, an admitted flow.
+        let mut flow_table = FlowTable::new();
+        flow_table.record_control_channel_port("n-1", 51234);
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 98, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            8443,
+            51234,
+        );
+        let original = packet.clone();
+
+        let node_id = prepare_reply_packet_for_forwarding(&mut packet, 51234, &flow_table);
+
+        assert_eq!(node_id, Some("n-1".to_string()));
+        assert_eq!(
+            packet, original,
+            "a control-channel reply needs no address rewrite - it already carries the right addresses"
+        );
+    }
+
+    #[test]
+    fn prepare_reply_packet_prefers_the_control_channel_mapping_over_an_admitted_flow_on_the_same_port()
+     {
+        // Genuinely unlikely (an admitted flow's translated port colliding with a live
+        // control-channel connection's own ephemeral port), but the control-channel check runs
+        // first unconditionally, so confirm it actually takes precedence rather than relying on
+        // the two never coinciding in practice.
+        let mut flow_table = FlowTable::new();
+        flow_table.admit(
+            "n-2".to_string(),
+            51234,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![],
+        );
+        flow_table.record_virtual_address("n-2", 51234, std::net::Ipv4Addr::new(10, 99, 0, 1));
+        flow_table.record_control_channel_port("n-1", 51234);
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 98, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            8443,
+            51234,
+        );
+        let original = packet.clone();
+
+        let node_id = prepare_reply_packet_for_forwarding(&mut packet, 51234, &flow_table);
+
+        assert_eq!(node_id, Some("n-1".to_string()));
+        assert_eq!(packet, original);
     }
 
     #[test]
