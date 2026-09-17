@@ -225,6 +225,7 @@ async fn handle_flow_admission(
             // admitted (TT-2046) - being entitled to a gateway says nothing
             // about which address that gateway is actually configured to
             // expose.
+            tracing::info!(node_id = %request.node_id, port = request.port, flow_id = %request.flow_id, "TT-2108-DEBUG: admitting flow");
             flow_table.lock().expect("flow table lock poisoned").admit(
                 request.node_id.clone(),
                 request.port,
