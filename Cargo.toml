@@ -12,6 +12,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# TT-2107: verifies the mobile app's device session signature (ECDSA P-256, SEC1 uncompressed
+# public keys + DER-encoded signatures - the standard Android/Java `SHA256withECDSA` output),
+# alongside the existing Ed25519 path used for Agent's own X-Signature scheme. Already resolved
+# transitively at 0.17.14 via rustls's dev-dependency "ring" feature (Cargo.lock) - this box's
+# toolchain already builds it successfully, so this adds no new build-toolchain requirement.
+ring = "0.17"
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 hex = "0.4"
