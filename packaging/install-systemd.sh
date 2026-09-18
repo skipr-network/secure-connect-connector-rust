@@ -53,8 +53,27 @@ if [ "$RUN_AS_USER" = "root" ]; then
 fi
 
 if [ ! -x "$BUILT_BINARY_PATH" ]; then
-  echo "error: $BUILT_BINARY_PATH not found or not executable - run 'cargo build --release' first." >&2
-  exit 1
+  # TT-2030 follow-up: the Portal install command chains `cargo build --release && ...` with no
+  # C toolchain guaranteed on a fresh box - several dependencies (including BoringTun) need `cc`
+  # for their build scripts, so a bare rustup install fails here with a linker error long before
+  # this script ever runs. Recover instead of just erroring a second time: install the toolchain
+  # if it's missing, then build here so a plain re-run of this script alone is enough to finish
+  # what the first attempt couldn't.
+  if ! command -v cc >/dev/null 2>&1; then
+    echo "cc not found - installing build-essential (required to compile this crate's dependencies)..."
+    sudo apt-get update -qq
+    sudo apt-get install -y build-essential
+  fi
+  # Build as RUN_AS_USER, not as whoever this script process is (root, when invoked via
+  # `sudo ./packaging/install-systemd.sh` as the error above tells people to do) - cargo lives in
+  # RUN_AS_USER's own $HOME/.cargo/bin from their rustup install, never on root's PATH, so running
+  # this as root would just trade "cc not found" for an equally silent "cargo: command not found".
+  echo "Building the Connector (target/release/secure_connect_connector not found)..."
+  sudo -u "$RUN_AS_USER" bash -lc "source \"\$HOME/.cargo/env\" 2>/dev/null || true; cd '$REPO_ROOT' && cargo build --release"
+  if [ ! -x "$BUILT_BINARY_PATH" ]; then
+    echo "error: build finished but $BUILT_BINARY_PATH still missing/not executable." >&2
+    exit 1
+  fi
 fi
 
 DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
