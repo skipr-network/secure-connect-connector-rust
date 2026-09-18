@@ -51,9 +51,17 @@ pub struct FlowAdmissionRequest {
     /// forwarded traffic and, since TT-1847, for routing reply traffic back
     /// to the right node.
     pub port: u16,
-    pub user_public_key: String,
-    pub signature: String,
-    pub signed_data: String,
+    /// All three nullable together (TT-2145): Gatekeeper legitimately sends
+    /// `null` for these when a flow's device isn't resolvable yet (spec
+    /// §B.9's "relaying without a session signature" case) - typing them as
+    /// required `String` made serde reject the entire request with a 422
+    /// before any admission logic ever ran, so the intended "no signature ->
+    /// refuse this flow" decision (with its own audit entry) was never
+    /// reached; a schema-validation failure was masquerading as a real
+    /// admission outcome.
+    pub user_public_key: Option<String>,
+    pub signature: Option<String>,
+    pub signed_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -112,6 +120,37 @@ async fn handle_flow_admission(
     flow_table: &Mutex<FlowTable>,
     request: FlowAdmissionRequest,
 ) -> FlowAdmissionResponse {
+    // TT-2145: a null signature triple is a normal, anticipated input (spec
+    // §B.9), not a malformed request - handle it as a considered "no
+    // signature presented -> refuse" decision, with its own audit entry,
+    // before ever touching decoding/verification. Deliberately not folded
+    // into the invalid_signature branch below: that one always has a
+    // device_public_key to record, this one usually doesn't.
+    let (Some(user_public_key), Some(signature), Some(signed_data)) = (
+        request.user_public_key.clone(),
+        request.signature.clone(),
+        request.signed_data.clone(),
+    ) else {
+        if let Err(error) = audit_log
+            .record(AuditEvent::AccessRefused {
+                gateway_id: request.gateway_id.clone(),
+                device_public_key: request.user_public_key.clone().unwrap_or_default(),
+                reason: "no_signature_presented".to_string(),
+            })
+            .await
+        {
+            tracing::error!(%error, "failed to write no-signature audit entry");
+        }
+        return FlowAdmissionResponse {
+            flow_id: request.flow_id,
+            decision: "refuse".to_string(),
+            // Fixed four-value wire vocabulary (TT-1732 contract) has no
+            // dedicated "no signature" value - same bucket as any other
+            // authentication failure from the caller's perspective.
+            reason: Some("invalid_signature".to_string()),
+        };
+    };
+
     // Authentication first (spec §B.9): proves possession of user_public_key,
     // not a claimed name. A request that fails this never reaches the
     // entitlement lookup below, regardless of what gateway_id it names.
@@ -126,11 +165,11 @@ async fn handle_flow_admission(
     // signed_data) triple only verifies once signed_data is base64-decoded
     // first. A decode failure here is treated the same as any other
     // malformed-signature input - refused, not propagated.
-    let Ok(signed_message) = BASE64.decode(&request.signed_data) else {
+    let Ok(signed_message) = BASE64.decode(&signed_data) else {
         if let Err(error) = audit_log
             .record(AuditEvent::AccessRefused {
                 gateway_id: request.gateway_id.clone(),
-                device_public_key: request.user_public_key.clone(),
+                device_public_key: user_public_key.clone(),
                 reason: "invalid_signature".to_string(),
             })
             .await
@@ -143,18 +182,14 @@ async fn handle_flow_admission(
             reason: Some("invalid_signature".to_string()),
         };
     };
-    if !crypto::verify_base64(
-        &request.user_public_key,
-        &signed_message,
-        &request.signature,
-    ) {
+    if !crypto::verify_base64(&user_public_key, &signed_message, &signature) {
         // This is itself a deny decision (acceptance criteria: "Connector...
         // makes an allow/deny decision... a local audit entry is recorded"),
         // not just an early exit - best-effort, same as decide_access_and_audit.
         if let Err(error) = audit_log
             .record(AuditEvent::AccessRefused {
                 gateway_id: request.gateway_id.clone(),
-                device_public_key: request.user_public_key.clone(),
+                device_public_key: user_public_key.clone(),
                 reason: "invalid_signature".to_string(),
             })
             .await
@@ -180,17 +215,13 @@ async fn handle_flow_admission(
         let mut guard = signature_binding
             .lock()
             .expect("signature binding guard lock poisoned");
-        guard.check_and_bind(
-            &request.user_public_key,
-            &request.signature,
-            &request.gateway_id,
-        )
+        guard.check_and_bind(&user_public_key, &signature, &request.gateway_id)
     };
     if !bound_to_this_gateway {
         if let Err(error) = audit_log
             .record(AuditEvent::AccessRefused {
                 gateway_id: request.gateway_id.clone(),
-                device_public_key: request.user_public_key.clone(),
+                device_public_key: user_public_key.clone(),
                 reason: "signature_reused_for_different_gateway".to_string(),
             })
             .await
@@ -204,13 +235,9 @@ async fn handle_flow_admission(
         };
     }
 
-    let decision = decide_access_and_audit(
-        policy_store,
-        audit_log,
-        &request.gateway_id,
-        &request.user_public_key,
-    )
-    .await;
+    let decision =
+        decide_access_and_audit(policy_store, audit_log, &request.gateway_id, &user_public_key)
+            .await;
 
     match decision {
         AccessDecision::Allowed { endpoints, .. } => {
@@ -230,7 +257,7 @@ async fn handle_flow_admission(
                 request.port,
                 request.gateway_id.clone(),
                 request.flow_id.clone(),
-                request.user_public_key.clone(),
+                user_public_key.clone(),
                 endpoints,
             );
             FlowAdmissionResponse {
@@ -336,9 +363,9 @@ mod tests {
             gateway_id: gateway_id.to_string(),
             node_id: "n-1".to_string(),
             port: 51820,
-            user_public_key: public_key_hex.to_string(),
-            signature: crypto::sign_to_base64(signing_key, message.as_bytes()),
-            signed_data: BASE64.encode(message),
+            user_public_key: Some(public_key_hex.to_string()),
+            signature: Some(crypto::sign_to_base64(signing_key, message.as_bytes())),
+            signed_data: Some(BASE64.encode(message)),
         }
     }
 
@@ -398,9 +425,9 @@ mod tests {
             gateway_id: "132f62aa-ac29-49ae-b527-c048530be935".to_string(),
             node_id: "n-1".to_string(),
             port: 51820,
-            user_public_key: "047fc7980b4735d2efa3492cb4312e0d1cdf4e23174d8bf8ade7e6a964a705211cf283eff432a12fabdb227d4529ef1fb3f0c6828181a54b9d1ad3194c6a9f490d".to_string(),
-            signature: "MEUCIHrp5diOwIHlLi8EFX4oE51tBN6361tP0BViMlKW0gdYAiEAo27/MSQpQNeodLixoaJ77dHP+mK8WatNXmAs+uwggOA=".to_string(),
-            signed_data: "eyJkZXZpY2VfaWQiOiI1ODVjYjU0MjYzZWU5YzNmYjM1MjYwZWYxMzM1NGE2NWIzZGNkYjk4IiwicHVibGljX2tleSI6IjA0N2ZjNzk4MGI0NzM1ZDJlZmEzNDkyY2I0MzEyZTBkMWNkZjRlMjMxNzRkOGJmOGFkZTdlNmE5NjRhNzA1MjExY2YyODNlZmY0MzJhMTJmYWJkYjIyN2Q0NTI5ZWYxZmIzZjBjNjgyODE4MWE1NGI5ZDFhZDMxOTRjNmE5ZjQ5MGQiLCJzZXJ2aWNlX3R5cGUiOiJpbnN0YW50IiwicmVnaW9uIjoiYXAtc291dGgtMSIsImlwX2FkZHJlc3MiOiI0NS4xMTMuMTA4LjEyNyIsImlzX2lwX2FkZHJlc3Nfc3RhdGljIjpmYWxzZSwicHJvdG9jb2wiOiJvcGVudnBuIiwic2Vzc2lvbl9pZCI6bnVsbCwicHJvdmlzaW9uX3Rva2VuIjoiX2l3VzlKQVZtNUQtSHYwdFpfMVdwOUIydGs1bzRwZERTbUo4TTA0MFYzUSIsImdhdGV3YXlfaWQiOiIxMzJmNjJhYS1hYzI5LTQ5YWUtYjUyNy1jMDQ4NTMwYmU5MzUifQ==".to_string(),
+            user_public_key: Some("047fc7980b4735d2efa3492cb4312e0d1cdf4e23174d8bf8ade7e6a964a705211cf283eff432a12fabdb227d4529ef1fb3f0c6828181a54b9d1ad3194c6a9f490d".to_string()),
+            signature: Some("MEUCIHrp5diOwIHlLi8EFX4oE51tBN6361tP0BViMlKW0gdYAiEAo27/MSQpQNeodLixoaJ77dHP+mK8WatNXmAs+uwggOA=".to_string()),
+            signed_data: Some("eyJkZXZpY2VfaWQiOiI1ODVjYjU0MjYzZWU5YzNmYjM1MjYwZWYxMzM1NGE2NWIzZGNkYjk4IiwicHVibGljX2tleSI6IjA0N2ZjNzk4MGI0NzM1ZDJlZmEzNDkyY2I0MzEyZTBkMWNkZjRlMjMxNzRkOGJmOGFkZTdlNmE5NjRhNzA1MjExY2YyODNlZmY0MzJhMTJmYWJkYjIyN2Q0NTI5ZWYxZmIzZjBjNjgyODE4MWE1NGI5ZDFhZDMxOTRjNmE5ZjQ5MGQiLCJzZXJ2aWNlX3R5cGUiOiJpbnN0YW50IiwicmVnaW9uIjoiYXAtc291dGgtMSIsImlwX2FkZHJlc3MiOiI0NS4xMTMuMTA4LjEyNyIsImlzX2lwX2FkZHJlc3Nfc3RhdGljIjpmYWxzZSwicHJvdG9jb2wiOiJvcGVudnBuIiwic2Vzc2lvbl9pZCI6bnVsbCwicHJvdmlzaW9uX3Rva2VuIjoiX2l3VzlKQVZtNUQtSHYwdFpfMVdwOUIydGs1bzRwZERTbUo4TTA0MFYzUSIsImdhdGV3YXlfaWQiOiIxMzJmNjJhYS1hYzI5LTQ5YWUtYjUyNy1jMDQ4NTMwYmU5MzUifQ==".to_string()),
         };
 
         let response = handle_flow_admission(
@@ -628,6 +655,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_a_flow_whose_signature_triple_is_null_without_panicking_or_erroring() {
+        // TT-2145: Gatekeeper legitimately relays a flow with no known device
+        // yet (spec §B.9's "relaying without a session signature" case) by
+        // sending null for all three fields - this must be a considered
+        // refusal, not a request-parsing failure.
+        let store = store_with_entitled_device("gw-1", "u-1", "some-device-key");
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let request = FlowAdmissionRequest {
+            flow_id: "flow-1".to_string(),
+            gateway_id: "gw-1".to_string(),
+            node_id: "n-1".to_string(),
+            port: 51820,
+            user_public_key: None,
+            signature: None,
+            signed_data: None,
+        };
+
+        let response = handle_flow_admission(
+            &store,
+            &audit_log,
+            &signature_binding(),
+            &flow_table(),
+            request,
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            FlowAdmissionResponse {
+                flow_id: "flow-1".to_string(),
+                decision: "refuse".to_string(),
+                reason: Some("invalid_signature".to_string()),
+            }
+        );
+        let entry: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(dir.path().join("audit.log"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entry["event"], "access_refused");
+        assert_eq!(entry["reason"], "no_signature_presented");
+        assert_eq!(entry["device_public_key"], "");
+    }
+
+    #[tokio::test]
     async fn refuses_a_flow_with_an_invalid_signature_before_ever_checking_entitlement() {
         let device = crypto::generate_keypair();
         let impostor = crypto::generate_keypair();
@@ -643,7 +719,7 @@ mod tests {
             &device.public_key_hex,
             "session-nonce-1",
         );
-        request.user_public_key = device.public_key_hex.clone();
+        request.user_public_key = Some(device.public_key_hex.clone());
 
         let response = handle_flow_admission(
             &store,
@@ -798,6 +874,50 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_null_signature_triple_over_real_http_extraction_gets_a_200_refuse_not_a_422() {
+        // TT-2145's actual bug: this used to fail JSON deserialization itself
+        // (422, never reaching handle_flow_admission) because the fields were
+        // typed as required String. This test exercises real axum/serde
+        // extraction, not just the already-parsed-struct unit test above -
+        // it's the only one that would have caught the original bug.
+        let store = store_with_entitled_device("gw-1", "u-1", "some-device-key");
+        let dir = tempfile::tempdir().unwrap();
+        let state = ControlPlaneState {
+            policy_store: Arc::new(store),
+            audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
+            signature_binding: Arc::new(signature_binding()),
+            flow_table: Arc::new(flow_table()),
+        };
+        let app = router(state);
+
+        let http_request = Request::builder()
+            .method("POST")
+            .uri("/api/flow/admit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "flow_id": "flow-1",
+                    "gateway_id": "gw-1",
+                    "node_id": "n-1",
+                    "port": 51820,
+                    "user_public_key": null,
+                    "signature": null,
+                    "signed_data": null
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(http_request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["decision"], "refuse");
+        assert_eq!(parsed["reason"], "invalid_signature");
     }
 
     #[tokio::test]
