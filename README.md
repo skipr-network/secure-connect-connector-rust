@@ -15,6 +15,29 @@ Implementation lands in feature PRs. Identity + verified heartbeat client
 against Agent, WireGuard tunneling, and flow admission/release are in place;
 see individual ticket history for what's landed.
 
+## Installing on a fresh machine
+
+A C toolchain is required before `cargo build` - several dependencies
+(including BoringTun) need `cc` for their build scripts, and it's not present
+by default on a minimal Ubuntu box. Install it *before* building, not after:
+`install-systemd.sh` can recover a missing toolchain on a re-run (see below),
+but the first `cargo build` here has no such fallback and fails outright with
+`error: linker `cc` not found` if this step is skipped.
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+sudo apt-get update && sudo apt-get install -y build-essential
+git clone https://github.com/skipr-network/secure-connect-connector-rust
+cd secure-connect-connector-rust
+cargo build --release
+sudo ./packaging/install-systemd.sh
+```
+
+Any copy of this command shown elsewhere (e.g. Portal's Deploy Connector
+screen) should match this - if it doesn't include the `apt-get install
+build-essential` line, it will fail on a fresh box the same way.
+
 ## Usage
 
 ### Generating the Connector's identity (first run, no config needed)
