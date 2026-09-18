@@ -27,6 +27,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::access::{AccessDecision, decide_access_and_audit};
@@ -113,9 +115,37 @@ async fn handle_flow_admission(
     // Authentication first (spec §B.9): proves possession of user_public_key,
     // not a claimed name. A request that fails this never reaches the
     // entitlement lookup below, regardless of what gateway_id it names.
+    //
+    // `signed_data` on the wire is itself the base64 *encoding* of the JSON
+    // payload the device actually signed (TT-2107) - not the signed bytes
+    // themselves, the way `heartbeat.rs`'s `body_bytes` already are for
+    // Agent's own signature. Passing the wire string's own bytes straight
+    // through (the bug this replaces) verifies against the wrong message
+    // every time, regardless of how correct the key/curve/signature parsing
+    // otherwise is - confirmed live: a real captured (key, signature,
+    // signed_data) triple only verifies once signed_data is base64-decoded
+    // first. A decode failure here is treated the same as any other
+    // malformed-signature input - refused, not propagated.
+    let Ok(signed_message) = BASE64.decode(&request.signed_data) else {
+        if let Err(error) = audit_log
+            .record(AuditEvent::AccessRefused {
+                gateway_id: request.gateway_id.clone(),
+                device_public_key: request.user_public_key.clone(),
+                reason: "invalid_signature".to_string(),
+            })
+            .await
+        {
+            tracing::error!(%error, "failed to write invalid-signature audit entry");
+        }
+        return FlowAdmissionResponse {
+            flow_id: request.flow_id,
+            decision: "refuse".to_string(),
+            reason: Some("invalid_signature".to_string()),
+        };
+    };
     if !crypto::verify_base64(
         &request.user_public_key,
-        request.signed_data.as_bytes(),
+        &signed_message,
         &request.signature,
     ) {
         // This is itself a deny decision (acceptance criteria: "Connector...
@@ -289,11 +319,17 @@ mod tests {
         store
     }
 
+    /// `message` is the logical content a device would sign (e.g. a session
+    /// nonce) - on the wire, `signed_data` carries its base64 *encoding*, not
+    /// the raw bytes themselves (TT-2107: confirmed against a real captured
+    /// mobile-app request), so this signs `message`'s raw bytes but stores
+    /// `signed_data` as that signature's own base64-encoded input, matching
+    /// `handle_flow_admission`'s real base64-decode-then-verify contract.
     fn admission_request(
         gateway_id: &str,
         signing_key: &ed25519_dalek::SigningKey,
         public_key_hex: &str,
-        signed_data: &str,
+        message: &str,
     ) -> FlowAdmissionRequest {
         FlowAdmissionRequest {
             flow_id: "flow-1".to_string(),
@@ -301,8 +337,8 @@ mod tests {
             node_id: "n-1".to_string(),
             port: 51820,
             user_public_key: public_key_hex.to_string(),
-            signature: crypto::sign_to_base64(signing_key, signed_data.as_bytes()),
-            signed_data: signed_data.to_string(),
+            signature: crypto::sign_to_base64(signing_key, message.as_bytes()),
+            signed_data: BASE64.encode(message),
         }
     }
 
@@ -343,6 +379,41 @@ mod tests {
                 reason: None,
             }
         );
+    }
+
+    /// Real values captured live via `tcpdump` from an actual mobile-app
+    /// `/api/user/create` call, then relayed through Gatekeeper as-is
+    /// (TT-2107) - confirms this Connector's signature verification is
+    /// genuinely interoperable with the real client, not just internally
+    /// consistent with its own test fixtures. Signature verification alone is
+    /// what's being proven here (the device isn't entitled to any gateway in
+    /// this test's `PolicyStore`, so the response is still a refusal - but
+    /// specifically `not_entitled`, never `invalid_signature`).
+    #[tokio::test]
+    async fn verifies_a_real_captured_mobile_app_ecdsa_p256_signature() {
+        let store = PolicyStore::new();
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = FlowAdmissionRequest {
+            flow_id: "flow-1".to_string(),
+            gateway_id: "132f62aa-ac29-49ae-b527-c048530be935".to_string(),
+            node_id: "n-1".to_string(),
+            port: 51820,
+            user_public_key: "047fc7980b4735d2efa3492cb4312e0d1cdf4e23174d8bf8ade7e6a964a705211cf283eff432a12fabdb227d4529ef1fb3f0c6828181a54b9d1ad3194c6a9f490d".to_string(),
+            signature: "MEUCIHrp5diOwIHlLi8EFX4oE51tBN6361tP0BViMlKW0gdYAiEAo27/MSQpQNeodLixoaJ77dHP+mK8WatNXmAs+uwggOA=".to_string(),
+            signed_data: "eyJkZXZpY2VfaWQiOiI1ODVjYjU0MjYzZWU5YzNmYjM1MjYwZWYxMzM1NGE2NWIzZGNkYjk4IiwicHVibGljX2tleSI6IjA0N2ZjNzk4MGI0NzM1ZDJlZmEzNDkyY2I0MzEyZTBkMWNkZjRlMjMxNzRkOGJmOGFkZTdlNmE5NjRhNzA1MjExY2YyODNlZmY0MzJhMTJmYWJkYjIyN2Q0NTI5ZWYxZmIzZjBjNjgyODE4MWE1NGI5ZDFhZDMxOTRjNmE5ZjQ5MGQiLCJzZXJ2aWNlX3R5cGUiOiJpbnN0YW50IiwicmVnaW9uIjoiYXAtc291dGgtMSIsImlwX2FkZHJlc3MiOiI0NS4xMTMuMTA4LjEyNyIsImlzX2lwX2FkZHJlc3Nfc3RhdGljIjpmYWxzZSwicHJvdG9jb2wiOiJvcGVudnBuIiwic2Vzc2lvbl9pZCI6bnVsbCwicHJvdmlzaW9uX3Rva2VuIjoiX2l3VzlKQVZtNUQtSHYwdFpfMVdwOUIydGs1bzRwZERTbUo4TTA0MFYzUSIsImdhdGV3YXlfaWQiOiIxMzJmNjJhYS1hYzI5LTQ5YWUtYjUyNy1jMDQ4NTMwYmU5MzUifQ==".to_string(),
+        };
+
+        let response = handle_flow_admission(
+            &store,
+            &audit_log,
+            &signature_binding(),
+            &flow_table(),
+            request,
+        )
+        .await;
+
+        assert_eq!(response.decision, "refuse");
+        assert_eq!(response.reason, Some("not_entitled".to_string()));
     }
 
     #[tokio::test]
@@ -743,6 +814,8 @@ mod tests {
         let app = router(state);
 
         let signature = crypto::sign_to_base64(&device.signing_key, b"session-nonce-1");
+        // signed_data carries the base64 *encoding* of what was actually
+        // signed (TT-2107) - see admission_request's doc comment.
         let http_request = Request::builder()
             .method("POST")
             .uri("/api/flow/admit")
@@ -755,7 +828,7 @@ mod tests {
                     "port": 51820,
                     "user_public_key": device.public_key_hex,
                     "signature": signature,
-                    "signed_data": "session-nonce-1"
+                    "signed_data": BASE64.encode("session-nonce-1")
                 }))
                 .unwrap(),
             ))
