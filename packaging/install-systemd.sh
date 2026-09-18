@@ -64,8 +64,12 @@ if [ ! -x "$BUILT_BINARY_PATH" ]; then
     sudo apt-get update -qq
     sudo apt-get install -y build-essential
   fi
+  # Build as RUN_AS_USER, not as whoever this script process is (root, when invoked via
+  # `sudo ./packaging/install-systemd.sh` as the error above tells people to do) - cargo lives in
+  # RUN_AS_USER's own $HOME/.cargo/bin from their rustup install, never on root's PATH, so running
+  # this as root would just trade "cc not found" for an equally silent "cargo: command not found".
   echo "Building the Connector (target/release/secure_connect_connector not found)..."
-  (cd "$REPO_ROOT" && cargo build --release)
+  sudo -u "$RUN_AS_USER" bash -lc "source \"\$HOME/.cargo/env\" 2>/dev/null || true; cd '$REPO_ROOT' && cargo build --release"
   if [ ! -x "$BUILT_BINARY_PATH" ]; then
     echo "error: build finished but $BUILT_BINARY_PATH still missing/not executable." >&2
     exit 1
