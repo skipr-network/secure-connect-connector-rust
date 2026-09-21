@@ -235,9 +235,13 @@ async fn handle_flow_admission(
         };
     }
 
-    let decision =
-        decide_access_and_audit(policy_store, audit_log, &request.gateway_id, &user_public_key)
-            .await;
+    let decision = decide_access_and_audit(
+        policy_store,
+        audit_log,
+        &request.gateway_id,
+        &user_public_key,
+    )
+    .await;
 
     match decision {
         AccessDecision::Allowed { endpoints, .. } => {
