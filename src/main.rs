@@ -16,7 +16,7 @@ mod tun_device;
 mod tunnel;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use audit::{AuditEvent, AuditLog};
@@ -537,7 +537,8 @@ fn reconcile_endpoint_changes(
 /// handshake for any node that doesn't have an established session yet.
 /// Established tunnels are left alone entirely - re-dialing them would
 /// discard a working session for no reason. Also evicts `flow_table`'s
-/// entries for any node this sync dropped (TT-1847 finding #1).
+/// entries for any node whose grace period (TT-1734) has now genuinely
+/// elapsed - see `TunnelManager::expire_grace_period`.
 ///
 /// Collects the handshake packets to send *while* holding the
 /// `tunnel_manager` lock (mutating each tunnel's state needs `&mut`), then
@@ -552,9 +553,10 @@ async fn dial_new_nodes(
     flow_table: &std::sync::Mutex<FlowTable>,
 ) {
     let mut handshakes_to_send = Vec::new();
-    let dropped = {
+    let (newly_missing, expired) = {
         let mut manager = tunnel_manager.lock().await;
-        let dropped = manager.sync_nodes(nodes);
+        let newly_missing = manager.sync_nodes(nodes);
+        let expired = manager.expire_grace_period(Instant::now());
 
         for node in nodes {
             let Some(tunnel) = manager.tunnel_for(&node.node_id) else {
@@ -567,16 +569,21 @@ async fn dial_new_nodes(
                 handshakes_to_send.push((packet, tunnel.addr, node.node_id.clone()));
             }
         }
-        dropped
+        (newly_missing, expired)
     };
+
+    for node_id in &newly_missing {
+        info!(%node_id, "node no longer present in heartbeat's node list - keeping its tunnel and admitted flows alive on a grace timer (TT-1734) rather than dropping immediately");
+    }
 
     // A node this Connector no longer has a tunnel for can't have its flows released cleanly by
     // Gatekeeper either - evict them here instead of leaving permanent ghost entries (TT-1732
-    // review, Tasneem, TT-1847 finding #1).
-    if !dropped.is_empty() {
+    // review, Tasneem, TT-1847 finding #1). Only reached once a node's grace period has actually
+    // elapsed (TT-1734), not the instant it drops out of the heartbeat.
+    if !expired.is_empty() {
         let mut table = flow_table.lock().expect("flow table lock poisoned");
-        for node_id in &dropped {
-            info!(%node_id, "node no longer present in heartbeat's node list - evicting its admitted flows");
+        for node_id in &expired {
+            info!(%node_id, "node's grace period elapsed - tearing down its tunnel and evicting its admitted flows");
             table.evict_node(node_id);
         }
     }

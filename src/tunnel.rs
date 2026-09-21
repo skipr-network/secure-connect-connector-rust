@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -43,6 +43,24 @@ pub(crate) const WIREGUARD_PORT: u16 = 51820;
 /// handshake completed at some point in this process's lifetime, however
 /// long ago" (TT-1732 review, Tasneem).
 const SESSION_REJECT_AFTER: Duration = Duration::from_secs(180);
+
+/// How long a node that has dropped out of the heartbeat's node_list keeps its existing tunnel
+/// (and admitted flows) alive before being torn down for good, instead of an immediate hard drop
+/// (TT-1734: rotation used to evict a node's flows the instant it left node_list, which happens
+/// right when Orchestrator flips it to TO_RETIRE - well before the underlying Gatekeeper VM is
+/// ever actually terminated. Orchestrator's own rotation design keeps the old node running and
+/// serving through its whole TO_RETIRE window, right up until real termination via
+/// InstantRetirementService, and the client's own OpenVPN session to that node is untouched
+/// throughout - only this Connector's own eviction was cutting things short). A still-present
+/// node is never affected by this at all - it's the "vanished from the list" case only.
+///
+/// ~2.5 heartbeat intervals (default heartbeat is 60s): long enough to ride out one missed or
+/// delayed heartbeat without prematurely tearing down a node that's still genuinely there, short
+/// enough that a node that's truly gone (a real outage, not a rotation) doesn't hold flows open
+/// forever. Comfortably inside `SESSION_REJECT_AFTER` too, so as long as `drive_all_timers` keeps
+/// running (unconditional over every tunnel still in `tunnels`, grace-period ones included), the
+/// WireGuard session itself stays alive for the full grace window rather than expiring first.
+const NODE_REMOVAL_GRACE_PERIOD: Duration = Duration::from_secs(150);
 
 /// Outcome of feeding a tunnel a network event, translated from boringtun's
 /// borrowed `TunnResult` into owned bytes so callers don't fight lifetimes.
@@ -349,6 +367,12 @@ pub struct TunnelManager {
     identity_secret: StaticSecret,
     rate_limiter: Arc<RateLimiter>,
     tunnels: HashMap<String, NodeTunnel>,
+    /// Nodes that have dropped out of the most recent heartbeat's node list, keyed by when they
+    /// were first observed missing - `expire_grace_period` is what actually removes them, once
+    /// `NODE_REMOVAL_GRACE_PERIOD` has genuinely elapsed. A node reappearing in a later heartbeat
+    /// clears its own entry here (see `sync_nodes`), so a node that only missed one heartbeat
+    /// never gets torn down at all.
+    pending_removal: HashMap<String, Instant>,
     next_index: u32,
 }
 
@@ -359,26 +383,28 @@ impl TunnelManager {
             identity_secret,
             rate_limiter: Arc::new(RateLimiter::new(&identity_public, 10)),
             tunnels: HashMap::new(),
+            pending_removal: HashMap::new(),
             next_index: 0,
         }
     }
 
-    /// Adds a tunnel for each node with a reported WireGuard key that isn't
-    /// already configured, and drops tunnels for nodes no longer in the
-    /// list. A still-present node whose reported key or IP is unchanged from
-    /// what its existing tunnel was built with is left alone entirely -
-    /// rebuilding it would throw away an established session (and restart
-    /// the handshake) for no reason. But a still-present node whose key or
-    /// IP *did* change (a rotation) is rebuilt - otherwise the Connector
-    /// would keep dialing a stale address/key indefinitely (TT-1732 review,
-    /// Tasneem). A node whose key fails to decode is logged and skipped, not
-    /// fatal to the rest of the sync - and never tears down a working
+    /// Adds a tunnel for each node with a reported WireGuard key that isn't already configured.
+    /// A still-present node whose reported key or IP is unchanged from what its existing tunnel
+    /// was built with is left alone entirely - rebuilding it would throw away an established
+    /// session (and restart the handshake) for no reason. But a still-present node whose key or
+    /// IP *did* change (a rotation) is rebuilt - otherwise the Connector would keep dialing a
+    /// stale address/key indefinitely (TT-1732 review, Tasneem). A node whose key fails to decode
+    /// is logged and skipped, not fatal to the rest of the sync - and never tears down a working
     /// existing tunnel just because a rebuild attempt failed.
     ///
-    /// Returns the node_ids that were dropped by this sync (present before,
-    /// gone now) - `main` uses this to evict their entries from `FlowTable`
-    /// too (TT-1732 review, Tasneem, TT-1847 finding #1), so a flow for a
-    /// node that's simply vanished doesn't linger forever.
+    /// A node no longer in the list is *not* torn down here - see `NODE_REMOVAL_GRACE_PERIOD`'s
+    /// doc comment. It's marked (or left marked) pending removal instead; `expire_grace_period`
+    /// is what actually removes a node, once it's been missing long enough. A node that reappears
+    /// here after having been marked has that mark cleared - it never actually gets removed.
+    ///
+    /// Returns the node_ids newly marked pending-removal by this call (for logging - the node
+    /// isn't gone yet, just started/still on its grace timer). Nodes actually torn down are
+    /// reported by `expire_grace_period`, not here.
     pub fn sync_nodes(&mut self, nodes: &[HeartbeatNode]) -> Vec<String> {
         let mut seen = HashSet::new();
         for node in nodes {
@@ -415,14 +441,48 @@ impl TunnelManager {
                 }
             }
         }
-        let dropped: Vec<String> = self
+
+        // A node reported again cancels any grace timer an earlier heartbeat started for it -
+        // it was never actually gone.
+        self.pending_removal
+            .retain(|node_id, _| !seen.contains(node_id));
+
+        let newly_missing: Vec<String> = self
             .tunnels
             .keys()
-            .filter(|node_id| !seen.contains(*node_id))
+            .filter(|node_id| {
+                !seen.contains(*node_id) && !self.pending_removal.contains_key(*node_id)
+            })
             .cloned()
             .collect();
-        self.tunnels.retain(|node_id, _| seen.contains(node_id));
-        dropped
+        for node_id in &newly_missing {
+            self.pending_removal.insert(node_id.clone(), Instant::now());
+        }
+        newly_missing
+    }
+
+    /// Actually tears down any node whose grace period has elapsed since it first went missing
+    /// from the heartbeat's node list (see `NODE_REMOVAL_GRACE_PERIOD`). Returns the node_ids
+    /// removed this call - the real "gone for good" signal `main` uses to evict their
+    /// `FlowTable` entries too (the counterpart of the old `sync_nodes`-returns-dropped
+    /// behavior, TT-1732 review Tasneem / TT-1847 finding #1, now delayed rather than instant).
+    ///
+    /// Takes `now` rather than reading the clock itself so a grace period can be proven to
+    /// elapse in a test without a real sleep.
+    pub fn expire_grace_period(&mut self, now: Instant) -> Vec<String> {
+        let expired: Vec<String> = self
+            .pending_removal
+            .iter()
+            .filter(|(_, missing_since)| {
+                now.duration_since(**missing_since) >= NODE_REMOVAL_GRACE_PERIOD
+            })
+            .map(|(node_id, _)| node_id.clone())
+            .collect();
+        for node_id in &expired {
+            self.pending_removal.remove(node_id);
+            self.tunnels.remove(node_id);
+        }
+        expired
     }
 
     fn build_tunnel(
@@ -638,7 +698,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_nodes_drops_a_tunnel_for_a_node_no_longer_present() {
+    fn sync_nodes_keeps_a_missing_nodes_tunnel_alive_on_a_grace_timer_instead_of_dropping_it() {
+        // TT-1734: a node no longer in the heartbeat's list must not lose its tunnel (and
+        // in-flight flows) immediately - the underlying Gatekeeper VM is very likely still
+        // running and serving through Orchestrator's own TO_RETIRE window.
         let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
         let key = random_public_key_base64();
         manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
@@ -646,42 +709,130 @@ mod tests {
 
         manager.sync_nodes(&[]);
 
-        assert_eq!(manager.node_count(), 0);
+        assert_eq!(manager.node_count(), 1);
+        assert!(manager.tunnel_for("n-1").is_some());
     }
 
     #[test]
-    fn sync_nodes_returns_the_node_ids_it_dropped() {
+    fn sync_nodes_preserves_the_same_tunnel_session_for_a_node_on_its_grace_timer() {
+        // Proves it's the *same* NodeTunnel kept alive, not a fresh rebuild - a rebuilt tunnel
+        // would have no handshake in progress and would produce a new initiation packet again.
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        manager.tunnel_for("n-1").unwrap().initiate_handshake();
+
+        manager.sync_nodes(&[]);
+
+        let event = manager.tunnel_for("n-1").unwrap().initiate_handshake();
+        assert_eq!(event, TunnelEvent::Nothing);
+    }
+
+    #[test]
+    fn sync_nodes_returns_the_node_ids_newly_marked_pending_removal() {
         let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
         let key = random_public_key_base64();
         manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
 
-        let dropped = manager.sync_nodes(&[]);
+        let newly_missing = manager.sync_nodes(&[]);
 
-        assert_eq!(dropped, vec!["n-1".to_string()]);
+        assert_eq!(newly_missing, vec!["n-1".to_string()]);
     }
 
     #[test]
-    fn sync_nodes_returns_nothing_dropped_when_every_node_is_still_present() {
+    fn sync_nodes_does_not_repeatedly_report_the_same_node_as_newly_missing() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        manager.sync_nodes(&[]);
+
+        // Still missing on a second consecutive heartbeat - already on its grace timer, not
+        // newly missing again.
+        let newly_missing = manager.sync_nodes(&[]);
+
+        assert!(newly_missing.is_empty());
+    }
+
+    #[test]
+    fn sync_nodes_returns_nothing_newly_missing_when_every_node_is_still_present() {
         let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
         let key = random_public_key_base64();
         manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
 
-        let dropped = manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        let newly_missing = manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
 
-        assert!(dropped.is_empty());
+        assert!(newly_missing.is_empty());
     }
 
     #[test]
-    fn sync_nodes_does_not_report_a_rebuild_as_a_drop() {
+    fn sync_nodes_does_not_report_a_rebuild_as_newly_missing() {
         // A key/IP rotation rebuilds the tunnel in place - the node is still
         // present, just reconfigured, not gone.
         let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
         let key = random_public_key_base64();
         manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
 
-        let dropped = manager.sync_nodes(&[node("n-1", "10.0.0.99", Some(&key))]);
+        let newly_missing = manager.sync_nodes(&[node("n-1", "10.0.0.99", Some(&key))]);
 
-        assert!(dropped.is_empty());
+        assert!(newly_missing.is_empty());
+    }
+
+    #[test]
+    fn sync_nodes_cancels_a_pending_removal_when_the_node_reappears() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        manager.sync_nodes(&[]); // goes missing, starts its grace timer
+
+        // Reappears in a later heartbeat before the grace period would have elapsed.
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let expired = manager.expire_grace_period(Instant::now() + Duration::from_secs(1000));
+        assert!(expired.is_empty());
+        assert!(manager.tunnel_for("n-1").is_some());
+    }
+
+    #[test]
+    fn expire_grace_period_does_not_remove_a_node_before_its_grace_period_elapses() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        manager.sync_nodes(&[]);
+
+        let expired = manager.expire_grace_period(Instant::now());
+
+        assert!(expired.is_empty());
+        assert_eq!(manager.node_count(), 1);
+    }
+
+    #[test]
+    fn expire_grace_period_removes_a_node_once_its_grace_period_has_elapsed() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+        manager.sync_nodes(&[]);
+
+        let expired = manager.expire_grace_period(
+            Instant::now() + NODE_REMOVAL_GRACE_PERIOD + Duration::from_secs(1),
+        );
+
+        assert_eq!(expired, vec!["n-1".to_string()]);
+        assert_eq!(manager.node_count(), 0);
+        assert!(manager.tunnel_for("n-1").is_none());
+    }
+
+    #[test]
+    fn expire_grace_period_never_removes_a_node_that_is_still_present() {
+        let mut manager = TunnelManager::new(WgStaticSecret::random_from_rng(OsRng));
+        let key = random_public_key_base64();
+        manager.sync_nodes(&[node("n-1", "10.0.0.10", Some(&key))]);
+
+        let expired = manager.expire_grace_period(
+            Instant::now() + NODE_REMOVAL_GRACE_PERIOD + Duration::from_secs(1),
+        );
+
+        assert!(expired.is_empty());
+        assert!(manager.tunnel_for("n-1").is_some());
     }
 
     #[test]
