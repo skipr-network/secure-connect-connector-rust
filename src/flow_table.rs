@@ -28,8 +28,21 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 use crate::dto::PolicyBundleEndpoint;
+
+/// How long a decrypted packet dropped for `ForwardOutcome::NotAdmitted` stays buffered, waiting
+/// for its own flow's admission decision to arrive (see `pending_packets`'s doc). Gatekeeper
+/// forwards a new flow's raw packets through the tunnel independently of, and often slightly
+/// *before*, the admission relay round-trip that decides whether the flow is even allowed -
+/// confirmed live (2026-09-22 session notes): the Connector's own "no admitted flow" warning
+/// consistently preceded Gatekeeper's matching admit/refuse log line by 15-35ms, and none of
+/// those flows' packets ever reached the real backend afterward, even though the flow sat
+/// genuinely admitted for minutes - nothing ever gave the already-in-flight decision a chance to
+/// catch up with the packet that lost the race. 300ms is generous headroom above that measured
+/// window without holding a doomed packet meaningfully longer than today's instant drop.
+const PENDING_PACKET_TTL: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, PartialEq)]
 struct AdmittedFlow {
@@ -122,6 +135,13 @@ pub struct FlowTable {
     /// unboundedly over a long uptime without needing real TCP-close detection.
     control_channel_ports: HashMap<u16, String>,
     control_channel_port_order: VecDeque<u16>,
+    /// A decrypted packet that lost the race against its own flow's admission decision (see
+    /// `PENDING_PACKET_TTL`'s doc) - held here briefly instead of being dropped outright, so
+    /// `take_pending_packet` can hand it back for forwarding if admission catches up in time.
+    /// Only the most recent packet per `(node_id, port)` is kept: for the TCP handshakes this
+    /// exists to rescue, any single copy of the client's SYN reaching the real destination once
+    /// is enough - there's nothing to gain from remembering more than one.
+    pending_packets: HashMap<(String, u16), (Vec<u8>, Instant)>,
 }
 
 /// How many distinct control-channel connections' worth of routing state to remember at once
@@ -345,6 +365,43 @@ impl FlowTable {
             },
             _ => ForwardOutcome::AmbiguousEndpoint,
         }
+    }
+
+    /// Buffers one decrypted packet that hit `ForwardOutcome::NotAdmitted`, in case its own
+    /// flow's admission decision is already in flight and arrives within `PENDING_PACKET_TTL`
+    /// (see that constant's doc for why this race exists and why it's worth rescuing). Overwrites
+    /// any previously-buffered packet for the same `(node_id, port)` - only the latest matters.
+    ///
+    /// Also opportunistically sweeps every *other* entry past its own TTL, so a packet whose flow
+    /// is ultimately refused (or never decided at all) doesn't linger here forever - there's no
+    /// separate release/expiry signal for a pending packet the way there is for an admitted flow,
+    /// so this is the only place that cleanup can happen without a dedicated background sweep.
+    pub fn buffer_pending_packet(
+        &mut self,
+        node_id: &str,
+        port: u16,
+        packet: Vec<u8>,
+        now: Instant,
+    ) {
+        self.pending_packets
+            .insert((node_id.to_string(), port), (packet, now));
+        self.pending_packets
+            .retain(|_, (_, buffered_at)| now.duration_since(*buffered_at) <= PENDING_PACKET_TTL);
+    }
+
+    /// Reclaims a packet `buffer_pending_packet` held for `(node_id, port)`, if one exists and is
+    /// still within `PENDING_PACKET_TTL` - called right after `admit()` records that same flow as
+    /// admitted, so the caller can push the rescued packet through the normal forwarding path
+    /// instead of leaving it lost. Removes the entry either way (a stale one is just as done being
+    /// useful as one just claimed), so this can't return the same packet twice.
+    pub fn take_pending_packet(
+        &mut self,
+        node_id: &str,
+        port: u16,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        let (packet, buffered_at) = self.pending_packets.remove(&(node_id.to_string(), port))?;
+        (now.duration_since(buffered_at) <= PENDING_PACKET_TTL).then_some(packet)
     }
 
     /// Records the fake/virtual address a flow's packets actually arrive addressed to (TT-2046
@@ -1205,5 +1262,111 @@ mod tests {
         table.record_virtual_address("n-1", 40001, "172.16.0.9".parse().unwrap());
 
         assert_eq!(table.virtual_address_for("n-1", 40001), None);
+    }
+
+    #[test]
+    fn a_pending_packet_is_reclaimed_within_the_ttl() {
+        let mut table = FlowTable::new();
+        let buffered_at = Instant::now();
+
+        table.buffer_pending_packet("n-1", 40001, vec![1, 2, 3], buffered_at);
+
+        let reclaimed =
+            table.take_pending_packet("n-1", 40001, buffered_at + Duration::from_millis(100));
+
+        assert_eq!(reclaimed, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn a_pending_packet_past_the_ttl_is_not_reclaimed() {
+        let mut table = FlowTable::new();
+        let buffered_at = Instant::now();
+
+        table.buffer_pending_packet("n-1", 40001, vec![1, 2, 3], buffered_at);
+
+        let reclaimed = table.take_pending_packet(
+            "n-1",
+            40001,
+            buffered_at + PENDING_PACKET_TTL + Duration::from_millis(1),
+        );
+
+        assert_eq!(reclaimed, None);
+    }
+
+    #[test]
+    fn take_pending_packet_removes_it_so_it_cannot_be_reclaimed_twice() {
+        let mut table = FlowTable::new();
+        let now = Instant::now();
+        table.buffer_pending_packet("n-1", 40001, vec![1, 2, 3], now);
+
+        assert_eq!(
+            table.take_pending_packet("n-1", 40001, now),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(table.take_pending_packet("n-1", 40001, now), None);
+    }
+
+    #[test]
+    fn take_pending_packet_is_none_when_nothing_was_ever_buffered() {
+        let mut table = FlowTable::new();
+
+        assert_eq!(
+            table.take_pending_packet("n-1", 40001, Instant::now()),
+            None
+        );
+    }
+
+    #[test]
+    fn buffering_a_new_pending_packet_for_the_same_key_overwrites_the_previous_one() {
+        let mut table = FlowTable::new();
+        let now = Instant::now();
+
+        table.buffer_pending_packet("n-1", 40001, vec![1], now);
+        table.buffer_pending_packet("n-1", 40001, vec![2], now);
+
+        assert_eq!(table.take_pending_packet("n-1", 40001, now), Some(vec![2]));
+    }
+
+    #[test]
+    fn buffering_a_pending_packet_sweeps_other_entries_that_have_already_expired() {
+        let mut table = FlowTable::new();
+        let stale_at = Instant::now();
+        table.buffer_pending_packet("n-1", 40001, vec![1], stale_at);
+
+        // A second, unrelated flow's packet arrives well past the first one's TTL - the sweep
+        // inside buffer_pending_packet should have already dropped the stale entry, not just left
+        // it there for take_pending_packet to reject later.
+        let fresh_at = stale_at + PENDING_PACKET_TTL + Duration::from_millis(50);
+        table.buffer_pending_packet("n-2", 40002, vec![2], fresh_at);
+
+        assert_eq!(table.take_pending_packet("n-1", 40001, fresh_at), None);
+        assert_eq!(
+            table.take_pending_packet("n-2", 40002, fresh_at),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn admit_does_not_by_itself_clear_a_pending_packet() {
+        // take_pending_packet is a deliberate, separate step the caller must take after admit()
+        // (see main.rs's use of both together) - admit() itself has no knowledge of buffered
+        // packets at all, so this just documents that the two are independent.
+        let mut table = FlowTable::new();
+        let now = Instant::now();
+        table.buffer_pending_packet("n-1", 40001, vec![1, 2, 3], now);
+
+        table.admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-1".to_string(),
+            vec![],
+        );
+
+        assert_eq!(
+            table.take_pending_packet("n-1", 40001, now),
+            Some(vec![1, 2, 3])
+        );
     }
 }
