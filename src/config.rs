@@ -22,12 +22,14 @@ pub struct Config {
     /// Konyk's answer (TT-1732 comment thread): 60s default, must stay configurable
     /// and below Agent's 5-minute signature validity window.
     pub heartbeat_interval: Duration,
-    /// Port the flow-admission/release HTTP server (TT-1821) listens on. The
-    /// host half is not configurable (TT-1838): `main` always binds to
-    /// `connector_virtual_ip`, the Connector's own TUN address, which only
-    /// receives traffic that arrived through an established WireGuard
-    /// session - so only the port is left as a knob.
-    pub control_plane_port: u16,
+    /// The HTTP port each paired Node's Gatekeeper listens on, for the flow-admission/release
+    /// control channel (TT-2144) - the Connector polls out to `http://{node.ip_address}:{this
+    /// port}/api/connector/{connector_id}/poll`, no inbound listener of its own anymore (replaces
+    /// the old `control_plane_port`, which was the port *this* process used to listen on before the
+    /// channel flipped direction - see `admission_poller`'s module doc for why this outbound call is
+    /// no different in kind, trust-wise, from the raw WireGuard handshake already dialing the same
+    /// `node.ip_address` directly).
+    pub gatekeeper_http_port: u16,
     /// Netmask for the Connector's TUN interface - the address itself is no longer a local
     /// config concern (TT-1838): it's `connector_virtual_ip`, learned from the first successful
     /// heartbeat (Portal's own registered, per-Connector address), not guessed here.
@@ -74,10 +76,12 @@ impl Config {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "/var/skipr/connector/audit/audit.log".to_string()),
             ),
-            control_plane_port: env::var("CONNECTOR_CONTROL_PLANE_PORT")
+            // 4000 matches secure-connect-backend-gatekeeper's own default `server.port`
+            // (application-prod.yml) - overridable in case a deployment ever changes it.
+            gatekeeper_http_port: env::var("CONNECTOR_GATEKEEPER_HTTP_PORT")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(8443),
+                .unwrap_or(4000),
             tun_netmask: env::var("CONNECTOR_TUN_NETMASK")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -157,7 +161,7 @@ mod tests {
             "REGISTRY_BASE_URL",
             "CONNECTOR_IDENTITY_KEY_PATH",
             "CONNECTOR_AUDIT_LOG_PATH",
-            "CONNECTOR_CONTROL_PLANE_PORT",
+            "CONNECTOR_GATEKEEPER_HTTP_PORT",
             "CONNECTOR_TUN_NETMASK",
             "HEARTBEAT_INTERVAL_SECONDS",
             "CONNECTOR_CA_BUNDLE_PATH",
@@ -303,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_the_control_plane_port() {
+    fn defaults_the_gatekeeper_http_port() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -315,12 +319,12 @@ mod tests {
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.control_plane_port, 8443);
+        assert_eq!(config.gatekeeper_http_port, 4000);
         clear_all();
     }
 
     #[test]
-    fn reads_a_configured_control_plane_port() {
+    fn reads_a_configured_gatekeeper_http_port() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -328,12 +332,12 @@ mod tests {
             env::set_var("AGENT_BASE_URL", "https://agent.example.com");
             env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
-            env::set_var("CONNECTOR_CONTROL_PLANE_PORT", "9000");
+            env::set_var("CONNECTOR_GATEKEEPER_HTTP_PORT", "9000");
         }
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.control_plane_port, 9000);
+        assert_eq!(config.gatekeeper_http_port, 9000);
         clear_all();
     }
 

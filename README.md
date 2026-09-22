@@ -77,7 +77,7 @@ Requires these environment variables:
 | `REGISTRY_BASE_URL`              | yes      | -                                             |
 | `CONNECTOR_IDENTITY_KEY_PATH`    | no       | `/var/skipr/connector/.keys/identity.key`     |
 | `CONNECTOR_AUDIT_LOG_PATH`       | no       | `/var/skipr/connector/audit/audit.log`        |
-| `CONNECTOR_CONTROL_PLANE_PORT`   | no       | `8443`                                        |
+| `CONNECTOR_GATEKEEPER_HTTP_PORT` | no       | `4000`                                        |
 | `CONNECTOR_TUN_NETMASK`          | no       | `255.255.255.0`                               |
 | `HEARTBEAT_INTERVAL_SECONDS`     | no       | `60`                                          |
 | `CONNECTOR_CA_BUNDLE_PATH`       | no       | unset                                         |

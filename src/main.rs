@@ -1,4 +1,5 @@
 mod access;
+mod admission_poller;
 mod audit;
 mod ca_trust;
 mod config;
@@ -18,6 +19,7 @@ mod tunnel;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use admission_poller::AdmissionPollers;
 use anyhow::Context;
 use audit::{AuditEvent, AuditLog};
 use boringtun::noise::Tunn;
@@ -145,6 +147,9 @@ async fn main() -> anyhow::Result<()> {
             None => "failed to build the HTTP client".to_string(),
         })?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+    // TT-2144: shared with the flow-admission poll client below - same outbound-only trust model
+    // as the two clients above, just a third destination (each paired Node's Gatekeeper).
+    let admission_poller_http = http.clone();
     let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
     let policy_store = Arc::new(PolicyStore::new());
     let audit_log = Arc::new(AuditLog::new(&config.audit_log_path));
@@ -161,22 +166,44 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to bind the WireGuard UDP socket")?,
     );
 
-    // Shared with the flow-admission control plane below: only a (node_id, port) pair recorded
-    // here by an actual "admit" decision may have its packets forwarded (TT-1732 review, Tasneem
-    // finding #1). Created before the startup heartbeat loop below (not after, like the TUN
-    // device) since run_heartbeat's node-dialing needs it too, to evict a departed node's flows
-    // (TT-1732 review, Tasneem, TT-1847 finding #1).
+    // Shared with the flow-admission poller below: only a (node_id, port) pair recorded here by
+    // an actual "admit" decision may have its packets forwarded (TT-1732 review, Tasneem finding
+    // #1). Created before the startup heartbeat loop below (not after, like the TUN device) since
+    // run_heartbeat's node-dialing needs it too, to evict a departed node's flows (TT-1732 review,
+    // Tasneem, TT-1847 finding #1).
     let flow_table = Arc::new(std::sync::Mutex::new(FlowTable::new()));
     // Refreshed once per heartbeat cycle in `run_heartbeat`, read synchronously on every
     // decrypted packet in `run_wireguard_receive_loop` (TT-2066) - see `dns_cache`'s module doc.
     let dns_cache = Arc::new(dns_cache::DnsCache::new());
 
+    // TT-2144: created here, before the startup heartbeat loop - unlike the TUN device below, this
+    // channel doesn't depend on connector_virtual_ip at all, only on policy_store/audit_log/
+    // flow_table (already built above), so admission_pollers can be live from the very first
+    // successful heartbeat instead of lagging behind by up to a full heartbeat_interval.
+    let (recovered_packet_tx, recovered_packet_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    let mut admission_pollers = AdmissionPollers::new(
+        admission_poller_http,
+        config.connector_id.clone(),
+        config.gatekeeper_http_port,
+        ControlPlaneState {
+            policy_store: policy_store.clone(),
+            audit_log: audit_log.clone(),
+            signature_binding: Arc::new(std::sync::Mutex::new(
+                signature_binding::SignatureBindingGuard::new(),
+            )),
+            flow_table: flow_table.clone(),
+            recovered_packet_tx,
+        },
+    );
+
     // TT-1838: the TUN device's own address is connector_virtual_ip - Portal's registered,
     // per-Connector control-channel address - not a locally guessed default anymore, so it can
     // only be known once the first heartbeat succeeds. Retries at the configured heartbeat
     // cadence (the same cadence steady-state heartbeats already use) rather than a separate,
-    // invented backoff. The heartbeat's other effects (policy application, node dialing) also
-    // run here on the very first successful attempt - nothing is fetched twice.
+    // invented backoff. The heartbeat's other effects (policy application, node dialing, and now
+    // syncing admission pollers) also run here on the very first successful attempt - nothing is
+    // fetched twice.
     let connector_virtual_ip = loop {
         match run_heartbeat(
             &config,
@@ -188,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await
         {
@@ -213,12 +241,6 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to create the Connector's TUN device")?;
     info!(tun_addr = %connector_virtual_ip, tun_netmask = %config.tun_netmask, "TUN device ready");
 
-    // Admission-rescue channel (2026-09-22 session notes): lets the control-plane admission
-    // handler hand a packet it reclaimed via FlowTable::take_pending_packet back to the one task
-    // allowed to write to tun_writer, instead of dropping it or needing its own TUN write access.
-    let (recovered_packet_tx, recovered_packet_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
-
     tokio::spawn(run_wireguard_receive_loop(
         wg_socket.clone(),
         tunnel_manager.clone(),
@@ -236,34 +258,9 @@ async fn main() -> anyhow::Result<()> {
     ));
     tokio::spawn(run_timer_loop(wg_socket.clone(), tunnel_manager.clone()));
 
-    // TT-1838: bind to connector_virtual_ip itself, not a wildcard/loopback address - this is
-    // what actually restricts these endpoints to genuine Gatekeeper peers (see flow_control.rs's
-    // module doc). Only the port stays configurable.
-    let control_plane_bind_addr = std::net::SocketAddr::new(
-        std::net::IpAddr::V4(connector_virtual_ip),
-        config.control_plane_port,
-    );
-    let control_plane_listener = tokio::net::TcpListener::bind(control_plane_bind_addr)
-        .await
-        .with_context(|| format!("failed to bind the flow-admission control-plane listener on {control_plane_bind_addr}"))?;
-    info!(
-        addr = %control_plane_bind_addr,
-        "flow-admission control plane listening"
-    );
-    let control_plane_router = flow_control::router(ControlPlaneState {
-        policy_store: policy_store.clone(),
-        audit_log: audit_log.clone(),
-        signature_binding: Arc::new(std::sync::Mutex::new(
-            signature_binding::SignatureBindingGuard::new(),
-        )),
-        flow_table: flow_table.clone(),
-        recovered_packet_tx,
-    });
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(control_plane_listener, control_plane_router).await {
-            error!(%error, "flow-admission control plane server stopped");
-        }
-    });
+    // TT-2144: no inbound listener for flow-admission/release at all anymore - `admission_pollers`
+    // (constructed above, synced on every `run_heartbeat` call including the startup one) already
+    // has one poll task running per node in the current node_list by this point.
 
     let mut interval = tokio::time::interval(config.heartbeat_interval);
     // The startup loop above already ran one successful heartbeat to learn
@@ -289,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await
         {
@@ -345,6 +343,7 @@ async fn run_heartbeat(
     wg_socket: &UdpSocket,
     flow_table: &std::sync::Mutex<FlowTable>,
     dns_cache: &dns_cache::DnsCache,
+    admission_pollers: &mut AdmissionPollers,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
     // Snapshotted before `policy_store.apply(response)` replaces it and before `response` is moved
     // (TT-1640): the entitlement lists this Connector had *before* this heartbeat, diffed after a
@@ -429,6 +428,8 @@ async fn run_heartbeat(
     }
 
     dial_new_nodes(tunnel_manager, wg_socket, &node_list, flow_table).await;
+    // TT-2144: independent of WireGuard tunnel state - see admission_poller's module doc for why.
+    admission_pollers.sync(&node_list);
     if let Some(old_bundles) = old_bundles {
         reconcile_dropped_entitlements(flow_table, &old_bundles, &new_bundles);
     }
@@ -990,7 +991,7 @@ mod tests {
             registry_base_url,
             identity_key_path: "/tmp/unused-in-this-test".into(),
             audit_log_path: "/tmp/unused-in-this-test-audit.log".into(),
-            control_plane_port: 0,
+            gatekeeper_http_port: 0,
             tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
             ca_bundle_path: None,
@@ -999,6 +1000,33 @@ mod tests {
 
     async fn wg_socket() -> UdpSocket {
         UdpSocket::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    /// `run_heartbeat`'s own tests don't exercise the admission-poller lifecycle itself (that's
+    /// `admission_poller`'s own test module) - this just satisfies the parameter, with a client
+    /// that's never actually asked to make a real call in any of these tests (no node in any
+    /// response body here has a resolvable ip_address that would make `sync` spawn a poller worth
+    /// asserting on).
+    fn admission_pollers() -> AdmissionPollers {
+        AdmissionPollers::new(
+            reqwest::Client::new(),
+            "c-1".to_string(),
+            0,
+            ControlPlaneState {
+                policy_store: Arc::new(PolicyStore::new()),
+                // AuditLog::new only stores the path lazily - never opened unless something
+                // actually calls .record() through this AdmissionPollers, which none of these
+                // tests do, so a fixed path under the OS temp dir is fine here.
+                audit_log: Arc::new(AuditLog::new(
+                    std::env::temp_dir().join("connector-rust-test-unused-audit.log"),
+                )),
+                signature_binding: Arc::new(std::sync::Mutex::new(
+                    signature_binding::SignatureBindingGuard::new(),
+                )),
+                flow_table: Arc::new(std::sync::Mutex::new(FlowTable::new())),
+                recovered_packet_tx: tokio::sync::mpsc::unbounded_channel().0,
+            },
+        )
     }
 
     fn read_audit_lines(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
@@ -1426,6 +1454,7 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
         let dns_cache = dns_cache::DnsCache::new();
 
+        let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
             &config,
             &registry_client,
@@ -1436,6 +1465,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -1491,6 +1521,7 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
         let dns_cache = dns_cache::DnsCache::new();
 
+        let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
             &config,
             &registry_client,
@@ -1501,6 +1532,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -1530,6 +1562,7 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
         let dns_cache = dns_cache::DnsCache::new();
 
+        let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
             &config,
             &registry_client,
@@ -1540,6 +1573,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -1592,6 +1626,7 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
         let dns_cache = dns_cache::DnsCache::new();
 
+        let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
             &config,
             &registry_client,
@@ -1602,6 +1637,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -1653,6 +1689,7 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
         let dns_cache = dns_cache::DnsCache::new();
 
+        let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
             &config,
             &registry_client,
@@ -1663,6 +1700,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -1716,6 +1754,7 @@ mod tests {
 
         // Nodes-without-key is only a warning, not a failure - the cycle still
         // succeeds (there's simply nothing to dial yet for that node).
+        let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
             &config,
             &registry_client,
@@ -1726,6 +1765,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -1795,6 +1835,7 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
         let dns_cache = dns_cache::DnsCache::new();
 
+        let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
             &config,
             &registry_client,
@@ -1805,6 +1846,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -2012,6 +2054,7 @@ mod tests {
 
         // First heartbeat: applies old_bundles as the *current* policy_store state, so the second
         // call below has real old_bundles/new_bundles to diff between - not None vs. something.
+        let mut admission_pollers = admission_pollers();
         run_heartbeat(
             &config,
             &registry_client,
@@ -2022,6 +2065,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await
         .unwrap();
@@ -2037,6 +2081,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await
         .unwrap();
@@ -2118,6 +2163,7 @@ mod tests {
         // means "no A record", the same as any other resolution failure.
         let dns_cache = dns_cache::DnsCache::with_lookup(|_host| async { Ok(vec![]) });
 
+        let mut admission_pollers = admission_pollers();
         run_heartbeat(
             &config,
             &registry_client,
@@ -2128,6 +2174,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await
         .unwrap();
@@ -2142,6 +2189,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
@@ -2418,6 +2466,7 @@ mod tests {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
         let dns_cache = dns_cache::DnsCache::new();
 
+        let mut admission_pollers = admission_pollers();
         run_heartbeat(
             &config,
             &registry_client,
@@ -2428,6 +2477,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await
         .unwrap();
@@ -2460,6 +2510,7 @@ mod tests {
             &wg_socket,
             &flow_table,
             &dns_cache,
+            &mut admission_pollers,
         )
         .await;
 
