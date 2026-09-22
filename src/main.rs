@@ -16,7 +16,7 @@ mod tun_device;
 mod tunnel;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use audit::{AuditEvent, AuditLog};
@@ -213,6 +213,12 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to create the Connector's TUN device")?;
     info!(tun_addr = %connector_virtual_ip, tun_netmask = %config.tun_netmask, "TUN device ready");
 
+    // Admission-rescue channel (2026-09-22 session notes): lets the control-plane admission
+    // handler hand a packet it reclaimed via FlowTable::take_pending_packet back to the one task
+    // allowed to write to tun_writer, instead of dropping it or needing its own TUN write access.
+    let (recovered_packet_tx, recovered_packet_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+
     tokio::spawn(run_wireguard_receive_loop(
         wg_socket.clone(),
         tunnel_manager.clone(),
@@ -220,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         flow_table.clone(),
         std::net::IpAddr::V4(connector_virtual_ip),
         dns_cache.clone(),
+        recovered_packet_rx,
     ));
     tokio::spawn(run_tun_send_loop(
         tun_reader,
@@ -250,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
             signature_binding::SignatureBindingGuard::new(),
         )),
         flow_table: flow_table.clone(),
+        recovered_packet_tx,
     });
     tokio::spawn(async move {
         if let Err(error) = axum::serve(control_plane_listener, control_plane_router).await {
@@ -656,7 +664,13 @@ fn prepare_decrypted_packet_for_forwarding(
         // that gateway until it does - none of these should be indistinguishable to whoever's
         // reading the log on-call.
         ForwardOutcome::NotAdmitted => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node/port - dropping");
+            // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a new
+            // flow's raw packets independently of, and often slightly before, the admission relay
+            // that decides whether it's allowed - buffer this one briefly in case that decision is
+            // already in flight (see PENDING_PACKET_TTL's doc) instead of losing it outright.
+            // run_wireguard_receive_loop's admission-recovery arm is what reclaims it, not here.
+            flow_table.buffer_pending_packet(node_id, source_port, packet.to_vec(), Instant::now());
+            warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node/port yet - buffering briefly in case admission is already in flight");
             return false;
         }
         ForwardOutcome::PortNotConfigured => {
@@ -705,6 +719,15 @@ fn prepare_decrypted_packet_for_forwarding(
 /// or, for real decrypted payload data, hands it to `prepare_decrypted_packet_for_forwarding`
 /// and writes it to the TUN device if that says to.
 ///
+/// Also owns the other end of `recovered_packet_rx` (paired with the `Sender` half in
+/// `ControlPlaneState`) - the only task allowed to write to `tun_writer` (see `tun_device`'s
+/// module doc: "only one task ever writes"), so a packet the admission handler rescues from
+/// `FlowTable::take_pending_packet` has to be handed back here rather than written directly from
+/// that handler's own task. Re-run through the exact same `prepare_decrypted_packet_for_forwarding`
+/// gate as a freshly-arrived packet - by the time this arrives the flow really is admitted, so
+/// this resolves to `Forward` and gets the same address rewrite a first-try success would have
+/// gotten, not a special-cased raw write.
+///
 /// Runs for the lifetime of the process; a single receive error is logged
 /// and the loop continues - one bad datagram must not take down every
 /// node's tunnel.
@@ -715,36 +738,19 @@ async fn run_wireguard_receive_loop(
     flow_table: Arc<std::sync::Mutex<FlowTable>>,
     connector_virtual_ip: std::net::IpAddr,
     dns_cache: Arc<dns_cache::DnsCache>,
+    mut recovered_packet_rx: tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
-        let (len, src) = match wg_socket.recv_from(&mut buf).await {
-            Ok(result) => result,
-            Err(error) => {
-                error!(%error, "failed to receive on the WireGuard UDP socket");
-                continue;
-            }
-        };
-
-        let mut manager = tunnel_manager.lock().await;
-        let Some(tunnel) = manager.tunnel_for_addr(src) else {
-            warn!(%src, "received a WireGuard datagram from an unrecognized peer address");
-            continue;
-        };
-        let node_id = tunnel.node_id.clone();
-        let event = tunnel.receive(&buf[..len]);
-        drop(manager);
-
-        match event {
-            TunnelEvent::SendToNode(packet) => {
-                if let Err(error) = wg_socket.send_to(&packet, src).await {
-                    error!(%error, %src, "failed to send WireGuard response packet");
-                }
-            }
-            TunnelEvent::DecryptedData(mut packet) => {
-                // Block-scoped (not a manual `drop`) so the std::sync::MutexGuard - not Send -
-                // provably can't be held across the `.await` below, which tokio::spawn's Send
-                // bound on the whole future requires.
+        tokio::select! {
+            recovered = recovered_packet_rx.recv() => {
+                let Some((node_id, mut packet)) = recovered else {
+                    // Sender half (ControlPlaneState) dropped - the control-plane server task
+                    // exited, which is itself a fatal condition logged elsewhere; nothing useful
+                    // to do here except stop selecting on a channel that will never produce again.
+                    error!("recovered-packet channel closed - admission-rescued packets will no longer be delivered");
+                    continue;
+                };
                 let should_forward = {
                     let mut table = flow_table.lock().expect("flow table lock poisoned");
                     prepare_decrypted_packet_for_forwarding(
@@ -756,16 +762,66 @@ async fn run_wireguard_receive_loop(
                     )
                 };
                 if !should_forward {
+                    // A genuinely rare race within the race: admitted a moment ago, already
+                    // released/refused/reconfigured by the time this was reclaimed. Not worth its
+                    // own warning - prepare_decrypted_packet_for_forwarding already logged why.
                     continue;
                 }
                 if let Err(error) = tun_writer.write_packet(&packet).await {
-                    error!(%error, node_id = %node_id, "failed to write decrypted packet to TUN device");
+                    error!(%error, node_id = %node_id, "failed to write admission-rescued packet to TUN device");
                 }
             }
-            TunnelEvent::ProtocolError(protocol_error) => {
-                warn!(error = %protocol_error, %src, "WireGuard protocol error");
+            received = wg_socket.recv_from(&mut buf) => {
+                let (len, src) = match received {
+                    Ok(result) => result,
+                    Err(error) => {
+                        error!(%error, "failed to receive on the WireGuard UDP socket");
+                        continue;
+                    }
+                };
+
+                let mut manager = tunnel_manager.lock().await;
+                let Some(tunnel) = manager.tunnel_for_addr(src) else {
+                    warn!(%src, "received a WireGuard datagram from an unrecognized peer address");
+                    continue;
+                };
+                let node_id = tunnel.node_id.clone();
+                let event = tunnel.receive(&buf[..len]);
+                drop(manager);
+
+                match event {
+                    TunnelEvent::SendToNode(packet) => {
+                        if let Err(error) = wg_socket.send_to(&packet, src).await {
+                            error!(%error, %src, "failed to send WireGuard response packet");
+                        }
+                    }
+                    TunnelEvent::DecryptedData(mut packet) => {
+                        // Block-scoped (not a manual `drop`) so the std::sync::MutexGuard - not
+                        // Send - provably can't be held across the `.await` below, which
+                        // tokio::spawn's Send bound on the whole future requires.
+                        let should_forward = {
+                            let mut table = flow_table.lock().expect("flow table lock poisoned");
+                            prepare_decrypted_packet_for_forwarding(
+                                &mut packet,
+                                &node_id,
+                                connector_virtual_ip,
+                                &mut table,
+                                &dns_cache,
+                            )
+                        };
+                        if !should_forward {
+                            continue;
+                        }
+                        if let Err(error) = tun_writer.write_packet(&packet).await {
+                            error!(%error, node_id = %node_id, "failed to write decrypted packet to TUN device");
+                        }
+                    }
+                    TunnelEvent::ProtocolError(protocol_error) => {
+                        warn!(error = %protocol_error, %src, "WireGuard protocol error");
+                    }
+                    TunnelEvent::Nothing => {}
+                }
             }
-            TunnelEvent::Nothing => {}
         }
     }
 }

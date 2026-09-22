@@ -86,6 +86,13 @@ pub struct ControlPlaneState {
     pub audit_log: Arc<AuditLog>,
     pub signature_binding: Arc<Mutex<SignatureBindingGuard>>,
     pub flow_table: Arc<Mutex<FlowTable>>,
+    /// Hands a packet `admit_flow` reclaimed via `FlowTable::take_pending_packet` back to
+    /// `main::run_wireguard_receive_loop` - the only task allowed to write to the TUN device (see
+    /// its own doc comment) - for forwarding, instead of this handler's own task needing TUN
+    /// write access it was never given. `(node_id, packet_bytes)`. Tests that don't exercise this
+    /// path construct this from an `unbounded_channel()` and just drop the receiver half - sending
+    /// into a channel with no live receiver is a harmless no-op error this code ignores.
+    pub recovered_packet_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
 }
 
 pub fn router(state: ControlPlaneState) -> Router {
@@ -99,16 +106,33 @@ async fn admit_flow(
     State(state): State<ControlPlaneState>,
     Json(request): Json<FlowAdmissionRequest>,
 ) -> Json<FlowAdmissionResponse> {
-    Json(
-        handle_flow_admission(
-            &state.policy_store,
-            &state.audit_log,
-            &state.signature_binding,
-            &state.flow_table,
-            request,
-        )
-        .await,
+    let node_id = request.node_id.clone();
+    let port = request.port;
+    let response = handle_flow_admission(
+        &state.policy_store,
+        &state.audit_log,
+        &state.signature_binding,
+        &state.flow_table,
+        request,
     )
+    .await;
+
+    // Only on an actual admit: a refused flow's buffered packet must stay dropped (fail-closed),
+    // so it's simply left in place here to age out on its own via take_pending_packet/
+    // buffer_pending_packet's shared TTL sweep the next time something else touches this table -
+    // no need to explicitly clear it.
+    if response.decision == "admit"
+        && let Some(packet) = state
+            .flow_table
+            .lock()
+            .expect("flow table lock poisoned")
+            .take_pending_packet(&node_id, port, std::time::Instant::now())
+        && let Err(error) = state.recovered_packet_tx.send((node_id, packet))
+    {
+        tracing::error!(%error, "could not hand a reclaimed packet back for forwarding - the receiving task appears to have exited");
+    }
+
+    Json(response)
 }
 
 /// Extracted from the axum handler so it's directly unit-testable without
@@ -235,9 +259,13 @@ async fn handle_flow_admission(
         };
     }
 
-    let decision =
-        decide_access_and_audit(policy_store, audit_log, &request.gateway_id, &user_public_key)
-            .await;
+    let decision = decide_access_and_audit(
+        policy_store,
+        audit_log,
+        &request.gateway_id,
+        &user_public_key,
+    )
+    .await;
 
     match decision {
         AccessDecision::Allowed { endpoints, .. } => {
@@ -375,6 +403,13 @@ mod tests {
 
     fn flow_table() -> Mutex<FlowTable> {
         Mutex::new(FlowTable::new())
+    }
+
+    /// A `recovered_packet_tx` for `ControlPlaneState` construction in tests that don't exercise
+    /// the pending-packet-rescue path - the paired receiver is just dropped, which is fine: a send
+    /// into it becomes a harmless, ignored error rather than a panic.
+    fn recovered_packet_tx() -> tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)> {
+        tokio::sync::mpsc::unbounded_channel().0
     }
 
     #[tokio::test]
@@ -890,6 +925,7 @@ mod tests {
             audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
             signature_binding: Arc::new(signature_binding()),
             flow_table: Arc::new(flow_table()),
+            recovered_packet_tx: recovered_packet_tx(),
         };
         let app = router(state);
 
@@ -930,6 +966,7 @@ mod tests {
             audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
             signature_binding: Arc::new(signature_binding()),
             flow_table: Arc::new(flow_table()),
+            recovered_packet_tx: recovered_packet_tx(),
         };
         let app = router(state);
 
@@ -976,5 +1013,122 @@ mod tests {
 
         let release_response = app.oneshot(release_request).await.unwrap();
         assert_eq!(release_response.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// The actual point of this session's admission-rescue fix: a packet that arrived and was
+    /// buffered before its own flow's admission decision came back must be handed to the
+    /// recovered-packet channel once that admission genuinely succeeds - not left stranded in
+    /// `FlowTable` forever. Exercises the real `/api/flow/admit` HTTP path, not a direct call.
+    #[tokio::test]
+    async fn admit_flow_hands_a_reclaimed_pending_packet_back_over_the_recovered_channel() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let dir = tempfile::tempdir().unwrap();
+        let table = FlowTable::new();
+        let flow_table = Arc::new(Mutex::new(table));
+        flow_table.lock().unwrap().buffer_pending_packet(
+            "n-1",
+            51820,
+            vec![9, 8, 7],
+            std::time::Instant::now(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ControlPlaneState {
+            policy_store: Arc::new(store),
+            audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
+            signature_binding: Arc::new(signature_binding()),
+            flow_table,
+            recovered_packet_tx: tx,
+        };
+        let app = router(state);
+
+        let signature = crypto::sign_to_base64(&device.signing_key, b"session-nonce-1");
+        let http_request = Request::builder()
+            .method("POST")
+            .uri("/api/flow/admit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "flow_id": "flow-1",
+                    "gateway_id": "gw-1",
+                    "node_id": "n-1",
+                    "port": 51820,
+                    "user_public_key": device.public_key_hex,
+                    "signature": signature,
+                    "signed_data": BASE64.encode("session-nonce-1")
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(http_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["decision"], "admit");
+
+        let (recovered_node_id, recovered_packet) = rx.try_recv().expect(
+            "the buffered packet for this now-admitted (node_id, port) should have been handed back for forwarding",
+        );
+        assert_eq!(recovered_node_id, "n-1");
+        assert_eq!(recovered_packet, vec![9, 8, 7]);
+    }
+
+    /// The mirror case: a refused flow must never have its buffered packet forwarded, no matter
+    /// how one was sitting there - fail-closed has to hold for a rescued packet exactly as
+    /// strictly as it already does for an ordinary one.
+    #[tokio::test]
+    async fn admit_flow_does_not_forward_a_pending_packet_when_the_flow_is_refused() {
+        let store = store_with_entitled_device("gw-1", "u-1", "some-device-key");
+        let dir = tempfile::tempdir().unwrap();
+        let table = FlowTable::new();
+        let flow_table = Arc::new(Mutex::new(table));
+        flow_table.lock().unwrap().buffer_pending_packet(
+            "n-1",
+            51820,
+            vec![9, 8, 7],
+            std::time::Instant::now(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = ControlPlaneState {
+            policy_store: Arc::new(store),
+            audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
+            signature_binding: Arc::new(signature_binding()),
+            flow_table,
+            recovered_packet_tx: tx,
+        };
+        let app = router(state);
+
+        let http_request = Request::builder()
+            .method("POST")
+            .uri("/api/flow/admit")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "flow_id": "flow-1",
+                    "gateway_id": "gw-1",
+                    "node_id": "n-1",
+                    "port": 51820,
+                    "user_public_key": null,
+                    "signature": null,
+                    "signed_data": null
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(http_request).await.unwrap();
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["decision"], "refuse");
+
+        // `app` (and with it, ControlPlaneState's own recovered_packet_tx clone) is dropped once
+        // `oneshot` returns, so by the time this runs the channel is legitimately Disconnected,
+        // not Empty, if nothing was ever sent - both outcomes mean the same thing here ("nothing
+        // arrived"), so accept either rather than over-specifying which one.
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused flow's buffered packet must never be handed back for forwarding"
+        );
     }
 }
