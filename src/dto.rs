@@ -70,7 +70,11 @@ pub struct PolicyBundleEndpoint {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Entitlement {
     pub user_id: String,
-    pub device_public_key: String,
+    /// `None` when this user is entitled but hasn't paired any device yet (a normal,
+    /// expected state Portal can produce - access can be granted by role before a device
+    /// ever registers) - never treat a missing key as an empty string, and never match it
+    /// against a real connecting device's key (see `access::decide_access_at`).
+    pub device_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -168,6 +172,39 @@ mod tests {
             response.node_list[0].wireguard_public_key.as_deref(),
             Some("wgkey=")
         );
+    }
+
+    /// Regression test: an entitled user with no paired device yet is a real, expected state
+    /// Portal can send (access granted by role before a device ever registers) - a `null`
+    /// `device_public_key` here previously failed the *entire* heartbeat response's
+    /// deserialization (not just that one entitlement), silently breaking every subsequent
+    /// heartbeat cycle for the whole Connector until the offending entitlement was removed.
+    #[test]
+    fn deserializes_an_entitlement_with_no_device_public_key_yet() {
+        let json = r#"{
+            "connector_id": "c-1",
+            "generated_at": "2026-08-27T10:00:00Z",
+            "expires_at": "2026-08-27T10:05:00Z",
+            "nonce": "abc123",
+            "policy_bundles": [{
+                "gateway_id": "gw-1",
+                "location": "Amsterdam",
+                "hostname": "crm.internal.example.com",
+                "access_mode": "SELECTED_USERS",
+                "endpoints": [],
+                "entitlement_list": [
+                    {"user_id": "u-1", "device_public_key": null},
+                    {"user_id": "u-2", "device_public_key": "abcd"}
+                ]
+            }],
+            "node_list": []
+        }"#;
+
+        let response: ConnectorHeartbeatResponse = serde_json::from_str(json).unwrap();
+
+        let entitlements = &response.policy_bundles[0].entitlement_list;
+        assert_eq!(entitlements[0].device_public_key, None);
+        assert_eq!(entitlements[1].device_public_key.as_deref(), Some("abcd"));
     }
 
     #[test]

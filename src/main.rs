@@ -11,7 +11,6 @@ mod heartbeat;
 mod identity;
 mod policy;
 mod registry_client;
-mod signature_binding;
 mod tun_device;
 mod tunnel;
 
@@ -253,9 +252,6 @@ async fn main() -> anyhow::Result<()> {
     let control_plane_router = flow_control::router(ControlPlaneState {
         policy_store: policy_store.clone(),
         audit_log: audit_log.clone(),
-        signature_binding: Arc::new(std::sync::Mutex::new(
-            signature_binding::SignatureBindingGuard::new(),
-        )),
         flow_table: flow_table.clone(),
         recovered_packet_tx,
     });
@@ -502,20 +498,24 @@ fn reconcile_dropped_entitlements(
                 bundle
                     .entitlement_list
                     .iter()
-                    .map(|e| e.device_public_key.as_str())
+                    .filter_map(|e| e.device_public_key.as_deref())
                     .collect()
             })
             .unwrap_or_default();
         for entitlement in &old_bundle.entitlement_list {
-            if still_entitled.contains(entitlement.device_public_key.as_str()) {
+            // No device ever means no admitted flow to evict either - `access::decide_access_at`
+            // can never have matched a real connecting device against a `None` entitlement.
+            let Some(device_public_key) = entitlement.device_public_key.as_deref() else {
+                continue;
+            };
+            if still_entitled.contains(device_public_key) {
                 continue;
             }
-            let evicted =
-                table.evict_gateway_device(&old_bundle.gateway_id, &entitlement.device_public_key);
+            let evicted = table.evict_gateway_device(&old_bundle.gateway_id, device_public_key);
             if evicted > 0 {
                 info!(
                     gateway_id = %old_bundle.gateway_id,
-                    device_public_key = %entitlement.device_public_key,
+                    device_public_key,
                     evicted,
                     "entitlement dropped: tore down admitted flow(s) for this gateway"
                 );
@@ -2163,7 +2163,7 @@ mod tests {
                 .iter()
                 .map(|key| Entitlement {
                     user_id: "u-1".to_string(),
-                    device_public_key: key.to_string(),
+                    device_public_key: Some(key.to_string()),
                 })
                 .collect(),
         }

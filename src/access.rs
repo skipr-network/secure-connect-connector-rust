@@ -144,7 +144,7 @@ fn decide_access_at(
     let matched = bundle
         .entitlement_list
         .iter()
-        .find(|entitlement| entitlement.device_public_key == device_public_key);
+        .find(|entitlement| entitlement.device_public_key.as_deref() == Some(device_public_key));
 
     match matched {
         Some(entitlement) => AccessDecision::Allowed {
@@ -207,7 +207,7 @@ mod tests {
             .to_utc();
         let entitled = Entitlement {
             user_id: "u-1".to_string(),
-            device_public_key: "device-key-1".to_string(),
+            device_public_key: Some("device-key-1".to_string()),
         };
         store
             .apply_at(
@@ -241,7 +241,7 @@ mod tests {
             .to_utc();
         let entitled = Entitlement {
             user_id: "u-1".to_string(),
-            device_public_key: "device-key-1".to_string(),
+            device_public_key: Some("device-key-1".to_string()),
         };
         store
             .apply_at(
@@ -257,6 +257,37 @@ mod tests {
         // caller-asserted user_id to even compare against anymore; only the
         // presented device key matters.
         let decision = decide_access_at(&store, "gw-1", "device-key-EVIL", now);
+
+        assert_eq!(
+            decision,
+            AccessDecision::Refused(RefusalReason::NotEntitled)
+        );
+    }
+
+    /// A user entitled by role before ever pairing a device (`device_public_key: None`) must
+    /// never be treated as a wildcard match for an arbitrary connecting device - only a real,
+    /// specific paired key should ever be allowed.
+    #[test]
+    fn refuses_any_device_when_the_only_entitlement_for_this_gateway_has_no_paired_device_yet() {
+        let store = PolicyStore::new();
+        let now = DateTime::parse_from_rfc3339("2026-08-27T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let entitled_no_device = Entitlement {
+            user_id: "u-1".to_string(),
+            device_public_key: None,
+        };
+        store
+            .apply_at(
+                response(
+                    &(now + Duration::minutes(5)).to_rfc3339(),
+                    vec![bundle("gw-1", vec![entitled_no_device])],
+                ),
+                now,
+            )
+            .unwrap();
+
+        let decision = decide_access_at(&store, "gw-1", "device-key-1", now);
 
         assert_eq!(
             decision,
@@ -296,7 +327,7 @@ mod tests {
             .to_utc();
         let entitled = Entitlement {
             user_id: "u-1".to_string(),
-            device_public_key: "device-key-1".to_string(),
+            device_public_key: Some("device-key-1".to_string()),
         };
         store
             .apply_at(
@@ -324,7 +355,7 @@ mod tests {
             .to_utc();
         let entitled = Entitlement {
             user_id: "u-1".to_string(),
-            device_public_key: "device-key-1".to_string(),
+            device_public_key: Some("device-key-1".to_string()),
         };
         // Valid for 5 minutes when applied.
         store
@@ -357,7 +388,7 @@ mod tests {
         let expiry = now + Duration::minutes(5);
         let entitled = Entitlement {
             user_id: "u-1".to_string(),
-            device_public_key: "device-key-1".to_string(),
+            device_public_key: Some("device-key-1".to_string()),
         };
         store
             .apply_at(
@@ -381,7 +412,7 @@ mod tests {
         let store = PolicyStore::new();
         let entitled = Entitlement {
             user_id: "u-1".to_string(),
-            device_public_key: "device-key-1".to_string(),
+            device_public_key: Some("device-key-1".to_string()),
         };
         // decide_access_and_audit calls decide_access, which checks against the
         // real Utc::now() (not an injectable one) - the applied package must
@@ -426,7 +457,7 @@ mod tests {
         let store = PolicyStore::new();
         let entitled = Entitlement {
             user_id: "u-1".to_string(),
-            device_public_key: "device-key-1".to_string(),
+            device_public_key: Some("device-key-1".to_string()),
         };
         store
             .apply(response(
