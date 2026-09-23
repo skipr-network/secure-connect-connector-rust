@@ -11,7 +11,6 @@ mod heartbeat;
 mod identity;
 mod policy;
 mod registry_client;
-mod signature_binding;
 mod tun_device;
 mod tunnel;
 
@@ -253,9 +252,6 @@ async fn main() -> anyhow::Result<()> {
     let control_plane_router = flow_control::router(ControlPlaneState {
         policy_store: policy_store.clone(),
         audit_log: audit_log.clone(),
-        signature_binding: Arc::new(std::sync::Mutex::new(
-            signature_binding::SignatureBindingGuard::new(),
-        )),
         flow_table: flow_table.clone(),
         recovered_packet_tx,
     });

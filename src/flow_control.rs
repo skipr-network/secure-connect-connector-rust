@@ -36,7 +36,6 @@ use crate::audit::{AuditEvent, AuditLog};
 use crate::crypto;
 use crate::flow_table::FlowTable;
 use crate::policy::PolicyStore;
-use crate::signature_binding::SignatureBindingGuard;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FlowAdmissionRequest {
@@ -84,7 +83,6 @@ pub struct FlowReleaseRequest {
 pub struct ControlPlaneState {
     pub policy_store: Arc<PolicyStore>,
     pub audit_log: Arc<AuditLog>,
-    pub signature_binding: Arc<Mutex<SignatureBindingGuard>>,
     pub flow_table: Arc<Mutex<FlowTable>>,
     /// Hands a packet `admit_flow` reclaimed via `FlowTable::take_pending_packet` back to
     /// `main::run_wireguard_receive_loop` - the only task allowed to write to the TUN device (see
@@ -111,7 +109,6 @@ async fn admit_flow(
     let response = handle_flow_admission(
         &state.policy_store,
         &state.audit_log,
-        &state.signature_binding,
         &state.flow_table,
         request,
     )
@@ -140,7 +137,6 @@ async fn admit_flow(
 async fn handle_flow_admission(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
-    signature_binding: &Mutex<SignatureBindingGuard>,
     flow_table: &Mutex<FlowTable>,
     request: FlowAdmissionRequest,
 ) -> FlowAdmissionResponse {
@@ -227,38 +223,22 @@ async fn handle_flow_admission(
         };
     }
 
-    // A cryptographically valid signature can still be a captured one being
-    // replayed against a gateway it was never presented for (TT-1732
-    // review, Tasneem) - refused with the same wire-level reason as any
-    // other signature problem, since from the caller's perspective it's
-    // still "your signature doesn't check out for this request" (the fixed
-    // wire vocabulary has no dedicated "replay" value; see
-    // `signature_binding`'s module doc for why this can't bind to
-    // flow_id/node_id/port instead).
-    let bound_to_this_gateway = {
-        let mut guard = signature_binding
-            .lock()
-            .expect("signature binding guard lock poisoned");
-        guard.check_and_bind(&user_public_key, &signature, &request.gateway_id)
-    };
-    if !bound_to_this_gateway {
-        if let Err(error) = audit_log
-            .record(AuditEvent::AccessRefused {
-                gateway_id: request.gateway_id.clone(),
-                device_public_key: user_public_key.clone(),
-                reason: "signature_reused_for_different_gateway".to_string(),
-            })
-            .await
-        {
-            tracing::error!(%error, "failed to write signature-replay audit entry");
-        }
-        return FlowAdmissionResponse {
-            flow_id: request.flow_id,
-            decision: "refuse".to_string(),
-            reason: Some("invalid_signature".to_string()),
-        };
-    }
-
+    // A cryptographically valid signature proves possession of
+    // user_public_key (spec §B.9); which gateway_id it's presented for is
+    // not something the Connector restricts here. TT-1732's original
+    // cross-gateway-replay guard (Tasneem's finding) bound a session
+    // signature to only the *first* gateway_id it touched, but the spec
+    // (§B.5/§B.9, and TT-1732's own acceptance criteria - "it stores
+    // policies, entitlement lists, and node list for all attached
+    // gateways") requires one session to reach every Private Gateway at
+    // this Connector's single Location without reconnecting; a Connector
+    // process never serves more than one Location, so there is nothing to
+    // gain security-wise from refusing a valid signature reused across
+    // gateways it's already legitimately presenting to on this same
+    // Connector. Authorization is still decided per request below, against
+    // the current entitlement list for the named gateway_id specifically -
+    // this only removes a same-Connector restriction the spec never called
+    // for.
     let decision = decide_access_and_audit(
         policy_store,
         audit_log,
@@ -397,10 +377,6 @@ mod tests {
         }
     }
 
-    fn signature_binding() -> Mutex<SignatureBindingGuard> {
-        Mutex::new(SignatureBindingGuard::new())
-    }
-
     fn flow_table() -> Mutex<FlowTable> {
         Mutex::new(FlowTable::new())
     }
@@ -424,14 +400,7 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(
-            &store,
-            &audit_log,
-            &signature_binding(),
-            &flow_table(),
-            request,
-        )
-        .await;
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         assert_eq!(
             response,
@@ -465,14 +434,7 @@ mod tests {
             signed_data: Some("eyJkZXZpY2VfaWQiOiI1ODVjYjU0MjYzZWU5YzNmYjM1MjYwZWYxMzM1NGE2NWIzZGNkYjk4IiwicHVibGljX2tleSI6IjA0N2ZjNzk4MGI0NzM1ZDJlZmEzNDkyY2I0MzEyZTBkMWNkZjRlMjMxNzRkOGJmOGFkZTdlNmE5NjRhNzA1MjExY2YyODNlZmY0MzJhMTJmYWJkYjIyN2Q0NTI5ZWYxZmIzZjBjNjgyODE4MWE1NGI5ZDFhZDMxOTRjNmE5ZjQ5MGQiLCJzZXJ2aWNlX3R5cGUiOiJpbnN0YW50IiwicmVnaW9uIjoiYXAtc291dGgtMSIsImlwX2FkZHJlc3MiOiI0NS4xMTMuMTA4LjEyNyIsImlzX2lwX2FkZHJlc3Nfc3RhdGljIjpmYWxzZSwicHJvdG9jb2wiOiJvcGVudnBuIiwic2Vzc2lvbl9pZCI6bnVsbCwicHJvdmlzaW9uX3Rva2VuIjoiX2l3VzlKQVZtNUQtSHYwdFpfMVdwOUIydGs1bzRwZERTbUo4TTA0MFYzUSIsImdhdGV3YXlfaWQiOiIxMzJmNjJhYS1hYzI5LTQ5YWUtYjUyNy1jMDQ4NTMwYmU5MzUifQ==".to_string()),
         };
 
-        let response = handle_flow_admission(
-            &store,
-            &audit_log,
-            &signature_binding(),
-            &flow_table(),
-            request,
-        )
-        .await;
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         assert_eq!(response.decision, "refuse");
         assert_eq!(response.reason, Some("not_entitled".to_string()));
@@ -492,7 +454,7 @@ mod tests {
             "session-nonce-1",
         );
 
-        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+        handle_flow_admission(&store, &audit_log, &table, request).await;
 
         assert_eq!(
             table.lock().unwrap().gateway_for("n-1", 51820),
@@ -518,7 +480,7 @@ mod tests {
             "session-nonce-1",
         );
 
-        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+        handle_flow_admission(&store, &audit_log, &table, request).await;
 
         // store_with_entitled_device's gw-1 bundle configures 10.0.0.5:443.
         let dns_cache = crate::dns_cache::DnsCache::new();
@@ -552,7 +514,7 @@ mod tests {
             "session-nonce-1",
         );
 
-        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+        handle_flow_admission(&store, &audit_log, &table, request).await;
 
         assert!(table.lock().unwrap().gateway_for("n-1", 51820).is_none());
     }
@@ -569,7 +531,7 @@ mod tests {
             &device.public_key_hex,
             "session-nonce-1",
         );
-        handle_flow_admission(&store, &audit_log, &signature_binding(), &table, request).await;
+        handle_flow_admission(&store, &audit_log, &table, request).await;
         assert!(table.lock().unwrap().gateway_for("n-1", 51820).is_some());
 
         table.lock().unwrap().release("flow-1");
@@ -585,7 +547,6 @@ mod tests {
         let device = crypto::generate_keypair();
         let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
         let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
-        let binding = signature_binding();
         let mut request = admission_request(
             "gw-1",
             &device.signing_key,
@@ -593,22 +554,26 @@ mod tests {
             "session-nonce-1",
         );
 
-        let first =
-            handle_flow_admission(&store, &audit_log, &binding, &flow_table(), request.clone())
-                .await;
+        let first = handle_flow_admission(&store, &audit_log, &flow_table(), request.clone()).await;
         request.flow_id = "flow-2".to_string();
-        let second =
-            handle_flow_admission(&store, &audit_log, &binding, &flow_table(), request).await;
+        let second = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         assert_eq!(first.decision, "admit");
         assert_eq!(second.decision, "admit");
     }
 
+    /// Regression test for a live-reproduced bug (2026-09-23): a device entitled to two Private
+    /// Gateways behind the same Connector (necessarily the same Location - a Connector process
+    /// never serves more than one) got refused switching from one to the other using its still-
+    /// valid session signature, and only worked again after a full reconnect. The spec (§B.5/§B.9,
+    /// and TT-1732's own acceptance criteria) requires one session to reach every Private Gateway
+    /// at that Location without reconnecting - the old cross-gateway `SignatureBindingGuard` was
+    /// stricter than that.
     #[tokio::test]
-    async fn the_same_session_signature_replayed_for_a_different_gateway_is_refused() {
+    async fn the_same_session_signature_admits_a_flow_to_a_second_gateway_on_the_same_connector() {
         let device = crypto::generate_keypair();
-        // Entitled to BOTH gateways, so a refusal here can only be the
-        // replay guard - not a coincidental entitlement failure.
+        // Entitled to BOTH gateways, so this isolates the fix from a coincidental entitlement
+        // failure.
         let store = PolicyStore::new();
         store
             .apply(ConnectorHeartbeatResponse {
@@ -650,43 +615,22 @@ mod tests {
                 node_list: vec![],
             })
             .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let audit_log = AuditLog::new(dir.path().join("audit.log"));
-        let binding = signature_binding();
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
         let first_request = admission_request(
             "gw-1",
             &device.signing_key,
             &device.public_key_hex,
             "session-nonce-1",
         );
-        let mut replayed_request = first_request.clone();
-        replayed_request.gateway_id = "gw-2".to_string();
-        replayed_request.flow_id = "flow-2".to_string();
+        let mut second_request = first_request.clone();
+        second_request.gateway_id = "gw-2".to_string();
+        second_request.flow_id = "flow-2".to_string();
 
-        let first =
-            handle_flow_admission(&store, &audit_log, &binding, &flow_table(), first_request).await;
-        let replayed = handle_flow_admission(
-            &store,
-            &audit_log,
-            &binding,
-            &flow_table(),
-            replayed_request,
-        )
-        .await;
+        let first = handle_flow_admission(&store, &audit_log, &flow_table(), first_request).await;
+        let second = handle_flow_admission(&store, &audit_log, &flow_table(), second_request).await;
 
         assert_eq!(first.decision, "admit");
-        assert_eq!(replayed.decision, "refuse");
-        assert_eq!(replayed.reason, Some("invalid_signature".to_string()));
-
-        let entries: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("audit.log"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(
-            entries[1]["reason"],
-            "signature_reused_for_different_gateway"
-        );
+        assert_eq!(second.decision, "admit");
     }
 
     #[tokio::test]
@@ -708,14 +652,7 @@ mod tests {
             signed_data: None,
         };
 
-        let response = handle_flow_admission(
-            &store,
-            &audit_log,
-            &signature_binding(),
-            &flow_table(),
-            request,
-        )
-        .await;
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         assert_eq!(
             response,
@@ -756,14 +693,7 @@ mod tests {
         );
         request.user_public_key = Some(device.public_key_hex.clone());
 
-        let response = handle_flow_admission(
-            &store,
-            &audit_log,
-            &signature_binding(),
-            &flow_table(),
-            request,
-        )
-        .await;
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         assert_eq!(
             response,
@@ -800,14 +730,7 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(
-            &store,
-            &audit_log,
-            &signature_binding(),
-            &flow_table(),
-            request,
-        )
-        .await;
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         assert_eq!(
             response,
@@ -831,14 +754,7 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(
-            &store,
-            &audit_log,
-            &signature_binding(),
-            &flow_table(),
-            request,
-        )
-        .await;
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         assert_eq!(response.decision, "refuse");
         assert_eq!(response.reason, Some("unknown_gateway".to_string()));
@@ -856,14 +772,7 @@ mod tests {
             "session-nonce-1",
         );
 
-        let response = handle_flow_admission(
-            &store,
-            &audit_log,
-            &signature_binding(),
-            &flow_table(),
-            request,
-        )
-        .await;
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
 
         // NoPolicyApplied has no dedicated wire value - collapses to
         // not_entitled (see RefusalReason::as_wire_str).
@@ -923,7 +832,6 @@ mod tests {
         let state = ControlPlaneState {
             policy_store: Arc::new(store),
             audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            signature_binding: Arc::new(signature_binding()),
             flow_table: Arc::new(flow_table()),
             recovered_packet_tx: recovered_packet_tx(),
         };
@@ -964,7 +872,6 @@ mod tests {
         let state = ControlPlaneState {
             policy_store: Arc::new(store),
             audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            signature_binding: Arc::new(signature_binding()),
             flow_table: Arc::new(flow_table()),
             recovered_packet_tx: recovered_packet_tx(),
         };
@@ -1036,7 +943,6 @@ mod tests {
         let state = ControlPlaneState {
             policy_store: Arc::new(store),
             audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            signature_binding: Arc::new(signature_binding()),
             flow_table,
             recovered_packet_tx: tx,
         };
@@ -1093,7 +999,6 @@ mod tests {
         let state = ControlPlaneState {
             policy_store: Arc::new(store),
             audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            signature_binding: Arc::new(signature_binding()),
             flow_table,
             recovered_packet_tx: tx,
         };
