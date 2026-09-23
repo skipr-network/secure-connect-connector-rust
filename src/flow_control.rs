@@ -365,7 +365,7 @@ mod tests {
                     }],
                     entitlement_list: vec![Entitlement {
                         user_id: user_id.to_string(),
-                        device_public_key: device_public_key.to_string(),
+                        device_public_key: Some(device_public_key.to_string()),
                     }],
                 }],
                 node_list: vec![],
@@ -629,7 +629,7 @@ mod tests {
                         }],
                         entitlement_list: vec![Entitlement {
                             user_id: "u-1".to_string(),
-                            device_public_key: device.public_key_hex.clone(),
+                            device_public_key: Some(device.public_key_hex.clone()),
                         }],
                     },
                     PolicyBundle {
@@ -643,7 +643,7 @@ mod tests {
                         }],
                         entitlement_list: vec![Entitlement {
                             user_id: "u-1".to_string(),
-                            device_public_key: device.public_key_hex.clone(),
+                            device_public_key: Some(device.public_key_hex.clone()),
                         }],
                     },
                 ],
