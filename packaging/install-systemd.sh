@@ -163,6 +163,46 @@ echo "Connector identity ready at $IDENTITY_KEY_PATH"
 echo "Public key (register this in Portal's Deploy Connector screen if you haven't already):"
 echo "  $IDENTITY_PUBLIC_KEY"
 
+# Without this, the Connector receives and admits a flow correctly but the reply never makes it
+# back: an admitted packet is forwarded toward the real backend with its tunnel-internal source
+# address left unrewritten (e.g. 10.66.66.x), which isn't routable from the backend's side, so the
+# backend (or the cloud network fabric in front of it) has nowhere to send its response - the
+# client just sees the connection hang and eventually time out or abort, with nothing wrong in any
+# admission/entitlement/Security-Group log to explain why. Confirmed live via a packet capture on
+# a Connector that was missing exactly this - packets left its outbound interface unmodified and
+# no reply ever came back, on a box otherwise identical (same binary, same policy) to one that had
+# this configured and worked.
+#
+# Two separate things, and both matter: forwarding must be turned on at all (ip_forward), and the
+# forwarded packet's source must be rewritten to an address the backend can actually reply to
+# (MASQUERADE). Neither was ever part of this script - previously a manual, undocumented step run
+# by hand on working boxes and silently missing on every other one.
+echo "Configuring IP forwarding and NAT for the Connector's outbound interface..."
+
+# Persisted the same way the rest of this box's Skipr-specific sysctl settings are (a dedicated
+# file under /etc/sysctl.d/), not just `sysctl -w` - that alone only affects the running kernel and
+# silently reverts on the next reboot, which is exactly the kind of gap this script exists to close.
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-skipr-connector.conf > /dev/null
+sudo sysctl -p /etc/sysctl.d/99-skipr-connector.conf > /dev/null
+
+# The interface name is instance/AMI-specific (ens5, eth0, enX1, ...) - never hardcode it. Derived
+# from the box's own default route rather than assumed, so this works unmodified on whatever
+# interface this particular instance actually uses.
+NAT_INTERFACE="$(ip route show default | awk '{print $5; exit}')"
+if [ -z "$NAT_INTERFACE" ]; then
+  echo "warning: could not determine the default outbound interface (no default route yet?) -" >&2
+  echo "         skipping NAT setup. Re-run this script once the box has one, or add the rule" >&2
+  echo "         yourself: sudo iptables -t nat -A POSTROUTING -o <interface> -j MASQUERADE" >&2
+else
+  # Checked before added (`-C` ... `|| ... -A`), not appended unconditionally - this script is
+  # documented as safe to re-run (after a rebuild, a config change), and an unconditional -A would
+  # silently stack up a duplicate MASQUERADE rule on every re-run instead of staying a no-op.
+  if ! sudo iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE 2>/dev/null; then
+    sudo iptables -t nat -A POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE
+  fi
+  echo "NAT configured on interface $NAT_INTERFACE"
+fi
+
 # Copied out of the checkout rather than exec'd from target/release directly: a permanent service
 # shouldn't depend on the build tree still existing at that exact path - `cargo clean`, moving the
 # repo, or a `git worktree` prune would otherwise leave a unit that fails at next boot with a
@@ -191,6 +231,16 @@ StartLimitBurst=5
 Type=simple
 User=${RUN_AS_USER}
 EnvironmentFile=${ENV_FILE}
+# The NAT rule this install added is only ever in the running kernel's netfilter table - unlike
+# the ip_forward sysctl (persisted via /etc/sysctl.d/99-skipr-connector.conf), a bare \`iptables -A\`
+# has no on-disk form of its own to survive a reboot, and this box may not have iptables-persistent
+# (or an equivalent) installed at all. Reapplying it here ties it to the one thing that already
+# reliably runs on every boot - this unit starting - instead of a second, separate persistence
+# mechanism. The \`+\` prefix runs this one command as root regardless of User= above (the
+# CAP_NET_ADMIN this service itself gets isn't sufficient for iptables' own netfilter access); the
+# check-then-add is the same idempotent pattern the install script uses, since ExecStartPre runs on
+# every restart, not just the first.
+ExecStartPre=+/bin/sh -c 'IFACE=\$(ip route show default | awk "{print \$5; exit}"); [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE; } || true'
 ExecStart=${INSTALLED_BINARY_PATH}
 Restart=on-failure
 RestartSec=5
