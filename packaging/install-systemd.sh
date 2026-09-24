@@ -240,7 +240,18 @@ EnvironmentFile=${ENV_FILE}
 # CAP_NET_ADMIN this service itself gets isn't sufficient for iptables' own netfilter access); the
 # check-then-add is the same idempotent pattern the install script uses, since ExecStartPre runs on
 # every restart, not just the first.
-ExecStartPre=+/bin/sh -c 'IFACE=\$(ip route show default | awk "{print \$5; exit}"); [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE; } || true'
+#
+# Deliberately not an awk one-liner here (unlike the plain NAT_INTERFACE line above, where that's
+# fine): inside this doubly-quoted /bin/sh -c wrapper, an awk script written in double quotes has
+# /bin/sh itself expand its field-number variable as ITS OWN (empty) positional parameter before
+# awk ever sees the script text - silently turning "print field five" into "print the whole line",
+# which prints the entire "ip route show default" output instead of just the interface name. That
+# then fails the iptables call (name too long) with no failure visible anywhere but this
+# ExecStartPre's own stderr. set-- positional-parameter extraction below has no such nested-dollar-
+# in-double-quotes ambiguity. Verified live: an awk version here produced a real
+# "interface name ... must be shorter than 16 characters" iptables error on a test box; this
+# version doesn't.
+ExecStartPre=+/bin/sh -c 'set -- \$(ip route show default); IFACE=\$5; [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE; } || true'
 ExecStart=${INSTALLED_BINARY_PATH}
 Restart=on-failure
 RestartSec=5
