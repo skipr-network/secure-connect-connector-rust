@@ -17,9 +17,7 @@ fn warns_when_generating_a_fresh_identity_at_normal_startup() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_secure_connect_connector"))
         .env_clear()
-        .env("CONNECTOR_ID", "c-test")
-        .env("AGENT_BASE_URL", "http://127.0.0.1:1")
-        .env("AGENT_IP_ADDRESS", "127.0.0.1")
+        .env("AGENTS_JSON_URL", "http://127.0.0.1:1/agents.json")
         .env("REGISTRY_BASE_URL", "http://127.0.0.1:1")
         .env("CONNECTOR_IDENTITY_KEY_PATH", &key_path)
         .env("RUST_LOG", "warn")
@@ -65,9 +63,7 @@ fn does_not_warn_when_an_identity_already_existed() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_secure_connect_connector"))
         .env_clear()
-        .env("CONNECTOR_ID", "c-test")
-        .env("AGENT_BASE_URL", "http://127.0.0.1:1")
-        .env("AGENT_IP_ADDRESS", "127.0.0.1")
+        .env("AGENTS_JSON_URL", "http://127.0.0.1:1/agents.json")
         .env("REGISTRY_BASE_URL", "http://127.0.0.1:1")
         .env("CONNECTOR_IDENTITY_KEY_PATH", &key_path)
         .env("RUST_LOG", "warn")

@@ -8,12 +8,23 @@
 # agent.service.d/bind-port.conf.
 #
 # Run this after `cargo build --release` has already produced
-# target/release/secure_connect_connector (i.e. right after the install command
-# Portal gives you, before starting the daemon) - the repo root is found from this
-# script's own location, so it doesn't matter what directory you invoke it from.
+# target/release/secure_connect_connector - Portal's install command does both in one go. The repo
+# root is found from this script's own location, so it doesn't matter what directory you invoke it
+# from.
+#
+# TT-2210: the install command is the only thing an admin runs on this host. Portal fills in the
+# environment's constants, so the service starts straight away and heartbeats with nothing but its
+# own public key - pasting that key into Portal is the only step left:
+#   AGENTS_JSON_URL          the environment's agents.json list the Connector picks a live Agent from
+#   REGISTRY_BASE_URL        the environment's Registry, used to verify that Agent's signature
+#   CONNECTOR_CA_BUNDLE_URL  optional - a PEM to trust for an Agent without a publicly-issued
+#                            certificate, downloaded next to connector.env
+# Values passed here are written into connector.env; leaving one unset keeps whatever the file
+# already has, so a plain re-run after a rebuild changes nothing.
 #
 # Usage:
-#   packaging/install-systemd.sh              install, or update after a rebuild/config change
+#   sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... packaging/install-systemd.sh
+#                                               install (or update) and start the service
 #   packaging/install-systemd.sh --uninstall   stop, disable, and remove the service and binary
 #                                               (connector.env is left in place)
 set -euo pipefail
@@ -82,19 +93,17 @@ sudo mkdir -p "$ENV_DIR"
 sudo install -d -o "$RUN_AS_USER" -m 750 /var/skipr/connector/audit /var/skipr/connector/.keys
 if [ ! -f "$ENV_FILE" ]; then
   sudo tee "$ENV_FILE" > /dev/null <<'EOF'
-# Filled in by the admin - see the README's "Running the Connector daemon" table
-# for what each of these means. This install script already generates the
-# Connector's identity for you at CONNECTOR_IDENTITY_KEY_PATH's default (or
-# whatever you set it to below, if you re-run this script after changing it) -
-# leave it commented out unless you deliberately want a non-default location.
+# Written by install-systemd.sh - see the README's "Running the Connector daemon"
+# table for what each of these means. AGENTS_JSON_URL and REGISTRY_BASE_URL come
+# from the install command Portal gives you; the identity is generated for you at
+# CONNECTOR_IDENTITY_KEY_PATH's default (or whatever you set it to below, if you
+# re-run this script after changing it).
 #
 # Leave a line commented out to use its documented default. systemd parses an
 # uncommented `VAR=` as VAR being *set* to an empty string, not unset - which
 # defeats both the defaults below and the required-variable check, so don't
 # just erase the value, uncomment the line and fill it in.
-#CONNECTOR_ID=
-#AGENT_BASE_URL=
-#AGENT_IP_ADDRESS=
+#AGENTS_JSON_URL=
 #REGISTRY_BASE_URL=
 # CONNECTOR_IDENTITY_KEY_PATH must be an ABSOLUTE path - systemd does not expand
 # $HOME or ~ in this file, and the unit's working directory is /, so a value
@@ -117,7 +126,47 @@ if [ ! -f "$ENV_FILE" ]; then
 RUST_LOG=info
 EOF
   sudo chmod 600 "$ENV_FILE"
-  echo "Created $ENV_FILE - fill in its values before starting the service."
+  echo "Created $ENV_FILE"
+fi
+
+# Sets KEY=VALUE in $ENV_FILE, replacing the first existing line for KEY (commented or not) or
+# appending one if there is none - always canonical and unquoted, so this script and systemd's own
+# EnvironmentFile parser never have to agree on how to read quoting or whitespace back. awk rather
+# than sed so VALUE is written out literally, with no backslash/ampersand/delimiter escaping to get
+# right (URLs are full of characters sed treats specially). Passed through the environment rather
+# than `awk -v`, which interprets backslash escapes in the value and would silently drop them.
+set_env_value() {
+  sudo env SET_ENV_KEY="$1" SET_ENV_VAL="$2" awk '
+    BEGIN { done = 0; key = ENVIRON["SET_ENV_KEY"]; val = ENVIRON["SET_ENV_VAL"] }
+    $0 ~ ("^[[:space:]]*#?[[:space:]]*" key "=") {
+      if (!done) { print key "=" val; done = 1; next }
+    }
+    { print }
+    END { if (!done) print key "=" val }
+  ' "$ENV_FILE" | sudo tee "${ENV_FILE}.new" > /dev/null
+  sudo chmod 600 "${ENV_FILE}.new"
+  sudo mv "${ENV_FILE}.new" "$ENV_FILE"
+}
+
+# KEY's current value in $ENV_FILE - empty if it is unset or only commented out.
+env_value() {
+  sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true
+}
+
+# TT-2210: the environment's constants, as Portal's install command passes them. Only written when
+# actually given, so re-running this script bare after a rebuild keeps what connector.env has.
+if [ -n "${AGENTS_JSON_URL:-}" ]; then
+  set_env_value AGENTS_JSON_URL "$AGENTS_JSON_URL"
+fi
+if [ -n "${REGISTRY_BASE_URL:-}" ]; then
+  set_env_value REGISTRY_BASE_URL "$REGISTRY_BASE_URL"
+fi
+if [ -n "${CONNECTOR_CA_BUNDLE_URL:-}" ]; then
+  CA_BUNDLE_PATH="${ENV_DIR}/ca-bundle.pem"
+  echo "Downloading the CA bundle to trust from $CONNECTOR_CA_BUNDLE_URL..."
+  curl -fsS "$CONNECTOR_CA_BUNDLE_URL" | sudo tee "$CA_BUNDLE_PATH" > /dev/null
+  sudo chmod 644 "$CA_BUNDLE_PATH"
+  set_env_value CONNECTOR_CA_BUNDLE_PATH "$CA_BUNDLE_PATH"
 fi
 
 # Generate the identity against the exact path the daemon will load - not a separate,
@@ -149,19 +198,8 @@ IDENTITY_PUBLIC_KEY="$(sudo -u "$RUN_AS_USER" env CONNECTOR_IDENTITY_KEY_PATH="$
 # agree on how to re-derive the same value from the admin's original text a second time - each
 # quoting/whitespace variant systemd accepts is one more way the two parsers could disagree, and
 # every prior fix here was another variant found the hard way. After this, $ENV_FILE always holds
-# the one plain, unambiguous string both readers already agree on byte-for-byte. Uses awk instead
-# of sed for this rewrite so the path is written out literally - no backslash/ampersand/delimiter
-# escaping to get right on the replacement side.
-sudo awk -v val="$IDENTITY_KEY_PATH" '
-  BEGIN { done = 0 }
-  /^[[:space:]]*#?[[:space:]]*CONNECTOR_IDENTITY_KEY_PATH=/ {
-    if (!done) { print "CONNECTOR_IDENTITY_KEY_PATH=" val; done = 1; next }
-  }
-  { print }
-  END { if (!done) print "CONNECTOR_IDENTITY_KEY_PATH=" val }
-' "$ENV_FILE" | sudo tee "${ENV_FILE}.new" > /dev/null
-sudo chmod 600 "${ENV_FILE}.new"
-sudo mv "${ENV_FILE}.new" "$ENV_FILE"
+# the one plain, unambiguous string both readers already agree on byte-for-byte.
+set_env_value CONNECTOR_IDENTITY_KEY_PATH "$IDENTITY_KEY_PATH"
 
 echo "Connector identity ready at $IDENTITY_KEY_PATH"
 echo "Public key (register this in Portal's Deploy Connector screen if you haven't already):"
@@ -274,17 +312,34 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-# daemon-reload alone doesn't restart anything - without this, re-running the script after a
-# rebuild, a user change, or an env-file edit updates what's on disk but leaves the old process
-# running against the old binary/config until something else restarts it. try-restart is a no-op
-# if the service was never started yet (first install), and only restarts - never starts - so it
-# won't surprise an admin who deliberately hasn't enabled it yet.
-sudo systemctl try-restart "$SERVICE_NAME"
 
-echo ""
-echo "Installed. Next steps:"
-echo "  1. sudo nano $ENV_FILE   # uncomment and fill in CONNECTOR_ID and the rest"
-echo "  2. sudo systemctl enable --now $SERVICE_NAME"
-echo "  3. journalctl -u $SERVICE_NAME -f   # watch it start"
+# TT-2210: started here, not left for a second admin step - the Connector heartbeats with just its
+# public key and is told "not registered" until the admin pastes that key into Portal, then picks
+# up its policy on the very next heartbeat, with no restart. restart rather than start so a re-run
+# after a rebuild or config change also takes effect immediately.
+if [ -n "$(env_value AGENTS_JSON_URL)" ] && [ -n "$(env_value REGISTRY_BASE_URL)" ]; then
+  sudo systemctl enable --quiet "$SERVICE_NAME"
+  sudo systemctl restart "$SERVICE_NAME"
+  echo ""
+  echo "Installed and running."
+  echo ""
+  echo "Last step: paste this public key into Portal's Deploy Connector screen:"
+  echo "  $IDENTITY_PUBLIC_KEY"
+  echo "The Connector activates on its next heartbeat - nothing else to run here."
+  echo "  journalctl -u $SERVICE_NAME -f   # to watch it"
+else
+  echo "" >&2
+  echo "warning: AGENTS_JSON_URL and/or REGISTRY_BASE_URL are missing from $ENV_FILE, so the" >&2
+  echo "         service was NOT (re)started. Re-run the install command from Portal's Deploy" >&2
+  echo "         Connector screen, from the same directory - it passes both - or set them in" >&2
+  echo "         that file and run: sudo systemctl enable --now $SERVICE_NAME" >&2
+  # An install from before TT-2210 (CONNECTOR_ID/AGENT_BASE_URL in connector.env) may still be
+  # running: its old process keeps going, but the binary just copied into place refuses to start
+  # without AGENTS_JSON_URL - so the next restart or reboot would take it down. Say so now, not then.
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    echo "warning: $SERVICE_NAME is still running the PREVIOUS binary. The new one needs these" >&2
+    echo "         values and will fail on its next restart or reboot until they are set." >&2
+  fi
+fi
 echo ""
 echo "To uninstall: packaging/install-systemd.sh --uninstall"

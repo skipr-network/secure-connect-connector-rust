@@ -31,21 +31,24 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/skipr-network/secure-connect-connector-rust
 cd secure-connect-connector-rust
 cargo build --release
-sudo ./packaging/install-systemd.sh
+sudo AGENTS_JSON_URL=<your environment's agents.json> REGISTRY_BASE_URL=<your environment's Registry> ./packaging/install-systemd.sh
 ```
 
-Any copy of this command shown elsewhere (e.g. Portal's Deploy Connector
-screen) should match this - if it doesn't include the `apt-get install
-build-essential` line, it will fail on a fresh box the same way.
+Portal's Deploy Connector screen shows this same command with both URLs already
+filled in for its environment - use that one. It builds and installs the
+Connector, starts it, and prints its public key. Paste that key into the same
+Portal screen and you're done: the running Connector picks up its registration
+on its next heartbeat (about a minute), with nothing else to run or configure
+on this machine (TT-2210). Any copy of this command shown elsewhere should match
+this - if it doesn't include the `apt-get install build-essential` line, it will
+fail on a fresh box the same way.
 
 ## Usage
 
-### Generating the Connector's identity (first run, no config needed)
+### Generating the Connector's identity (no config needed)
 
-Portal only issues a `CONNECTOR_ID` after an Enterprise Admin submits the
-Connector's public key on the Deploy Connector screen - so the very first run
-can't go through the normal startup path yet. Use the standalone identity mode
-instead:
+`install-systemd.sh` generates the identity for you. To print a public key
+without installing anything, use the standalone identity mode:
 
 ```sh
 secure_connect_connector --generate-identity
@@ -53,13 +56,12 @@ secure_connect_connector --generate-identity
 
 This generates (or loads, if one already exists) the Connector's X25519
 identity keypair, prints only the public key to stdout, and exits. No
-`CONNECTOR_ID`/`AGENT_BASE_URL`/`AGENT_IP_ADDRESS`/`REGISTRY_BASE_URL` required,
-no network calls made. The resolved key file path is reported on stderr (not
-stdout, so stdout stays scriptable - copy just what's printed there into
-Portal).
+`AGENTS_JSON_URL`/`REGISTRY_BASE_URL` required, no network calls made. The
+resolved key file path is reported on stderr (not stdout, so stdout stays
+scriptable - copy just what's printed there into Portal).
 
-Copy the printed public key into Portal's Deploy Connector screen, get back a
-real `connector_id`, then run the Connector normally (see below) with the
+The public key is the Connector's only identity - there is no separate
+connector ID to configure. Run the daemon (see below) with
 `CONNECTOR_IDENTITY_KEY_PATH` unchanged, so it loads the same identity rather
 than generating a new, unregistered one.
 
@@ -71,9 +73,7 @@ Requires these environment variables:
 
 | Variable                       | Required | Default                                    |
 | ------------------------------- | -------- | ------------------------------------------- |
-| `CONNECTOR_ID`                  | yes      | -                                             |
-| `AGENT_BASE_URL`                 | yes      | -                                             |
-| `AGENT_IP_ADDRESS`               | yes      | -                                             |
+| `AGENTS_JSON_URL`                | yes      | -                                             |
 | `REGISTRY_BASE_URL`              | yes      | -                                             |
 | `CONNECTOR_IDENTITY_KEY_PATH`    | no       | `/var/skipr/connector/.keys/identity.key`     |
 | `CONNECTOR_AUDIT_LOG_PATH`       | no       | `/var/skipr/connector/audit/audit.log`        |
@@ -81,6 +81,15 @@ Requires these environment variables:
 | `CONNECTOR_TUN_NETMASK`          | no       | `255.255.255.0`                               |
 | `HEARTBEAT_INTERVAL_SECONDS`     | no       | `60`                                          |
 | `CONNECTOR_CA_BUNDLE_PATH`       | no       | unset                                         |
+
+**`AGENTS_JSON_URL`** - the environment's public `agents.json` list (e.g.
+`https://skipr-shared-test.s3.us-west-2.amazonaws.com/agents.json`), never one Agent's
+address. Every heartbeat re-reads it and goes through an Agent listed as `operational`, staying
+on the one that last answered while it is still listed, and failing over to the next one in the
+same cycle if it stops answering - so an Agent rotating away needs no action here (TT-2210).
+Until an admin has pasted this Connector's public key into Portal, every heartbeat is answered
+"not registered", logged at `info` with the key to paste; the first heartbeat after that paste
+activates the Connector without a restart.
 
 **`CONNECTOR_CA_BUNDLE_PATH`** - a PEM bundle (one or more certificates) of extra root CAs to
 trust for the Agent/Registry connections, for an Agent running behind a private/internal CA. Not
@@ -98,12 +107,11 @@ exact count of what the running HTTP client ends up trusting (a certificate that
 a valid trust anchor is silently skipped by the client itself, the same way a native store's own
 occasional ancient or malformed entry always has been).
 
-**`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** - it is
-not persisted anywhere by itself. Portal's install command sets it inline for that one command
-only (e.g. `$HOME/.skipr/connector-identity.key`); a later shell, systemd unit, or a different user
-does not inherit it. Starting the daemon without repeating the exact same value generates a
-second, unregistered identity - the daemon will log a loud warning if this happens, but the fix is
-to export it explicitly first:
+**`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** when
+running the raw binary by hand - it is not persisted anywhere by itself (the systemd install below
+handles this for you, writing the path it used into `connector.env`). Starting the daemon with a
+different value generates a second, unregistered identity - the daemon will log a loud warning if
+this happens, but the fix is to export the same path explicitly first:
 
 ```sh
 export CONNECTOR_IDENTITY_KEY_PATH=$HOME/.skipr/connector-identity.key
@@ -131,24 +139,32 @@ above does, but without the separate manual step or the risk of the daemon
 loading from a different path than whatever shell generated the key:
 
 ```sh
-./packaging/install-systemd.sh
+sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... ./packaging/install-systemd.sh
 ```
 
-Copy the printed public key into Portal's Deploy Connector screen if you
-haven't already, then fill in `/etc/skipr/connector/connector.env` with
-`CONNECTOR_ID` (the one Portal gives you back) and the rest of the required
-values from the table above - leave `CONNECTOR_IDENTITY_KEY_PATH` commented
-out unless you deliberately want a non-default location (note that this file
-is read by systemd, not a shell: use an absolute path only, since `$HOME` and
-`~` are not expanded there, and re-run `install-systemd.sh` afterwards so the
-identity gets generated at the new path before the daemon ever starts). Then:
+It writes both values into `/etc/skipr/connector/connector.env`, starts the
+service, and prints the public key to paste into Portal's Deploy Connector
+screen - that paste is the last step. `CONNECTOR_CA_BUNDLE_URL=<url>` can be
+passed the same way to download a CA bundle to trust (see
+`CONNECTOR_CA_BUNDLE_PATH` above). Leave `CONNECTOR_IDENTITY_KEY_PATH` in that
+file alone unless you deliberately want a non-default location (it is read by
+systemd, not a shell: use an absolute path only, since `$HOME` and `~` are not
+expanded there, and re-run `install-systemd.sh` afterwards so the identity gets
+generated at the new path). To watch it:
 
 ```sh
-sudo systemctl enable --now secure-connect-connector
 journalctl -u secure-connect-connector -f
 ```
 
-Re-running `install-systemd.sh` after a rebuild or an env-file change picks up the new binary/config and restarts the service if it's already running. To remove it entirely (`connector.env` is left in place):
+Re-running `install-systemd.sh` after a rebuild or an env-file change picks up the new binary/config and restarts the service; values not passed on a re-run keep whatever `connector.env` already has.
+
+**Upgrading a Connector installed before TT-2210** (its `connector.env` has `CONNECTOR_ID` /
+`AGENT_BASE_URL` / `AGENT_IP_ADDRESS`): the new binary no longer reads those and needs
+`AGENTS_JSON_URL` instead, so pass both values when re-running the script, e.g. re-run Portal's
+install command, or `sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... ./packaging/install-systemd.sh`.
+Its identity key, and so its registration in Portal, carry over unchanged. Re-running without them
+warns that the still-running old process will not survive its next restart. The old lines can be
+deleted from `connector.env`; they are ignored. To remove it entirely (`connector.env` is left in place):
 
 ```sh
 ./packaging/install-systemd.sh --uninstall
