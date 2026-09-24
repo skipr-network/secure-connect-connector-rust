@@ -147,9 +147,6 @@ async fn main() -> anyhow::Result<()> {
             None => "failed to build the HTTP client".to_string(),
         })?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-    // TT-2144: shared with the flow-admission poll client below - same outbound-only trust model
-    // as the two clients above, just a third destination (each paired Node's Gatekeeper).
-    let admission_poller_http = http.clone();
     let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
     let policy_store = Arc::new(PolicyStore::new());
     let audit_log = Arc::new(AuditLog::new(&config.audit_log_path));
@@ -183,7 +180,6 @@ async fn main() -> anyhow::Result<()> {
     let (recovered_packet_tx, recovered_packet_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
     let mut admission_pollers = AdmissionPollers::new(
-        admission_poller_http,
         config.connector_id.clone(),
         config.gatekeeper_http_port,
         ControlPlaneState {
@@ -1003,13 +999,12 @@ mod tests {
     }
 
     /// `run_heartbeat`'s own tests don't exercise the admission-poller lifecycle itself (that's
-    /// `admission_poller`'s own test module) - this just satisfies the parameter, with a client
-    /// that's never actually asked to make a real call in any of these tests (no node in any
-    /// response body here has a resolvable ip_address that would make `sync` spawn a poller worth
-    /// asserting on).
+    /// `admission_poller`'s own test module) - this just satisfies the parameter; `sync`'s spawned
+    /// pollers are never asked to make a real call in any of these tests (no node in any response
+    /// body here has a resolvable ip_address that would make a real poll attempt worth asserting
+    /// on).
     fn admission_pollers() -> AdmissionPollers {
         AdmissionPollers::new(
-            reqwest::Client::new(),
             "c-1".to_string(),
             0,
             ControlPlaneState {

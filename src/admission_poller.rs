@@ -8,32 +8,62 @@
 //! port made every flow fail closed with an opaque timeout, needing a manual firewall edit the
 //! product's install story was never supposed to require).
 //!
-//! This module flips the direction: one task per currently-paired Node holds a plain outbound HTTP
+//! This module flips the direction: one task per currently-paired Node holds an outbound HTTP
 //! long-poll open to that Node's Gatekeeper (`GET /api/connector/{connector_id}/poll`), and posts
 //! its decision back (`POST /api/connector/{connector_id}/admission-result`). This never opens a
 //! listening socket on the Connector at all, so no inbound firewall rule is ever needed for this
 //! channel again.
 //!
-//! **Why a plain outbound HTTP call, not routed through the userspace WireGuard tunnel itself**:
-//! the spec's "no inbound port ever opened" principle is specifically about the *customer's own*
-//! Connector VM never needing an inbound rule - it says nothing about how our own Gatekeeper node's
-//! already-reachable HTTP API is dialed. `tunnel.rs`'s raw WireGuard handshake already dials
-//! `node.ip_address` directly, over the same plain network, to establish the tunnel in the first
-//! place - a Node's address being reachable by an authorized Connector is an existing, accepted
-//! part of this system's trust model, not something this channel needs to additionally protect
-//! against. This mirrors `heartbeat.rs`/`registry_client.rs`'s own outbound-only HTTP clients.
+//! **Within the Connector<->Node tunnel, per spec §B.8** ("a reserved control channel within the
+//! Connector<->Node tunnel carries a flow-admission message"): every poll/result call dials
+//! `tun_device::GATEKEEPER_WG0_ADDRESS` (`10.66.66.1`, Gatekeeper's own fixed address on the same
+//! `wg0` interface this Connector is itself a peer on), never `node.ip_address` (Gatekeeper's
+//! public IP) directly. The kernel route `tun_device::create` already installs for that address
+//! (`ip route replace 10.66.66.0/24 dev <tun-iface>`, originally added for the pre-TT-2144 reply
+//! path - TT-1734 gap #6) means a plain `TcpStream::connect` to it is transparently carried through
+//! this Connector's TUN device and the existing `run_tun_send_loop`/`run_wireguard_receive_loop`
+//! machinery, out over the real encrypted WireGuard tunnel to that specific Node's Gatekeeper - no
+//! new userspace TCP stack needed, just dialing the address that's already routed correctly.
+//! (An earlier version of this module dialed `node.ip_address` directly instead, over the plain
+//! network - a real, since-corrected deviation from this spec line, confirmed by reading it
+//! directly rather than assumed; see the ticket's own quoted text.)
 //!
-//! Poller lifecycle is deliberately independent of `TunnelManager`'s tunnel-established state
-//! (`sync` below runs against the raw heartbeat node list directly, not gated on a reported
-//! WireGuard key) - Gatekeeper simply never generates an admission request for a node whose tunnel
-//! isn't up on its own side yet, so an idle poller against such a node just receives repeated
-//! "none" responses until real traffic exists. Coupling this channel's liveness to tunnel state
-//! would only add complexity for no behavioral benefit.
+//! **Why this module drives HTTP at `hyper`'s lower level instead of through `reqwest::Client`
+//! (as `heartbeat.rs`/`registry_client.rs` do)**: routing a reply back to the right Node is
+//! `run_tun_send_loop`'s job (`prepare_reply_packet_for_forwarding`), and every Node's Gatekeeper
+//! shares the identical destination address `10.66.66.1` from this Connector's point of view (the
+//! module doc's "fixed and identical across the whole fleet" - same masquerading `flow_table`
+//! already relies on for gateway virtual addresses) - so the only signal left to disambiguate
+//! *which* Node a reply belongs to is this connection's own local source port, which must be
+//! learned and registered (`FlowTable::record_control_channel_port`, reusing the exact TT-2102
+//! mechanism the old reactive/Gatekeeper-initiated model already had for the same reason) *before*
+//! any request goes out on it - not after, or a fast-enough reply could arrive unroutable.
+//! `reqwest::Client` manages connections internally and has no way to expose an unsent connection's
+//! local port for this; a `TcpStream` this module connects (and inspects) itself does. One
+//! connection per call (matching `control_channel_ports`' own doc: "these are short-lived one-shot
+//! HTTP exchanges, not long-lived sessions") - not pooled/reused, deliberately, so this stays simple
+//! and each call registers its own port fresh rather than reasoning about a shared connection's
+//! lifetime against the bounded-FIFO eviction that mechanism already has.
+//!
+//! Poller lifecycle is deliberately independent of `TunnelManager`'s tunnel-established state, and
+//! of whether the TUN device (and its Gatekeeper return route) exists yet at all (`sync` below runs
+//! against the raw heartbeat node list directly, spawned before the startup heartbeat loop that
+//! creates the TUN device - see `main.rs`) - a poll/result call attempted before that route exists
+//! simply fails to connect (no route to host) like any other transient failure, and
+//! `POLL_RETRY_BACKOFF` already retries it shortly after, by which point the route is up. No new
+//! synchronization needed for this ordering: the existing retry loop already covers it.
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::Incoming;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use serde::Deserialize;
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -42,12 +72,14 @@ use crate::flow_control::{
     ControlPlaneState, FlowAdmissionRequest, FlowReleaseRequest, handle_flow_admission,
     handle_flow_release,
 };
+use crate::tun_device::GATEKEEPER_WG0_ADDRESS;
 
 /// Backoff between poll attempts after a transport failure (connection refused, timeout, non-2xx
 /// status, unparseable body) - distinct from the poll call's own long-poll timeout, which is
 /// Gatekeeper's own affair (`gatekeeper.connector.control-channel.poll-timeout-ms`, default 25s on
-/// that side). Short enough that a Gatekeeper node coming back up is noticed quickly, long enough
-/// not to hammer a genuinely-down node on every iteration.
+/// that side). Short enough that a Gatekeeper node coming back up (or the Connector's own TUN
+/// device/return route finishing setup at startup) is noticed quickly, long enough not to hammer a
+/// genuinely-down node on every iteration.
 const POLL_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Bounds the poll HTTP request itself - comfortably longer than Gatekeeper's own long-poll
@@ -55,6 +87,10 @@ const POLL_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// own full timeout isn't itself mistaken for a transport failure and retried into a needless
 /// reconnect.
 const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Bounds the admission-result POST - a small fixed JSON body with no long-poll wait on Gatekeeper's
+/// side, so this only ever needs to cover plain network latency, not a deliberate server-side hold.
+const RESULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct ConnectorPollResponse {
@@ -65,10 +101,9 @@ struct ConnectorPollResponse {
 }
 
 /// Tracks one long-poll task per currently-paired Node, spawned/aborted to match each heartbeat's
-/// own `node_list` (see `sync`). Owns the `ControlPlaneState` and HTTP client every poller task
-/// shares - both are cheaply `Clone` (`Arc`-backed / `reqwest::Client`'s own internal `Arc`).
+/// own `node_list` (see `sync`). Owns the `ControlPlaneState` every poller task shares (cheaply
+/// `Clone`, `Arc`-backed).
 pub struct AdmissionPollers {
-    http: reqwest::Client,
     connector_id: String,
     gatekeeper_http_port: u16,
     state: ControlPlaneState,
@@ -76,14 +111,8 @@ pub struct AdmissionPollers {
 }
 
 impl AdmissionPollers {
-    pub fn new(
-        http: reqwest::Client,
-        connector_id: String,
-        gatekeeper_http_port: u16,
-        state: ControlPlaneState,
-    ) -> Self {
+    pub fn new(connector_id: String, gatekeeper_http_port: u16, state: ControlPlaneState) -> Self {
         Self {
-            http,
             connector_id,
             gatekeeper_http_port,
             state,
@@ -112,11 +141,9 @@ impl AdmissionPollers {
             if self.tasks.contains_key(&node.node_id) {
                 continue;
             }
-            info!(node_id = %node.node_id, ip_address = %node.ip_address, "starting admission poller for node");
+            info!(node_id = %node.node_id, "starting admission poller for node");
             let handle = tokio::spawn(run_poller(
-                self.http.clone(),
                 node.node_id.clone(),
-                node.ip_address.clone(),
                 self.gatekeeper_http_port,
                 self.connector_id.clone(),
                 self.state.clone(),
@@ -139,27 +166,132 @@ impl Drop for AdmissionPollers {
     }
 }
 
+/// Connects a fresh `TcpStream` to `gatekeeper_addr:port` and registers its local port against
+/// `node_id` *before* returning it - see the module doc's "why hyper's lower level" section for why
+/// this ordering (register, then ever send anything) is the entire point. `gatekeeper_addr` is
+/// always `GATEKEEPER_WG0_ADDRESS` in production (every real call site below passes it
+/// unconditionally) - a parameter here, not a hardcoded constant, purely so tests can point this at
+/// a loopback listener instead: `GATEKEEPER_WG0_ADDRESS` has no route to it at all in a plain test
+/// process (no real TUN device), so hardcoding it here would make every network-calling function in
+/// this module untestable rather than just the handful of lines that actually need a real tunnel.
+async fn connect_registered(
+    node_id: &str,
+    flow_table: &std::sync::Mutex<crate::flow_table::FlowTable>,
+    gatekeeper_addr: Ipv4Addr,
+    port: u16,
+) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect(SocketAddr::new(IpAddr::V4(gatekeeper_addr), port)).await?;
+    let local_port = stream.local_addr()?.port();
+    flow_table
+        .lock()
+        .expect("flow table lock poisoned")
+        .record_control_channel_port(node_id, local_port);
+    Ok(stream)
+}
+
+/// A request body that's either empty (GET) or a small fixed JSON payload (POST) - boxed to one
+/// common type since `send_once` below is shared by both call shapes, never actually fallible
+/// (neither `Empty` nor `Full` can fail to produce their own bytes), so `Infallible` is the error
+/// type, not `hyper::Error`.
+type RequestBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+
+/// Drives one request/response exchange over `stream` via a plain HTTP/1.1 handshake (no
+/// connection reuse - see the module doc), bounded by `timeout`.
+///
+/// The connection-driving future (`connection` below) has to be polled independently of
+/// `send_request`/the response body read for either to ever actually move any bytes - hyper's
+/// low-level `client::conn` API splits "the connection's own I/O" from "one request/response on
+/// it" into two separate futures precisely so a caller can hold several requests against one
+/// connection at once, and expects *some* task to keep driving the former for as long as the
+/// latter is in use. `tokio::spawn`ing it (not `select!`ing it against the request) is what makes
+/// that true here: `select!` would drop - not just pause - whichever future loses the race, and
+/// `send_request` only resolves once the response *headers* arrive, before its body is read -
+/// dropping the connection driver at that exact point would leave `.collect()` below awaiting
+/// bytes nothing is ever going to deliver again. Always aborted once this one exchange is done
+/// (success, failure, or timeout alike) rather than left running, since this module never reuses
+/// a connection for a second request (see the module doc) - there's no keep-alive benefit to
+/// leaving it alive, and leaving it running unbounded on every timed-out call would leak one task
+/// and one socket per attempt for as long as Gatekeeper stays unreachable.
+async fn send_once(
+    stream: TcpStream,
+    request: Request<RequestBody>,
+    timeout: Duration,
+) -> anyhow::Result<(StatusCode, Bytes)> {
+    let io = TokioIo::new(stream);
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
+    let connection_task = tokio::spawn(connection);
+
+    let outcome = tokio::time::timeout(timeout, async {
+        let response: Response<Incoming> = sender.send_request(request).await?;
+        let status = response.status();
+        let body = response.into_body().collect().await?.to_bytes();
+        Ok::<_, hyper::Error>((status, body))
+    })
+    .await;
+
+    connection_task.abort();
+
+    match outcome {
+        Ok(Ok((status, body))) => Ok((status, body)),
+        Ok(Err(error)) => Err(anyhow::anyhow!("request failed: {error}")),
+        Err(_) => Err(anyhow::anyhow!("timed out after {timeout:?}")),
+    }
+}
+
 async fn run_poller(
-    http: reqwest::Client,
     node_id: String,
-    node_ip: String,
     gatekeeper_http_port: u16,
     connector_id: String,
     state: ControlPlaneState,
 ) {
-    let base_url = format!("http://{node_ip}:{gatekeeper_http_port}/api/connector/{connector_id}");
-    let poll_url = format!("{base_url}/poll");
+    let poll_path = format!("/api/connector/{connector_id}/poll");
+    let host_header = format!("{GATEKEEPER_WG0_ADDRESS}:{gatekeeper_http_port}");
     loop {
-        match http
-            .get(&poll_url)
-            .timeout(POLL_REQUEST_TIMEOUT)
-            .send()
-            .await
+        let stream = match connect_registered(
+            &node_id,
+            &state.flow_table,
+            GATEKEEPER_WG0_ADDRESS,
+            gatekeeper_http_port,
+        )
+        .await
         {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<ConnectorPollResponse>().await {
+            Ok(stream) => stream,
+            Err(error) => {
+                warn!(%error, %node_id, "could not connect to Gatekeeper's tunnel address to poll for flow-admission work - retrying after a backoff");
+                tokio::time::sleep(POLL_RETRY_BACKOFF).await;
+                continue;
+            }
+        };
+        let request = match Request::builder()
+            .method("GET")
+            .uri(&poll_path)
+            .header("Host", &host_header)
+            .body(
+                Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed(),
+            ) {
+            Ok(request) => request,
+            Err(error) => {
+                error!(%error, %node_id, "failed to build the poll request - this is a programming error, not a transport failure");
+                tokio::time::sleep(POLL_RETRY_BACKOFF).await;
+                continue;
+            }
+        };
+
+        match send_once(stream, request, POLL_REQUEST_TIMEOUT).await {
+            Ok((status, body)) if status.is_success() => {
+                match serde_json::from_slice::<ConnectorPollResponse>(&body) {
                     Ok(message) => {
-                        handle_message(&http, &base_url, &node_id, &state, message).await;
+                        handle_message(
+                            &node_id,
+                            GATEKEEPER_WG0_ADDRESS,
+                            gatekeeper_http_port,
+                            &connector_id,
+                            &state,
+                            message,
+                        )
+                        .await;
                         // No sleep: the long-poll itself paces this loop - a "none" response
                         // already waited out Gatekeeper's own poll-timeout before returning.
                     }
@@ -169,12 +301,12 @@ async fn run_poller(
                     }
                 }
             }
-            Ok(response) => {
-                warn!(status = %response.status(), %node_id, %poll_url, "poll to Gatekeeper returned a non-success status - retrying after a backoff");
+            Ok((status, _)) => {
+                warn!(%status, %node_id, "poll to Gatekeeper returned a non-success status - retrying after a backoff");
                 tokio::time::sleep(POLL_RETRY_BACKOFF).await;
             }
             Err(error) => {
-                warn!(%error, %node_id, %poll_url, "could not reach Gatekeeper to poll for flow-admission work - retrying after a backoff");
+                warn!(%error, %node_id, "could not reach Gatekeeper to poll for flow-admission work - retrying after a backoff");
                 tokio::time::sleep(POLL_RETRY_BACKOFF).await;
             }
         }
@@ -182,14 +314,25 @@ async fn run_poller(
 }
 
 async fn handle_message(
-    http: &reqwest::Client,
-    base_url: &str,
     node_id: &str,
+    gatekeeper_addr: Ipv4Addr,
+    gatekeeper_http_port: u16,
+    connector_id: &str,
     state: &ControlPlaneState,
     message: ConnectorPollResponse,
 ) {
     match message.kind.as_str() {
-        "admission" => handle_admission(http, base_url, node_id, state, message.admission).await,
+        "admission" => {
+            handle_admission(
+                node_id,
+                gatekeeper_addr,
+                gatekeeper_http_port,
+                connector_id,
+                state,
+                message.admission,
+            )
+            .await
+        }
         "release" => handle_release(state, message.release).await,
         "none" => {}
         other => {
@@ -199,9 +342,10 @@ async fn handle_message(
 }
 
 async fn handle_admission(
-    http: &reqwest::Client,
-    base_url: &str,
     node_id: &str,
+    gatekeeper_addr: Ipv4Addr,
+    gatekeeper_http_port: u16,
+    connector_id: &str,
     state: &ControlPlaneState,
     request: Option<FlowAdmissionRequest>,
 ) {
@@ -236,8 +380,47 @@ async fn handle_admission(
         error!(%error, "could not hand a reclaimed packet back for forwarding - the receiving task appears to have exited");
     }
 
-    let result_url = format!("{base_url}/admission-result");
-    if let Err(error) = http.post(&result_url).json(&response).send().await {
+    let result_path = format!("/api/connector/{connector_id}/admission-result");
+    let host_header = format!("{gatekeeper_addr}:{gatekeeper_http_port}");
+    let body = match serde_json::to_vec(&response) {
+        Ok(body) => body,
+        Err(error) => {
+            error!(%error, %node_id, %flow_id, "could not serialize the admission result - it will fail closed on Gatekeeper's own timeout for this flow");
+            return;
+        }
+    };
+    let stream = match connect_registered(
+        node_id,
+        &state.flow_table,
+        gatekeeper_addr,
+        gatekeeper_http_port,
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            error!(%error, %node_id, %flow_id, "could not reach Gatekeeper to post the admission result - it will fail closed on its own timeout for this flow");
+            return;
+        }
+    };
+    let request = match Request::builder()
+        .method("POST")
+        .uri(&result_path)
+        .header("Host", &host_header)
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed(),
+        ) {
+        Ok(request) => request,
+        Err(error) => {
+            error!(%error, %node_id, %flow_id, "failed to build the admission-result request - this is a programming error, not a transport failure");
+            return;
+        }
+    };
+    if let Err(error) = send_once(stream, request, RESULT_REQUEST_TIMEOUT).await {
         error!(%error, %node_id, %flow_id, "could not post admission result back to Gatekeeper - it will fail closed on its own timeout for this flow");
     }
 }
@@ -263,8 +446,6 @@ mod tests {
     use crate::policy::PolicyStore;
     use crate::signature_binding::SignatureBindingGuard;
     use std::sync::{Arc, Mutex};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn state() -> (
         ControlPlaneState,
@@ -296,13 +477,13 @@ mod tests {
     fn sync_starts_a_poller_for_each_new_node_and_stops_it_when_the_node_disappears() {
         let (state, _rx) = state();
         // A Tokio runtime is needed to spawn tasks on, but this test never actually drives them -
-        // no server is mocked, so any spawned poller just sits retrying against a closed
-        // connection, exercised only for its lifecycle bookkeeping (tasks map), not its behavior.
+        // there is no route to GATEKEEPER_WG0_ADDRESS in a plain test process, so any spawned
+        // poller just sits retrying against a connection failure, exercised only for its lifecycle
+        // bookkeeping (tasks map), not its behavior.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
 
-        let mut pollers =
-            AdmissionPollers::new(reqwest::Client::new(), "c-1".to_string(), 4000, state);
+        let mut pollers = AdmissionPollers::new("c-1".to_string(), 4000, state);
         pollers.sync(&[node("n-1", "10.0.0.1"), node("n-2", "10.0.0.2")]);
         assert_eq!(
             pollers.running_node_ids(),
@@ -327,8 +508,7 @@ mod tests {
         let (state, _rx) = state();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
-        let mut pollers =
-            AdmissionPollers::new(reqwest::Client::new(), "c-1".to_string(), 4000, state);
+        let mut pollers = AdmissionPollers::new("c-1".to_string(), 4000, state);
 
         pollers.sync(&[node("n-1", "10.0.0.1")]);
         let first_id = pollers.tasks.get("n-1").unwrap().id();
@@ -341,16 +521,140 @@ mod tests {
         );
     }
 
+    /// A real TCP round trip through a loopback listener standing in for Gatekeeper's tunnel
+    /// address - proves `connect_registered` really does learn and record the connection's own
+    /// local port *before* any request is sent, which is the entire mechanism the reply path
+    /// depends on (see the module doc). Can't dial the real `GATEKEEPER_WG0_ADDRESS` constant in a
+    /// test process (no route to it without a real TUN device), so this exercises
+    /// `connect_registered`/`send_once` directly against a loopback server instead of through
+    /// `run_poller`'s hardcoded address.
+    #[tokio::test]
+    async fn connect_registered_records_the_connections_own_local_port_before_any_request_is_sent()
+    {
+        let (state, _rx) = state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    io,
+                    hyper::service::service_fn(|_req: Request<Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(Response::new(
+                            Full::new(Bytes::from_static(b"{\"type\":\"none\"}"))
+                                .map_err(|never: std::convert::Infallible| match never {})
+                                .boxed(),
+                        ))
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        let local_port = stream.local_addr().unwrap().port();
+        state
+            .flow_table
+            .lock()
+            .unwrap()
+            .record_control_channel_port("n-1", local_port);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("Host", format!("127.0.0.1:{server_port}"))
+            .body(
+                Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let (status, body) = send_once(stream, request, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(status.is_success());
+        assert_eq!(&body[..], b"{\"type\":\"none\"}");
+        assert_eq!(
+            state
+                .flow_table
+                .lock()
+                .unwrap()
+                .node_for_control_channel_port(local_port),
+            Some("n-1"),
+            "the connection's own local port must be registered against its node before any \
+             request goes out on it, so a reply on that port routes back correctly"
+        );
+    }
+
+    /// Regression test for a real bug caught in review before this ever shipped: `send_once`
+    /// originally raced the connection-driving future against `send_request` via `tokio::select!`,
+    /// which *drops* - not pauses - whichever side loses. `send_request` resolves once response
+    /// *headers* arrive, before its body is necessarily fully read; dropping the connection driver
+    /// right then leaves `.collect()` awaiting bytes nothing is left to ever read off the socket
+    /// again - a silent, permanent hang. A response fully buffered in one packet (the other test's
+    /// small fixed body over loopback) doesn't reliably exercise this, since hyper may already have
+    /// the whole thing read before `send_request`'s future is even polled to completion; this
+    /// hand-rolled server writes headers, waits, then writes the body in a genuinely separate
+    /// write, forcing a real second read to be necessary.
+    #[tokio::test]
+    async fn send_once_still_reads_a_response_body_that_arrives_in_a_separate_read_after_headers_do()
+     {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = b"{\"type\":\"none\"}";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stream.write_all(body).await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+
+        let stream = TcpStream::connect(("127.0.0.1", server_port))
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("Host", format!("127.0.0.1:{server_port}"))
+            .body(
+                Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let (status, body) = send_once(stream, request, Duration::from_secs(5))
+            .await
+            .expect(
+                "must not hang or fail when the response body arrives in a separate read after headers",
+            );
+
+        assert!(status.is_success());
+        assert_eq!(&body[..], b"{\"type\":\"none\"}");
+    }
+
     /// TT-2144's own version of the TT-2145 regression this codebase already learned from once: a
     /// null signature triple must deserialize into `ConnectorPollResponse` and reach
     /// `handle_flow_admission` as a considered refusal, not fail JSON extraction outright - now at
     /// this module's own deserialization boundary instead of an axum-extracted request, since
     /// that's where the equivalent risk moved to once Gatekeeper stopped calling into the Connector
     /// directly.
-    #[tokio::test]
-    async fn a_null_signature_triple_in_a_polled_admission_gets_a_real_refusal_not_a_parse_failure()
-    {
-        let (state, _rx) = state();
+    #[test]
+    fn a_null_signature_triple_in_a_polled_admission_deserializes_as_a_considered_refusal_not_a_parse_failure()
+     {
         let raw = serde_json::json!({
             "type": "admission",
             "admission": {
@@ -365,41 +669,74 @@ mod tests {
         });
         let message: ConnectorPollResponse = serde_json::from_value(raw)
             .expect("a null signature triple must deserialize, not fail parsing");
+        assert_eq!(message.kind, "admission");
+        assert!(message.admission.is_some());
+    }
 
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/connector/c-1/admission-result"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
-        let base_url = format!("{}/api/connector/c-1", server.uri());
-
-        handle_message(&reqwest::Client::new(), &base_url, "n-1", &state, message).await;
-
-        let requests = server.received_requests().await.unwrap();
-        let result_call = requests
-            .iter()
-            .find(|r| r.url.path() == "/api/connector/c-1/admission-result")
-            .expect("admission-result must have been posted back");
-        let body: serde_json::Value = serde_json::from_slice(&result_call.body).unwrap();
-        assert_eq!(body["decision"], "refuse");
-        assert_eq!(body["reason"], "invalid_signature");
+    /// Spawns a loopback HTTP/1.1 server standing in for Gatekeeper, and returns the address/port
+    /// pair to pass as `handle_admission`/`handle_message`'s `gatekeeper_addr`/
+    /// `gatekeeper_http_port` - what makes this module's real network-calling code (not just
+    /// `connect_registered`/`send_once` in isolation) exercisable in a test process at all, since
+    /// the real `GATEKEEPER_WG0_ADDRESS` constant has no route to it without an actual TUN device.
+    /// `on_admission_result` receives each posted-back `FlowAdmissionResponse` body, for tests that
+    /// need to assert on what was actually sent.
+    async fn spawn_mock_gatekeeper(
+        on_admission_result: impl Fn(serde_json::Value) + Send + Sync + 'static,
+    ) -> (Ipv4Addr, u16) {
+        let on_admission_result = std::sync::Arc::new(on_admission_result);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let on_admission_result = on_admission_result.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(move |req: Request<Incoming>| {
+                                let on_admission_result = on_admission_result.clone();
+                                async move {
+                                    if req.uri().path().ends_with("/admission-result") {
+                                        let body =
+                                            req.into_body().collect().await.unwrap().to_bytes();
+                                        let parsed: serde_json::Value =
+                                            serde_json::from_slice(&body).unwrap();
+                                        on_admission_result(parsed);
+                                    }
+                                    Ok::<_, std::convert::Infallible>(
+                                        Response::builder()
+                                            .status(204)
+                                            .body(
+                                                Empty::<Bytes>::new()
+                                                    .map_err(|never: std::convert::Infallible| {
+                                                        match never {}
+                                                    })
+                                                    .boxed(),
+                                            )
+                                            .unwrap(),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (Ipv4Addr::new(127, 0, 0, 1), port)
     }
 
     #[tokio::test]
-    async fn an_admitted_flow_hands_a_reclaimed_pending_packet_back_over_the_recovered_channel() {
+    async fn an_admitted_flow_hands_a_reclaimed_pending_packet_back_over_the_recovered_channel_and_posts_the_result()
+     {
         let (state, mut rx) = state();
-        // MockServer::start() does real network I/O (binding a TCP listener) and can occasionally
-        // take a noticeable moment under a large parallel test run - set it up *before* buffering
-        // the pending packet, not after, so the 300ms TTL clock only starts once everything else
-        // is already ready and the only thing left is the actual admission call.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/connector/c-1/admission-result"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
-        let base_url = format!("{}/api/connector/c-1", server.uri());
+        let posted = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let posted_writer = posted.clone();
+        let (gatekeeper_addr, gatekeeper_port) =
+            spawn_mock_gatekeeper(move |body| posted_writer.lock().unwrap().push(body)).await;
         // Warms the audit log's lazy first-write path (file creation, tokio's blocking-thread-pool
         // cold start) outside the timed window below - otherwise that one-time cost can occasionally
         // eat enough of the 300ms TTL under a large parallel test run to make this flaky for reasons
@@ -447,12 +784,11 @@ mod tests {
         // nothing to do with whether the reclaim wiring itself is correct. Retried a few times
         // with a fresh buffer+flow_id each attempt rather than lengthened, since the TTL itself is
         // a fixed production value this test must exercise as-is, not something to relax.
-        let http = reqwest::Client::new();
         let mut recovered = None;
         for attempt in 0..5 {
             let flow_id = format!("flow-{attempt}");
             let request = FlowAdmissionRequest {
-                flow_id,
+                flow_id: flow_id.clone(),
                 gateway_id: "gw-1".to_string(),
                 node_id: "n-1".to_string(),
                 port: 51820,
@@ -466,7 +802,15 @@ mod tests {
                 vec![9, 8, 7],
                 std::time::Instant::now(),
             );
-            handle_admission(&http, &base_url, "n-1", &state, Some(request)).await;
+            handle_admission(
+                "n-1",
+                gatekeeper_addr,
+                gatekeeper_port,
+                "c-1",
+                &state,
+                Some(request),
+            )
+            .await;
             if let Ok(result) = rx.try_recv() {
                 recovered = Some(result);
                 break;
@@ -478,11 +822,21 @@ mod tests {
         );
         assert_eq!(recovered_node_id, "n-1");
         assert_eq!(recovered_packet, vec![9, 8, 7]);
+        assert_eq!(
+            posted.lock().unwrap().last().unwrap()["decision"],
+            "admit",
+            "the admission decision must also have been posted back to Gatekeeper over the real network path"
+        );
     }
 
     #[tokio::test]
-    async fn a_refused_admission_does_not_forward_a_pending_packet() {
+    async fn a_refused_admissions_decision_never_reclaims_a_pending_packet_but_still_posts_the_refusal()
+     {
         let (state, mut rx) = state();
+        let posted = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let posted_writer = posted.clone();
+        let (gatekeeper_addr, gatekeeper_port) =
+            spawn_mock_gatekeeper(move |body| posted_writer.lock().unwrap().push(body)).await;
         state.flow_table.lock().unwrap().buffer_pending_packet(
             "n-1",
             51820,
@@ -498,18 +852,12 @@ mod tests {
             signature: None,
             signed_data: None,
         };
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/connector/c-1/admission-result"))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
-        let base_url = format!("{}/api/connector/c-1", server.uri());
 
         handle_admission(
-            &reqwest::Client::new(),
-            &base_url,
             "n-1",
+            gatekeeper_addr,
+            gatekeeper_port,
+            "c-1",
             &state,
             Some(request),
         )
@@ -519,6 +867,7 @@ mod tests {
             rx.try_recv().is_err(),
             "a refused flow's buffered packet must never be handed back for forwarding"
         );
+        assert_eq!(posted.lock().unwrap().last().unwrap()["decision"], "refuse");
     }
 
     #[tokio::test]
@@ -566,9 +915,10 @@ mod tests {
         let (state, _rx) = state();
 
         handle_message(
-            &reqwest::Client::new(),
-            "http://unused",
             "n-1",
+            Ipv4Addr::new(127, 0, 0, 1),
+            4000,
+            "c-1",
             &state,
             ConnectorPollResponse {
                 kind: "none".to_string(),
@@ -577,7 +927,7 @@ mod tests {
             },
         )
         .await;
-        // No assertion beyond "this returns without touching anything" - covered by the absence of
-        // any mock server needing to be hit at all.
+        // No assertion beyond "this returns without touching anything or attempting a network
+        // call" - covered by the absence of any listener needing to be hit at all.
     }
 }

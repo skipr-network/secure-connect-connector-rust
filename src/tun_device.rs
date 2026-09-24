@@ -32,6 +32,15 @@ use tun::AbstractDevice;
 /// back through the tunnel (TT-1734 gap #6).
 const GATEKEEPER_WG0_SUBNET: &str = "10.66.66.0/24";
 
+/// Gatekeeper's own address on that same `wg0` interface (TT-2144) - what
+/// `admission_poller` actually dials to reach Gatekeeper's flow-admission
+/// poll/admission-result endpoints *within* the Connector<->Node tunnel (spec
+/// §B.8), rather than Gatekeeper's public IP directly. Reachable once this
+/// module's own `add_gatekeeper_return_route` below has run - exported from
+/// here, not redefined in `admission_poller`, so the one fixed address this
+/// whole return-route mechanism exists for has exactly one source of truth.
+pub const GATEKEEPER_WG0_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 66, 66, 1);
+
 pub struct TunReader {
     inner: tun::DeviceReader,
 }

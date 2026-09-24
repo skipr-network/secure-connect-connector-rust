@@ -30,6 +30,19 @@ boringtun = { version = "0.7.1", default-features = false }
 tun = { version = "0.8.14", features = ["async"] }
 x509-parser = "0.18"
 futures-util = "0.3"
+# TT-2144: admission_poller's flow-admission/release control channel now dials Gatekeeper's own
+# wg0 tunnel address (see admission_poller.rs's module doc) over a connection whose *local port*
+# must be known before any traffic flows on it (so it can be registered against the owning node in
+# flow_table, for the reply path - see FlowTable::record_control_channel_port). reqwest's Client
+# has no way to expose that, so this drives the connection at hyper's lower level instead, over a
+# TcpStream this module connects (and inspects) itself. Already resolved transitively at these
+# exact versions via reqwest's own hyper-based stack (Cargo.lock) - this adds no new dependency to
+# the tree, just direct names (and the http1-client-only feature set actually used) for crates
+# already being built.
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 # TT-2027 review finding #2: reads the OS trust store purely to log how many anchors it found -
 # already resolved transitively via reqwest's rustls-tls-native-roots feature (Cargo.lock), so this
 # adds no new dependency to the tree, just a direct name for a crate already being built.
@@ -39,7 +52,6 @@ rustls-native-certs = "0.8"
 wiremock = "0.6"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 # Test-only: both already in the tree transitively via reqwest's rustls-tls backend (Cargo.lock
 # already resolves tokio-rustls 0.26.4) - used to spin up a real TLS server in ca_trust's tests so
