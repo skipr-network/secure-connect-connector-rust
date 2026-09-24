@@ -135,6 +135,28 @@ pub struct FlowTable {
     /// unboundedly over a long uptime without needing real TCP-close detection.
     control_channel_ports: HashMap<u16, String>,
     control_channel_port_order: VecDeque<u16>,
+    /// `port -> node_id` for the reverse direction (TT-2144): this Connector's OWN chosen local
+    /// port when IT dials out to Gatekeeper (`admission_poller`'s poll/admission-result calls),
+    /// not Gatekeeper's port as seen from an inbound connection. Genuinely a different mapping
+    /// from `control_channel_ports` above, not just the same data recorded earlier: an outbound
+    /// packet on one of these connections carries this port as its own *source* port, never its
+    /// destination - the destination is Gatekeeper's fixed HTTP port, identical across every node
+    /// (see the module doc's masquerading note), which by itself carries zero information about
+    /// which node a brand new outbound connection is even for. `run_tun_send_loop` needs a lookup
+    /// keyed the opposite way from `control_channel_ports`'s own destination-port lookup to route
+    /// such a connection's packets to the right node's tunnel at all - see
+    /// `node_for_outbound_control_channel_source_port`.
+    ///
+    /// Recorded by `admission_poller::connect_registered` *before* the connection's `connect()`
+    /// call ever sends a SYN (not after, the way `control_channel_ports` above is recorded after
+    /// its own triggering packet already arrived) - the local port must already be known and
+    /// routable before the very first packet of the connection exists, or that first packet has
+    /// nothing to match against and is dropped as an "unroutable outbound packet", which is
+    /// exactly the bug this mechanism exists to fix. Same bounded-FIFO eviction shape as
+    /// `control_channel_ports` and for the same reason (no explicit "I'm done" signal for a
+    /// one-shot HTTP exchange).
+    outbound_control_channel_ports: HashMap<u16, String>,
+    outbound_control_channel_port_order: VecDeque<u16>,
     /// A decrypted packet that lost the race against its own flow's admission decision (see
     /// `PENDING_PACKET_TTL`'s doc) - held here briefly instead of being dropped outright, so
     /// `take_pending_packet` can hand it back for forwarding if admission catches up in time.
@@ -154,24 +176,36 @@ impl FlowTable {
         Self::default()
     }
 
+    /// Shared bounded-FIFO insert behind both `control_channel_ports` and
+    /// `outbound_control_channel_ports` - identical eviction shape, different map/order pair.
+    fn record_bounded_port(
+        map: &mut HashMap<u16, String>,
+        order: &mut VecDeque<u16>,
+        node_id: &str,
+        port: u16,
+    ) {
+        if map.insert(port, node_id.to_string()).is_none() {
+            order.push_back(port);
+            if order.len() > MAX_TRACKED_CONTROL_CHANNEL_PORTS
+                && let Some(oldest) = order.pop_front()
+            {
+                map.remove(&oldest);
+            }
+        }
+    }
+
     /// Records that a direct connection to this Connector's own control-plane API on `port`
     /// belongs to `node_id`, so a reply on that port can be routed back to the right node (TT-2102).
     /// Safe to call repeatedly for the same port (a retried request reusing it, or the OS handing
     /// out a recently-freed ephemeral port again) - always just overwrites in place without
     /// growing `control_channel_port_order`.
     pub fn record_control_channel_port(&mut self, node_id: &str, port: u16) {
-        if self
-            .control_channel_ports
-            .insert(port, node_id.to_string())
-            .is_none()
-        {
-            self.control_channel_port_order.push_back(port);
-            if self.control_channel_port_order.len() > MAX_TRACKED_CONTROL_CHANNEL_PORTS
-                && let Some(oldest) = self.control_channel_port_order.pop_front()
-            {
-                self.control_channel_ports.remove(&oldest);
-            }
-        }
+        Self::record_bounded_port(
+            &mut self.control_channel_ports,
+            &mut self.control_channel_port_order,
+            node_id,
+            port,
+        );
     }
 
     /// The node a reply on this control-channel port should route back to, if any was ever
@@ -179,6 +213,31 @@ impl FlowTable {
     /// own port - those are answered by `node_for_port` instead, never this.
     pub fn node_for_control_channel_port(&self, port: u16) -> Option<&str> {
         self.control_channel_ports.get(&port).map(String::as_str)
+    }
+
+    /// Records that `port` is this Connector's own local port for a connection it is itself
+    /// dialing out to Gatekeeper on `node_id`'s behalf (TT-2144) - see
+    /// `outbound_control_channel_ports`'s doc for why this is a genuinely different mapping from
+    /// `record_control_channel_port` above, not a duplicate. Same overwrite-in-place/no-growth
+    /// behavior on a repeated port for the same reasons.
+    pub fn record_outbound_control_channel_port(&mut self, node_id: &str, port: u16) {
+        Self::record_bounded_port(
+            &mut self.outbound_control_channel_ports,
+            &mut self.outbound_control_channel_port_order,
+            node_id,
+            port,
+        );
+    }
+
+    /// The node an outbound packet whose own *source* port is `port` belongs to, if this
+    /// Connector itself registered that port for a connection it dialed out (TT-2144). Checked
+    /// against a packet's source port, never its destination - see
+    /// `outbound_control_channel_ports`'s doc for why the destination alone can't disambiguate
+    /// this direction at all.
+    pub fn node_for_outbound_control_channel_source_port(&self, port: u16) -> Option<&str> {
+        self.outbound_control_channel_ports
+            .get(&port)
+            .map(String::as_str)
     }
 
     pub fn admit(
@@ -558,6 +617,89 @@ mod tests {
         );
         assert_eq!(
             table.node_for_control_channel_port(MAX_TRACKED_CONTROL_CHANNEL_PORTS as u16),
+            Some("n-1")
+        );
+    }
+
+    #[test]
+    fn outbound_control_channel_port_has_no_node_until_recorded() {
+        let table = FlowTable::new();
+
+        assert!(
+            table
+                .node_for_outbound_control_channel_source_port(51234)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_recorded_outbound_control_channel_port_resolves_to_its_node() {
+        let mut table = FlowTable::new();
+
+        table.record_outbound_control_channel_port("n-1", 51234);
+
+        assert_eq!(
+            table.node_for_outbound_control_channel_source_port(51234),
+            Some("n-1")
+        );
+    }
+
+    /// The inbound and outbound mappings are genuinely separate state, not two views of the same
+    /// data - a port recorded for one direction must never resolve through the other's lookup,
+    /// since the two directions key on opposite fields of a packet (destination vs. source port)
+    /// for reasons that would silently misroute a real packet if the tables were ever conflated.
+    #[test]
+    fn an_inbound_control_channel_port_and_an_outbound_one_are_independent_even_at_the_same_port_number()
+     {
+        let mut table = FlowTable::new();
+
+        table.record_control_channel_port("n-1", 51234);
+        table.record_outbound_control_channel_port("n-2", 51234);
+
+        assert_eq!(table.node_for_control_channel_port(51234), Some("n-1"));
+        assert_eq!(
+            table.node_for_outbound_control_channel_source_port(51234),
+            Some("n-2")
+        );
+    }
+
+    #[test]
+    fn re_recording_an_outbound_control_channel_port_for_a_different_node_overwrites_it() {
+        let mut table = FlowTable::new();
+        table.record_outbound_control_channel_port("n-1", 51234);
+
+        table.record_outbound_control_channel_port("n-2", 51234);
+
+        assert_eq!(
+            table.node_for_outbound_control_channel_source_port(51234),
+            Some("n-2")
+        );
+    }
+
+    #[test]
+    fn the_oldest_outbound_control_channel_port_is_evicted_once_the_cap_is_exceeded() {
+        let mut table = FlowTable::new();
+        for port in 0..MAX_TRACKED_CONTROL_CHANNEL_PORTS as u16 {
+            table.record_outbound_control_channel_port("n-1", port);
+        }
+        assert!(
+            table
+                .node_for_outbound_control_channel_source_port(0)
+                .is_some()
+        );
+
+        table.record_outbound_control_channel_port("n-1", MAX_TRACKED_CONTROL_CHANNEL_PORTS as u16);
+
+        assert!(
+            table
+                .node_for_outbound_control_channel_source_port(0)
+                .is_none(),
+            "the oldest entry must be evicted once the cap is exceeded"
+        );
+        assert_eq!(
+            table.node_for_outbound_control_channel_source_port(
+                MAX_TRACKED_CONTROL_CHANNEL_PORTS as u16
+            ),
             Some("n-1")
         );
     }

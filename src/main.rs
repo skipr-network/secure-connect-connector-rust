@@ -854,6 +854,20 @@ fn prepare_reply_packet_for_forwarding(
         return Some(node_id.to_string());
     }
 
+    // TT-2144: this Connector's OWN outbound connection to Gatekeeper's tunnel address (the
+    // admission poller's poll/admission-result calls) - matched on this packet's own *source*
+    // port, never destination_port above (which is Gatekeeper's fixed HTTP port, identical across
+    // every node, and so carries no information at all about which node a brand new outbound
+    // connection is even for - see `FlowTable::outbound_control_channel_ports`'s doc). Needs no
+    // address rewrite either, for the same reason as the branch above: this connection's own
+    // packets already carry this Connector's real (connector_virtual_ip) source address, nothing
+    // masqueraded to restore.
+    if let Some(source_port) = tunnel::parse_source_port(packet)
+        && let Some(node_id) = flow_table.node_for_outbound_control_channel_source_port(source_port)
+    {
+        return Some(node_id.to_string());
+    }
+
     let node_id = match flow_table.node_for_port(destination_port) {
         Some(node_id) => node_id.to_string(),
         None => {
@@ -1296,6 +1310,74 @@ mod tests {
 
         assert_eq!(node_id, Some("n-1".to_string()));
         assert_eq!(packet, original);
+    }
+
+    /// TT-2144 regression test: proves the actual production bug (admission_poller's own outbound
+    /// connection to Gatekeeper never routed to the right node, since destination_port - the
+    /// packet's own destination port - is the SAME fixed value (Gatekeeper's HTTP port) for every
+    /// node, and carries no information about which one a brand new outbound connection is even
+    /// for) is fixed: this Connector's own outbound packet, on a connection whose *source* port
+    /// was registered via `record_outbound_control_channel_port`, must resolve to that node
+    /// through this new source-port-keyed lookup - the destination-port-keyed
+    /// `node_for_control_channel_port` (checked first, and correctly returns None here) can never
+    /// match it, by construction, since nothing was ever recorded under the destination port.
+    #[test]
+    fn prepare_reply_packet_routes_a_locally_initiated_outbound_connections_packet_via_its_own_source_port()
+     {
+        let mut flow_table = FlowTable::new();
+        flow_table.record_outbound_control_channel_port("n-1", 54321);
+        // Gatekeeper's fixed HTTP port - identical regardless of which node this packet is
+        // actually for, which is exactly the fact that makes the destination-port lookup useless
+        // here and the source-port one necessary.
+        let gatekeeper_http_port = 4000;
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 98, 0, 5), // this Connector's own connector_virtual_ip
+            std::net::Ipv4Addr::new(10, 66, 66, 1), // Gatekeeper's fixed tunnel address
+            54321,                                 // this connection's own registered local port
+            gatekeeper_http_port,
+        );
+        let original = packet.clone();
+
+        let node_id =
+            prepare_reply_packet_for_forwarding(&mut packet, gatekeeper_http_port, &flow_table);
+
+        assert_eq!(node_id, Some("n-1".to_string()));
+        assert_eq!(
+            packet, original,
+            "this Connector's own outbound packet already carries its real address - no rewrite needed"
+        );
+    }
+
+    /// The two directions must never be conflated even when the raw port number happens to
+    /// coincide - see `FlowTable`'s own test of the same property; this proves it holds through
+    /// `prepare_reply_packet_for_forwarding`'s actual lookup order too; the inbound
+    /// (destination-port-keyed) mapping takes precedence when both happen to have an entry at the
+    /// same numeric port, matching the existing control-channel-vs-admitted-flow precedence test
+    /// above.
+    #[test]
+    fn prepare_reply_packet_prefers_the_inbound_control_channel_mapping_over_an_outbound_one_at_the_same_port_number()
+     {
+        let mut flow_table = FlowTable::new();
+        flow_table.record_control_channel_port("n-1", 51234);
+        flow_table.record_outbound_control_channel_port("n-2", 51234);
+        // Source AND destination both 51234, so BOTH the inbound (destination-port-keyed) and
+        // outbound (source-port-keyed) lookups below have a real, distinct candidate to match -
+        // without this, one of the two branches could never have matched this packet at all
+        // regardless of lookup order, and this test would prove nothing about precedence.
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 98, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            51234,
+            51234,
+        );
+
+        let node_id = prepare_reply_packet_for_forwarding(&mut packet, 51234, &flow_table);
+
+        assert_eq!(
+            node_id,
+            Some("n-1".to_string()),
+            "the inbound (destination-port) mapping, checked first, must take precedence"
+        );
     }
 
     #[test]

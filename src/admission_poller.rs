@@ -20,30 +20,44 @@
 //! `wg0` interface this Connector is itself a peer on), never `node.ip_address` (Gatekeeper's
 //! public IP) directly. The kernel route `tun_device::create` already installs for that address
 //! (`ip route replace 10.66.66.0/24 dev <tun-iface>`, originally added for the pre-TT-2144 reply
-//! path - TT-1734 gap #6) means a plain `TcpStream::connect` to it is transparently carried through
+//! path - TT-1734 gap #6) means a plain TCP connection to it is transparently carried through
 //! this Connector's TUN device and the existing `run_tun_send_loop`/`run_wireguard_receive_loop`
 //! machinery, out over the real encrypted WireGuard tunnel to that specific Node's Gatekeeper - no
-//! new userspace TCP stack needed, just dialing the address that's already routed correctly.
+//! new userspace TCP stack needed, just dialing the address that's already routed correctly. (See
+//! `connect_registered`'s own doc for why that connection is driven via a bound `TcpSocket`
+//! rather than a plain `TcpStream::connect` - routing that very first outbound packet correctly
+//! needs one more piece than the route alone, below.)
 //! (An earlier version of this module dialed `node.ip_address` directly instead, over the plain
 //! network - a real, since-corrected deviation from this spec line, confirmed by reading it
 //! directly rather than assumed; see the ticket's own quoted text.)
 //!
 //! **Why this module drives HTTP at `hyper`'s lower level instead of through `reqwest::Client`
-//! (as `heartbeat.rs`/`registry_client.rs` do)**: routing a reply back to the right Node is
-//! `run_tun_send_loop`'s job (`prepare_reply_packet_for_forwarding`), and every Node's Gatekeeper
-//! shares the identical destination address `10.66.66.1` from this Connector's point of view (the
-//! module doc's "fixed and identical across the whole fleet" - same masquerading `flow_table`
-//! already relies on for gateway virtual addresses) - so the only signal left to disambiguate
-//! *which* Node a reply belongs to is this connection's own local source port, which must be
-//! learned and registered (`FlowTable::record_control_channel_port`, reusing the exact TT-2102
-//! mechanism the old reactive/Gatekeeper-initiated model already had for the same reason) *before*
-//! any request goes out on it - not after, or a fast-enough reply could arrive unroutable.
-//! `reqwest::Client` manages connections internally and has no way to expose an unsent connection's
-//! local port for this; a `TcpStream` this module connects (and inspects) itself does. One
-//! connection per call (matching `control_channel_ports`' own doc: "these are short-lived one-shot
-//! HTTP exchanges, not long-lived sessions") - not pooled/reused, deliberately, so this stays simple
-//! and each call registers its own port fresh rather than reasoning about a shared connection's
-//! lifetime against the bounded-FIFO eviction that mechanism already has.
+//! (as `heartbeat.rs`/`registry_client.rs` do)**: routing one of THIS connection's OWN outbound
+//! packets to the right Node's tunnel is `run_tun_send_loop`'s job, and (unlike an ordinary
+//! forwarded user flow, or a reply to something Gatekeeper dialed in for) there is nothing in
+//! such a packet for it to key on except this connection's own local *source* port - every Node's
+//! Gatekeeper shares the identical destination address `10.66.66.1`:`gatekeeper_http_port` from
+//! this Connector's point of view (the module doc's "fixed and identical across the whole fleet" -
+//! same masquerading `flow_table` already relies on for gateway virtual addresses), so the
+//! destination alone carries zero information about which Node a brand new connection is even
+//! for. The local port has to be known and registered
+//! (`FlowTable::record_outbound_control_channel_port` - deliberately its OWN mapping, not reused
+//! from TT-2102's `control_channel_ports`, since that one keys on the opposite field for the
+//! opposite direction; see `outbound_control_channel_ports`'s own doc) strictly *before* this
+//! connection's very first packet (the SYN) is sent - not merely before the request, and not
+//! "after connect() resolves": `TcpStream::connect().await` doesn't return until the full
+//! three-way handshake already completed, so learning the port from an already-connected
+//! `TcpStream` is *always* too late - by then, an unregistered SYN has already gone out and
+//! already been dropped, and no reply can ever arrive to bootstrap that registration once. (A
+//! real bug of exactly this shape shipped once and was caught here in review - see
+//! `connect_registered`'s own doc for the fix: bind to port 0 first, register, only then
+//! `connect()`.) `reqwest::Client` manages connections internally with no way to expose an
+//! unconnected socket's bound-but-not-yet-dialed local port for this; a `TcpSocket` this module
+//! binds (and inspects) itself does. One connection per call (matching
+//! `outbound_control_channel_ports`' own doc: "these are short-lived one-shot HTTP exchanges, not
+//! long-lived sessions") - not pooled/reused, deliberately, so this stays simple and each call
+//! registers its own port fresh rather than reasoning about a shared connection's lifetime against
+//! the bounded-FIFO eviction that mechanism already has.
 //!
 //! Poller lifecycle is deliberately independent of `TunnelManager`'s tunnel-established state, and
 //! of whether the TUN device (and its Gatekeeper return route) exists yet at all (`sync` below runs
@@ -166,27 +180,40 @@ impl Drop for AdmissionPollers {
     }
 }
 
-/// Connects a fresh `TcpStream` to `gatekeeper_addr:port` and registers its local port against
-/// `node_id` *before* returning it - see the module doc's "why hyper's lower level" section for why
-/// this ordering (register, then ever send anything) is the entire point. `gatekeeper_addr` is
-/// always `GATEKEEPER_WG0_ADDRESS` in production (every real call site below passes it
-/// unconditionally) - a parameter here, not a hardcoded constant, purely so tests can point this at
-/// a loopback listener instead: `GATEKEEPER_WG0_ADDRESS` has no route to it at all in a plain test
-/// process (no real TUN device), so hardcoding it here would make every network-calling function in
-/// this module untestable rather than just the handful of lines that actually need a real tunnel.
+/// Connects a fresh `TcpStream` to `gatekeeper_addr:port`, registering its local port against
+/// `node_id` *before* the connection's very first packet (the SYN) is ever sent - not after
+/// `connect()` resolves, which is too late: `run_tun_send_loop` (`main.rs`) needs this
+/// registration to route that very first outbound packet to the right node's tunnel at all (see
+/// `FlowTable::outbound_control_channel_ports`'s doc), and `TcpStream::connect().await` doesn't
+/// return control to this function until the full three-way handshake has already completed -
+/// i.e. only *after* a SYN this registration was supposed to make routable has already gone out
+/// and (without it) already been dropped. Binds a `TcpSocket` to `0.0.0.0:0` first instead - the
+/// OS assigns the local port synchronously, at `bind()`, a purely local kernel operation with no
+/// network I/O - so the assigned port is known, and can be registered, strictly before `connect()`
+/// is ever called and a single packet leaves.
+///
+/// `gatekeeper_addr` is always `GATEKEEPER_WG0_ADDRESS` in production (every real call site below
+/// passes it unconditionally) - a parameter here, not a hardcoded constant, purely so tests can
+/// point this at a loopback listener instead: `GATEKEEPER_WG0_ADDRESS` has no route to it at all
+/// in a plain test process (no real TUN device), so hardcoding it here would make every
+/// network-calling function in this module untestable rather than just the handful of lines that
+/// actually need a real tunnel.
 async fn connect_registered(
     node_id: &str,
     flow_table: &std::sync::Mutex<crate::flow_table::FlowTable>,
     gatekeeper_addr: Ipv4Addr,
     port: u16,
 ) -> std::io::Result<TcpStream> {
-    let stream = TcpStream::connect(SocketAddr::new(IpAddr::V4(gatekeeper_addr), port)).await?;
-    let local_port = stream.local_addr()?.port();
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    let local_port = socket.local_addr()?.port();
     flow_table
         .lock()
         .expect("flow table lock poisoned")
-        .record_control_channel_port(node_id, local_port);
-    Ok(stream)
+        .record_outbound_control_channel_port(node_id, local_port);
+    socket
+        .connect(SocketAddr::new(IpAddr::V4(gatekeeper_addr), port))
+        .await
 }
 
 /// A request body that's either empty (GET) or a small fixed JSON payload (POST) - boxed to one
@@ -521,73 +548,110 @@ mod tests {
         );
     }
 
-    /// A real TCP round trip through a loopback listener standing in for Gatekeeper's tunnel
-    /// address - proves `connect_registered` really does learn and record the connection's own
-    /// local port *before* any request is sent, which is the entire mechanism the reply path
-    /// depends on (see the module doc). Can't dial the real `GATEKEEPER_WG0_ADDRESS` constant in a
-    /// test process (no route to it without a real TUN device), so this exercises
-    /// `connect_registered`/`send_once` directly against a loopback server instead of through
-    /// `run_poller`'s hardcoded address.
+    /// Exercises `connect_registered` itself (not a hand-rolled stand-in) against a loopback
+    /// listener - proves the local port it registers is really the connection's own (matches what
+    /// the server observed as the peer's port), and - the actual point of the whole mechanism -
+    /// that it's registered under `node_for_outbound_control_channel_source_port` (the lookup
+    /// `main.rs`'s `run_tun_send_loop` uses for this Connector's own outbound packets), not the
+    /// unrelated `node_for_control_channel_port` (keyed the opposite way, for the opposite,
+    /// Gatekeeper-dials-in direction - see both doc comments). Can't dial the real
+    /// `GATEKEEPER_WG0_ADDRESS` constant in a test process (no route to it without a real TUN
+    /// device), so this points `connect_registered` at a loopback address instead.
     #[tokio::test]
-    async fn connect_registered_records_the_connections_own_local_port_before_any_request_is_sent()
-    {
+    async fn connect_registered_registers_the_connections_own_local_port_as_an_outbound_one() {
         let (state, _rx) = state();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            hyper::server::conn::http1::Builder::new()
-                .serve_connection(
-                    io,
-                    hyper::service::service_fn(|_req: Request<Incoming>| async {
-                        Ok::<_, std::convert::Infallible>(Response::new(
-                            Full::new(Bytes::from_static(b"{\"type\":\"none\"}"))
-                                .map_err(|never: std::convert::Infallible| match never {})
-                                .boxed(),
-                        ))
-                    }),
-                )
-                .await
-                .unwrap();
+        let observed_peer_port = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            drop(stream);
+            peer_addr.port()
         });
 
-        let stream = TcpStream::connect(("127.0.0.1", server_port))
-            .await
-            .unwrap();
+        let stream = connect_registered(
+            "n-1",
+            &state.flow_table,
+            Ipv4Addr::new(127, 0, 0, 1),
+            server_port,
+        )
+        .await
+        .unwrap();
         let local_port = stream.local_addr().unwrap().port();
-        state
-            .flow_table
-            .lock()
-            .unwrap()
-            .record_control_channel_port("n-1", local_port);
-        let request = Request::builder()
-            .method("GET")
-            .uri("/")
-            .header("Host", format!("127.0.0.1:{server_port}"))
-            .body(
-                Empty::<Bytes>::new()
-                    .map_err(|never| match never {})
-                    .boxed(),
-            )
-            .unwrap();
 
-        let (status, body) = send_once(stream, request, Duration::from_secs(5))
-            .await
-            .unwrap();
-
-        assert!(status.is_success());
-        assert_eq!(&body[..], b"{\"type\":\"none\"}");
+        assert_eq!(
+            observed_peer_port.await.unwrap(),
+            local_port,
+            "the port connect_registered records must really be this connection's own local port"
+        );
         assert_eq!(
             state
                 .flow_table
                 .lock()
                 .unwrap()
-                .node_for_control_channel_port(local_port),
+                .node_for_outbound_control_channel_source_port(local_port),
             Some("n-1"),
-            "the connection's own local port must be registered against its node before any \
-             request goes out on it, so a reply on that port routes back correctly"
+            "must be registered as an OUTBOUND control-channel port (source-port keyed) - the \
+             mechanism run_tun_send_loop actually looks up for this Connector's own outbound \
+             packets, not node_for_control_channel_port (the opposite, Gatekeeper-dials-in \
+             direction)"
         );
+        assert!(
+            state
+                .flow_table
+                .lock()
+                .unwrap()
+                .node_for_control_channel_port(local_port)
+                .is_none(),
+            "must NOT be registered under the unrelated inbound mapping"
+        );
+    }
+
+    /// Regression test for the actual production bug this whole mechanism exists to prevent:
+    /// registering a connection's local port only *after* `connect()` resolves is always too
+    /// late, since nothing routes the SYN that `connect()` itself needs to send until the
+    /// registration already happened. `connect_registered` fixes this by binding (which assigns
+    /// the local port synchronously, no network I/O) and registering *before* ever calling
+    /// `connect()` - this test proves that ordering holds by registering nothing else in between:
+    /// if `connect_registered` ever regressed to registering after connecting instead, the
+    /// `flow_table` lookup inside the accept handler below (running concurrently, so it only ever
+    /// observes state as it stood at whatever point the connection is far enough along for the
+    /// peer to have been accepted) could race ahead of it. Run many times to make a race with any
+    /// real chance of manifesting.
+    #[tokio::test]
+    async fn connect_registered_has_already_registered_the_port_by_the_time_the_peer_can_accept_the_connection()
+     {
+        for _ in 0..50 {
+            let (state, _rx) = state();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_port = listener.local_addr().unwrap().port();
+            let flow_table_for_server = state.flow_table.clone();
+            let accept_task = tokio::spawn(async move {
+                let (_stream, peer_addr) = listener.accept().await.unwrap();
+                // If registration happens strictly before connect() (the contract this test
+                // exists to enforce), this lookup - running the instant the peer is observably
+                // connected - must already see it; no sleep, no retry.
+                flow_table_for_server
+                    .lock()
+                    .unwrap()
+                    .node_for_outbound_control_channel_source_port(peer_addr.port())
+                    .map(str::to_string)
+            });
+
+            let _stream = connect_registered(
+                "n-1",
+                &state.flow_table,
+                Ipv4Addr::new(127, 0, 0, 1),
+                server_port,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                accept_task.await.unwrap().as_deref(),
+                Some("n-1"),
+                "the port must already be registered by the moment the peer sees the connection arrive"
+            );
+        }
     }
 
     /// Regression test for a real bug caught in review before this ever shipped: `send_once`
