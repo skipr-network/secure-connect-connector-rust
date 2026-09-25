@@ -379,9 +379,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
         }
 
@@ -398,9 +396,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("CONNECTOR_GATEKEEPER_WG0_ADDRESS", "10.66.66.9");
         }

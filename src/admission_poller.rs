@@ -828,6 +828,7 @@ mod tests {
             .policy_store
             .apply(crate::dto::ConnectorHeartbeatResponse {
                 connector_id: "c-1".to_string(),
+                connector_public_key: None,
                 connector_virtual_ip: Some("10.98.0.1".to_string()),
                 generated_at: "2026-08-27T10:00:00Z".to_string(),
                 expires_at: "2099-01-01T00:00:00Z".to_string(),

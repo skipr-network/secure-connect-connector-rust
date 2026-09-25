@@ -26,7 +26,7 @@ but the first `cargo build` here has no such fallback and fails outright with
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source $HOME/.cargo/env
+. $HOME/.cargo/env
 sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/skipr-network/secure-connect-connector-rust
 cd secure-connect-connector-rust

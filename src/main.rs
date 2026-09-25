@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
     let (recovered_packet_tx, recovered_packet_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
     let mut admission_pollers = AdmissionPollers::new(
-        config.connector_id.clone(),
+        connector_public_key.clone(),
         config.gatekeeper_http_port,
         config.gatekeeper_wg0_address,
         ControlPlaneState {
