@@ -298,6 +298,24 @@ impl FlowTable {
         for port in removed_ports {
             self.deindex(node_id, port);
         }
+        // TT-2297: a departed node's control-channel ports route to a tunnel that no longer
+        // exists - left in place, a packet matching one is dropped instead of reaching the node
+        // that now owns that port.
+        Self::forget_node_ports(
+            &mut self.control_channel_ports,
+            &mut self.control_channel_port_order,
+            node_id,
+        );
+        Self::forget_node_ports(
+            &mut self.outbound_control_channel_ports,
+            &mut self.outbound_control_channel_port_order,
+            node_id,
+        );
+    }
+
+    fn forget_node_ports(map: &mut HashMap<u16, String>, order: &mut VecDeque<u16>, node_id: &str) {
+        map.retain(|_, owner| owner != node_id);
+        order.retain(|port| map.contains_key(port));
     }
 
     /// Drops every currently-admitted flow for one device on one gateway
@@ -887,6 +905,35 @@ mod tests {
 
         assert!(table.gateway_for("n-1", 40001).is_none());
         assert!(table.gateway_for("n-1", 40002).is_none());
+    }
+
+    /// TT-2297: a departed node's control-channel ports must not keep routing to its (gone)
+    /// tunnel, and another node's entries must survive.
+    #[test]
+    fn evict_node_forgets_that_nodes_control_channel_ports_only() {
+        let mut table = FlowTable::new();
+        table.record_control_channel_port("n-1", 4000);
+        table.record_outbound_control_channel_port("n-1", 50001);
+        table.record_outbound_control_channel_port("n-2", 50002);
+
+        table.evict_node("n-1");
+
+        assert!(table.node_for_control_channel_port(4000).is_none());
+        assert!(
+            table
+                .node_for_outbound_control_channel_source_port(50001)
+                .is_none()
+        );
+        assert_eq!(
+            table.node_for_outbound_control_channel_source_port(50002),
+            Some("n-2")
+        );
+        table.record_outbound_control_channel_port("n-1", 50001);
+        assert_eq!(
+            table.node_for_outbound_control_channel_source_port(50001),
+            Some("n-1"),
+            "a forgotten port must be recordable again"
+        );
     }
 
     #[test]
