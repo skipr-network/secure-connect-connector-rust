@@ -85,8 +85,8 @@ use tracing::{error, info, warn};
 
 use crate::dto::HeartbeatNode;
 use crate::flow_control::{
-    ControlPlaneState, FlowAdmissionRequest, FlowReleaseRequest, handle_flow_admission,
-    handle_flow_release,
+    ControlPlaneState, DnsAdmissionRequest, DnsAdmissionResponse, FlowAdmissionRequest,
+    FlowReleaseRequest, handle_dns_admission, handle_flow_admission, handle_flow_release,
 };
 
 /// Backoff between poll attempts after a transport failure (connection refused, timeout, non-2xx
@@ -113,6 +113,8 @@ struct ConnectorPollResponse {
     kind: String,
     admission: Option<FlowAdmissionRequest>,
     release: Option<FlowReleaseRequest>,
+    /// TT-2227: DNS admission request - present when `kind == "dns_admission"`.
+    dns_admission: Option<DnsAdmissionRequest>,
 }
 
 /// Tracks one long-poll task per currently-paired Node, spawned/aborted to match each heartbeat's
@@ -371,6 +373,17 @@ async fn handle_message(
             )
             .await
         }
+        "dns_admission" => {
+            handle_dns(
+                node_id,
+                gatekeeper_addr,
+                gatekeeper_http_port,
+                connector_id,
+                state,
+                message.dns_admission,
+            )
+            .await
+        }
         "release" => handle_release(state, message.release).await,
         "none" => {}
         other => {
@@ -459,6 +472,75 @@ async fn handle_admission(
     };
     if let Err(error) = send_once(stream, request, RESULT_REQUEST_TIMEOUT).await {
         error!(%error, %node_id, %flow_id, "could not post admission result back to Gatekeeper - it will fail closed on its own timeout for this flow");
+    }
+}
+
+/// TT-2227: DNS admission — received as `type=dns_admission` over the Connector-initiated
+/// long-poll channel (same channel as `type=admission`/`type=release`). Calls
+/// `handle_dns_admission` from `flow_control` and posts the decision back to Gatekeeper over the
+/// same admission-result endpoint, keyed by a correlation id Gatekeeper supplied in the request.
+async fn handle_dns(
+    node_id: &str,
+    gatekeeper_addr: Ipv4Addr,
+    gatekeeper_http_port: u16,
+    connector_id: &str,
+    state: &ControlPlaneState,
+    request: Option<DnsAdmissionRequest>,
+) {
+    let Some(request) = request else {
+        error!(%node_id, "poll response claimed type=dns_admission but carried no dns_admission body - ignoring");
+        return;
+    };
+    let correlation_id = request.correlation_id.clone();
+    let response: DnsAdmissionResponse =
+        handle_dns_admission(&state.policy_store, &state.audit_log, request).await;
+
+    let result_path = format!("/api/connector/{connector_id}/admission-result");
+    let host_header = format!("{gatekeeper_addr}:{gatekeeper_http_port}");
+    let body = match serde_json::to_vec(&serde_json::json!({
+        "correlation_id": correlation_id,
+        "decision": response.decision,
+        "reason": response.reason,
+    })) {
+        Ok(body) => body,
+        Err(error) => {
+            error!(%error, %node_id, %correlation_id, "could not serialize the DNS admission result - it will fail closed on Gatekeeper's own timeout");
+            return;
+        }
+    };
+    let stream = match connect_registered(
+        node_id,
+        &state.flow_table,
+        gatekeeper_addr,
+        gatekeeper_http_port,
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            error!(%error, %node_id, %correlation_id, "could not reach Gatekeeper to post the DNS admission result - it will fail closed on its own timeout");
+            return;
+        }
+    };
+    let http_request = match Request::builder()
+        .method("POST")
+        .uri(&result_path)
+        .header("Host", &host_header)
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed(),
+        ) {
+        Ok(r) => r,
+        Err(error) => {
+            error!(%error, %node_id, %correlation_id, "failed to build the DNS admission-result request - programming error");
+            return;
+        }
+    };
+    if let Err(error) = send_once(stream, http_request, RESULT_REQUEST_TIMEOUT).await {
+        error!(%error, %node_id, %correlation_id, "could not post DNS admission result back to Gatekeeper - it will fail closed on its own timeout");
     }
 }
 
@@ -998,6 +1080,7 @@ mod tests {
                 kind: "none".to_string(),
                 admission: None,
                 release: None,
+                dns_admission: None,
             },
         )
         .await;
