@@ -104,7 +104,11 @@ if [ ! -f "$ENV_FILE" ]; then
 # Optional - each of these already has the documented default shown below and only needs
 # uncommenting if you want something other than that.
 #CONNECTOR_AUDIT_LOG_PATH=/var/skipr/connector/audit/audit.log
-#CONNECTOR_CONTROL_PLANE_PORT=8443
+# TT-2144: the flow-admission/release channel is Connector-initiated (the Connector polls out to
+# each paired Node's Gatekeeper) - no inbound port is opened for it, so there is nothing to open in
+# this host's own firewall for it. Only needs setting if a Gatekeeper deployment ever changes its
+# HTTP port away from the default below.
+#CONNECTOR_GATEKEEPER_HTTP_PORT=4000
 #CONNECTOR_TUN_NETMASK=255.255.255.0
 #HEARTBEAT_INTERVAL_SECONDS=60
 

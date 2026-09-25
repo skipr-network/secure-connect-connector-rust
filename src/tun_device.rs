@@ -22,16 +22,6 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tun::AbstractDevice;
 
-/// Gatekeeper's own `wg0` subnet - fixed and identical across the whole fleet
-/// (same assumption `flow_table`'s module doc already relies on for the
-/// masqueraded gateway address), never per-deployment configurable. A reply
-/// this Connector's local endpoints send back (e.g. the flow-admission HTTP
-/// server's own response) is addressed to a masqueraded source here
-/// (`10.66.66.1`) - without a route to it, the kernel falls through to the
-/// default route and the reply leaks out to the real internet instead of
-/// back through the tunnel (TT-1734 gap #6).
-const GATEKEEPER_WG0_SUBNET: &str = "10.66.66.0/24";
-
 pub struct TunReader {
     inner: tun::DeviceReader,
 }
@@ -43,14 +33,32 @@ pub struct TunWriter {
 /// Creates and brings up a TUN interface at `address`/`netmask`, returning
 /// separately-ownable read/write halves so each can live in its own async
 /// task without needing a shared lock - only one task ever reads, only one
-/// ever writes.
-pub fn create(address: Ipv4Addr, netmask: Ipv4Addr, mtu: u16) -> Result<(TunReader, TunWriter)> {
+/// ever writes. `gatekeeper_wg0_address` (`Config::gatekeeper_wg0_address`,
+/// TT-2144 review PR #21 - previously a hardcoded constant here) is what
+/// `add_gatekeeper_return_route` below installs a kernel route for, derived
+/// as that address's own /24 rather than a second, separately hardcoded
+/// subnet - one value to get right, not two.
+pub fn create(
+    address: Ipv4Addr,
+    netmask: Ipv4Addr,
+    mtu: u16,
+    gatekeeper_wg0_address: Ipv4Addr,
+) -> Result<(TunReader, TunWriter)> {
     let mut config = tun::Configuration::default();
     config.address(address).netmask(netmask).mtu(mtu).up();
     let device = tun::create_as_async(&config).context("failed to create TUN device")?;
-    add_gatekeeper_return_route(&device);
+    add_gatekeeper_return_route(&device, gatekeeper_wg0_address);
     let (writer, reader) = device.split().context("failed to split TUN device")?;
     Ok((TunReader { inner: reader }, TunWriter { inner: writer }))
+}
+
+/// `gatekeeper_wg0_address`'s own /24, e.g. `10.66.66.1` -> `10.66.66.0/24` - what
+/// `add_gatekeeper_return_route` installs a kernel route for. A plain string format
+/// (not an actual subnet/CIDR type) since the only consumer is `ip route replace`'s
+/// own argument list, which just wants text.
+fn subnet_slash_24(address: Ipv4Addr) -> String {
+    let [a, b, c, _] = address.octets();
+    format!("{a}.{b}.{c}.0/24")
 }
 
 /// Adds the kernel route a locally-terminating reply (e.g. the flow-admission
@@ -69,7 +77,7 @@ pub fn create(address: Ipv4Addr, netmask: Ipv4Addr, mtu: u16) -> Result<(TunRead
 /// at all should still come up rather than refuse to start over one missing
 /// return path - it'll just repeat the same "replies leak to the internet"
 /// failure until whoever's running it notices and fixes the environment.
-fn add_gatekeeper_return_route(device: &tun::AsyncDevice) {
+fn add_gatekeeper_return_route(device: &tun::AsyncDevice, gatekeeper_wg0_address: Ipv4Addr) {
     let interface_name = match device.tun_name() {
         Ok(name) => name,
         Err(error) => {
@@ -77,24 +85,19 @@ fn add_gatekeeper_return_route(device: &tun::AsyncDevice) {
             return;
         }
     };
+    let subnet = subnet_slash_24(gatekeeper_wg0_address);
     match Command::new("ip")
-        .args([
-            "route",
-            "replace",
-            GATEKEEPER_WG0_SUBNET,
-            "dev",
-            &interface_name,
-        ])
+        .args(["route", "replace", &subnet, "dev", &interface_name])
         .status()
     {
         Ok(status) if status.success() => {
-            tracing::info!(interface = %interface_name, subnet = GATEKEEPER_WG0_SUBNET, "added the Gatekeeper return route");
+            tracing::info!(interface = %interface_name, %subnet, "added the Gatekeeper return route");
         }
         Ok(status) => {
-            tracing::error!(interface = %interface_name, subnet = GATEKEEPER_WG0_SUBNET, exit_code = ?status.code(), "ip route replace exited non-zero - Gatekeeper's flow-admission replies will not route back correctly");
+            tracing::error!(interface = %interface_name, %subnet, exit_code = ?status.code(), "ip route replace exited non-zero - Gatekeeper's flow-admission replies will not route back correctly");
         }
         Err(error) => {
-            tracing::error!(%error, interface = %interface_name, subnet = GATEKEEPER_WG0_SUBNET, "failed to run ip route replace - Gatekeeper's flow-admission replies will not route back correctly");
+            tracing::error!(%error, interface = %interface_name, %subnet, "failed to run ip route replace - Gatekeeper's flow-admission replies will not route back correctly");
         }
     }
 }
@@ -114,5 +117,26 @@ impl TunWriter {
             .write_all(packet)
             .await
             .context("failed to write to TUN device")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subnet_slash_24_zeroes_the_last_octet() {
+        assert_eq!(
+            subnet_slash_24(Ipv4Addr::new(10, 66, 66, 1)),
+            "10.66.66.0/24"
+        );
+    }
+
+    #[test]
+    fn subnet_slash_24_works_for_a_configured_non_default_address() {
+        assert_eq!(
+            subnet_slash_24(Ipv4Addr::new(10, 66, 66, 9)),
+            "10.66.66.0/24"
+        );
     }
 }

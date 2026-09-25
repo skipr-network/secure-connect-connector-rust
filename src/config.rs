@@ -22,12 +22,25 @@ pub struct Config {
     /// Konyk's answer (TT-1732 comment thread): 60s default, must stay configurable
     /// and below Agent's 5-minute signature validity window.
     pub heartbeat_interval: Duration,
-    /// Port the flow-admission/release HTTP server (TT-1821) listens on. The
-    /// host half is not configurable (TT-1838): `main` always binds to
-    /// `connector_virtual_ip`, the Connector's own TUN address, which only
-    /// receives traffic that arrived through an established WireGuard
-    /// session - so only the port is left as a knob.
-    pub control_plane_port: u16,
+    /// The HTTP port each paired Node's Gatekeeper listens on, for the flow-admission/release
+    /// control channel (TT-2144) - the Connector polls out to `http://{gatekeeper_wg0_address}:
+    /// {this port}/api/connector/{connector_id}/poll`, *within* the Connector<->Node tunnel (spec
+    /// §B.8; see `gatekeeper_wg0_address`'s own doc for that address, and `admission_poller`'s
+    /// module doc for how a plain TCP connection to it ends up carried through the tunnel with no
+    /// new userspace TCP stack needed). No inbound listener of its own anymore (replaces the old
+    /// `control_plane_port`, which was the port *this* process used to listen on before the
+    /// channel flipped direction).
+    pub gatekeeper_http_port: u16,
+    /// Gatekeeper's own fixed address on the `wg0` interface this Connector is a peer on (TT-2144
+    /// review, PR #21: previously a hardcoded constant in `tun_device.rs`, `10.66.66.1` - a real
+    /// orchestrator-side provisioning convention, but one a node provisioned with a different wg0
+    /// address would silently violate, sending every flow admission/release into a permanent
+    /// fail-closed with no config knob to recover without a rebuild). Defaults to that same
+    /// `10.66.66.1` (unchanged behavior for the fleet's actual convention), overridable via
+    /// `CONNECTOR_GATEKEEPER_WG0_ADDRESS` for a deployment that genuinely differs. `tun_device`'s
+    /// own kernel return-route is derived from this same value (its /24), not a second, separately
+    /// hardcoded subnet - one address to get right, not two.
+    pub gatekeeper_wg0_address: Ipv4Addr,
     /// Netmask for the Connector's TUN interface - the address itself is no longer a local
     /// config concern (TT-1838): it's `connector_virtual_ip`, learned from the first successful
     /// heartbeat (Portal's own registered, per-Connector address), not guessed here.
@@ -74,10 +87,16 @@ impl Config {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "/var/skipr/connector/audit/audit.log".to_string()),
             ),
-            control_plane_port: env::var("CONNECTOR_CONTROL_PLANE_PORT")
+            // 4000 matches secure-connect-backend-gatekeeper's own default `server.port`
+            // (application-prod.yml) - overridable in case a deployment ever changes it.
+            gatekeeper_http_port: env::var("CONNECTOR_GATEKEEPER_HTTP_PORT")
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(8443),
+                .unwrap_or(4000),
+            gatekeeper_wg0_address: env::var("CONNECTOR_GATEKEEPER_WG0_ADDRESS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(Ipv4Addr::new(10, 66, 66, 1)),
             tun_netmask: env::var("CONNECTOR_TUN_NETMASK")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -157,7 +176,8 @@ mod tests {
             "REGISTRY_BASE_URL",
             "CONNECTOR_IDENTITY_KEY_PATH",
             "CONNECTOR_AUDIT_LOG_PATH",
-            "CONNECTOR_CONTROL_PLANE_PORT",
+            "CONNECTOR_GATEKEEPER_HTTP_PORT",
+            "CONNECTOR_GATEKEEPER_WG0_ADDRESS",
             "CONNECTOR_TUN_NETMASK",
             "HEARTBEAT_INTERVAL_SECONDS",
             "CONNECTOR_CA_BUNDLE_PATH",
@@ -303,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_the_control_plane_port() {
+    fn defaults_the_gatekeeper_http_port() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -315,12 +335,12 @@ mod tests {
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.control_plane_port, 8443);
+        assert_eq!(config.gatekeeper_http_port, 4000);
         clear_all();
     }
 
     #[test]
-    fn reads_a_configured_control_plane_port() {
+    fn reads_a_configured_gatekeeper_http_port() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
@@ -328,12 +348,49 @@ mod tests {
             env::set_var("AGENT_BASE_URL", "https://agent.example.com");
             env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
-            env::set_var("CONNECTOR_CONTROL_PLANE_PORT", "9000");
+            env::set_var("CONNECTOR_GATEKEEPER_HTTP_PORT", "9000");
         }
 
         let config = Config::from_env().unwrap();
 
-        assert_eq!(config.control_plane_port, 9000);
+        assert_eq!(config.gatekeeper_http_port, 9000);
+        clear_all();
+    }
+
+    #[test]
+    fn defaults_the_gatekeeper_wg0_address() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.gatekeeper_wg0_address, Ipv4Addr::new(10, 66, 66, 1));
+        clear_all();
+    }
+
+    #[test]
+    fn reads_a_configured_gatekeeper_wg0_address() {
+        // TT-2144 review: a node provisioned with a non-default wg0 address must be recoverable
+        // via config, not force a rebuild or a permanent fail-closed on every flow.
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("CONNECTOR_ID", "c-1");
+            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
+            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+            env::set_var("CONNECTOR_GATEKEEPER_WG0_ADDRESS", "10.66.66.9");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.gatekeeper_wg0_address, Ipv4Addr::new(10, 66, 66, 9));
         clear_all();
     }
 

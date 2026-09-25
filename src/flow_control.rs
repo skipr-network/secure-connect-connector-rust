@@ -1,32 +1,19 @@
-//! Connector<->Gatekeeper flow-admission/release control plane - the agreed
-//! contract from the TT-1732 comment thread (2026-08-24 to 2026-08-26).
-//! Gatekeeper calls these endpoints on the Connector whenever a user's flow
-//! gets a new port, or when that flow closes, routed through the private
-//! WireGuard tunnel rather than the public internet.
+//! Connector<->Gatekeeper flow-admission/release decision logic - the agreed contract from the
+//! TT-1732 comment thread (2026-08-24 to 2026-08-26), transport-agnostic on purpose (fully testable
+//! without a real socket).
 //!
-//! Transport-agnostic on purpose: this module only builds the axum `Router`
-//! and its handlers, fully testable without a real socket - `main` binds it
-//! to `connector_virtual_ip:Config::control_plane_port`. What actually
-//! restricts these endpoints to genuine Gatekeeper peers is that the tunnel
-//! network isn't reachable from anywhere else (Konyk's final comment on
-//! TT-1732) - and since TT-1838, that's a real guarantee rather than an
-//! aspiration: the listener binds to `connector_virtual_ip` itself, the
-//! Connector's own address on its TUN interface, which only receives
-//! traffic that arrived through an established WireGuard session with a
-//! node whose wg0 `allowed-ips` includes this Connector's address
-//! specifically (Gatekeeper's `WireGuardPeerProvisioner`, TT-1838). Before
-//! that, this listener bound to a wildcard/loopback address configured
-//! independently of any tunnel-internal address, so it was reachable at
-//! whatever address the process happened to be configured with - an honest
-//! limitation, not a security design, and now closed.
+//! **TT-2144: this module no longer runs an HTTP server.** Gatekeeper used to call an axum router
+//! exposed here directly, dialing *into* this Connector - which required an inbound firewall rule
+//! on the Connector host, silently violating the spec's "no inbound port ever opened on the
+//! customer's side" principle (found live: a Connector whose own `ufw` had no rule for the
+//! admission port made every flow fail closed with an opaque timeout). The channel is now
+//! Connector-initiated instead - see `admission_poller`, which calls [`handle_flow_admission`] and
+//! [`handle_flow_release`] directly after receiving a message over its own outbound long-poll to
+//! Gatekeeper, rather than these being invoked from an axum handler here. [`ControlPlaneState`]
+//! stays as the shared bundle both that module and this one's own tests need.
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::post;
-use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
@@ -84,57 +71,20 @@ pub struct ControlPlaneState {
     pub policy_store: Arc<PolicyStore>,
     pub audit_log: Arc<AuditLog>,
     pub flow_table: Arc<Mutex<FlowTable>>,
-    /// Hands a packet `admit_flow` reclaimed via `FlowTable::take_pending_packet` back to
+    /// Hands a packet `admission_poller` reclaimed via `FlowTable::take_pending_packet` back to
     /// `main::run_wireguard_receive_loop` - the only task allowed to write to the TUN device (see
-    /// its own doc comment) - for forwarding, instead of this handler's own task needing TUN
-    /// write access it was never given. `(node_id, packet_bytes)`. Tests that don't exercise this
-    /// path construct this from an `unbounded_channel()` and just drop the receiver half - sending
-    /// into a channel with no live receiver is a harmless no-op error this code ignores.
+    /// its own doc comment) - for forwarding, instead of that poller task needing TUN write access
+    /// it was never given. `(node_id, packet_bytes)`. Tests that don't exercise this path construct
+    /// this from an `unbounded_channel()` and just drop the receiver half - sending into a channel
+    /// with no live receiver is a harmless no-op error this code ignores.
     pub recovered_packet_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
 }
 
-pub fn router(state: ControlPlaneState) -> Router {
-    Router::new()
-        .route("/api/flow/admit", post(admit_flow))
-        .route("/api/flow/release", post(release_flow))
-        .with_state(state)
-}
-
-async fn admit_flow(
-    State(state): State<ControlPlaneState>,
-    Json(request): Json<FlowAdmissionRequest>,
-) -> Json<FlowAdmissionResponse> {
-    let node_id = request.node_id.clone();
-    let port = request.port;
-    let response = handle_flow_admission(
-        &state.policy_store,
-        &state.audit_log,
-        &state.flow_table,
-        request,
-    )
-    .await;
-
-    // Only on an actual admit: a refused flow's buffered packet must stay dropped (fail-closed),
-    // so it's simply left in place here to age out on its own via take_pending_packet/
-    // buffer_pending_packet's shared TTL sweep the next time something else touches this table -
-    // no need to explicitly clear it.
-    if response.decision == "admit"
-        && let Some(packet) = state
-            .flow_table
-            .lock()
-            .expect("flow table lock poisoned")
-            .take_pending_packet(&node_id, port, std::time::Instant::now())
-        && let Err(error) = state.recovered_packet_tx.send((node_id, packet))
-    {
-        tracing::error!(%error, "could not hand a reclaimed packet back for forwarding - the receiving task appears to have exited");
-    }
-
-    Json(response)
-}
-
-/// Extracted from the axum handler so it's directly unit-testable without
-/// going through HTTP extraction.
-async fn handle_flow_admission(
+/// The decision logic `admission_poller` calls once it has received one admission message over its
+/// own long-poll to Gatekeeper - previously invoked from an axum handler here directly (pre-TT-2144),
+/// now called from that module's own task after HTTP JSON extraction happens there instead. Public
+/// so it stays independently testable (as its own unit tests below do) without an HTTP round trip.
+pub(crate) async fn handle_flow_admission(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
     flow_table: &Mutex<FlowTable>,
@@ -225,20 +175,18 @@ async fn handle_flow_admission(
 
     // A cryptographically valid signature proves possession of
     // user_public_key (spec §B.9); which gateway_id it's presented for is
-    // not something the Connector restricts here. TT-1732's original
-    // cross-gateway-replay guard (Tasneem's finding) bound a session
-    // signature to only the *first* gateway_id it touched, but the spec
-    // (§B.5/§B.9, and TT-1732's own acceptance criteria - "it stores
-    // policies, entitlement lists, and node list for all attached
-    // gateways") requires one session to reach every Private Gateway at
-    // this Connector's single Location without reconnecting; a Connector
-    // process never serves more than one Location, so there is nothing to
-    // gain security-wise from refusing a valid signature reused across
-    // gateways it's already legitimately presenting to on this same
-    // Connector. Authorization is still decided per request below, against
-    // the current entitlement list for the named gateway_id specifically -
-    // this only removes a same-Connector restriction the spec never called
-    // for.
+    // not something the Connector restricts here (TT-2143: the original
+    // cross-gateway-replay guard bound a session signature to only the
+    // *first* gateway_id it touched, but the spec - §B.5/§B.9, and TT-1732's
+    // own acceptance criteria, "it stores policies, entitlement lists, and
+    // node list for all attached gateways" - requires one session to reach
+    // every Private Gateway at this Connector's single Location without
+    // reconnecting; a Connector process never serves more than one
+    // Location, so there is nothing to gain security-wise from refusing a
+    // valid signature reused across gateways it's already legitimately
+    // presenting to on this same Connector). Authorization is still decided
+    // per request below, against the current entitlement list for the named
+    // gateway_id specifically.
     let decision = decide_access_and_audit(
         policy_store,
         audit_log,
@@ -282,25 +230,14 @@ async fn handle_flow_admission(
     }
 }
 
-async fn release_flow(
-    State(state): State<ControlPlaneState>,
-    Json(request): Json<FlowReleaseRequest>,
-) -> impl IntoResponse {
-    state
-        .flow_table
-        .lock()
-        .expect("flow table lock poisoned")
-        .release(&request.flow_id);
-    handle_flow_release(&state.audit_log, request).await;
-    StatusCode::NO_CONTENT
-}
-
 /// Real per-flow state (matching a release to the exact admitted flow, not
 /// just its port) needs the actual traffic-forwarding slice to exist first -
 /// there's nothing to release yet. For now this closes the loop on the
 /// acceptance criteria's audit requirement ("Local audit is written... the
-/// action completes").
-async fn handle_flow_release(audit_log: &AuditLog, request: FlowReleaseRequest) {
+/// action completes"). `admission_poller` also removes the flow from
+/// `flow_table` itself, right before calling this - this function only
+/// handles the audit side, mirroring the pre-TT-2144 handler's own split.
+pub(crate) async fn handle_flow_release(audit_log: &AuditLog, request: FlowReleaseRequest) {
     if let Err(error) = audit_log
         .record(AuditEvent::FlowReleased {
             flow_id: request.flow_id,
@@ -316,10 +253,6 @@ async fn handle_flow_release(audit_log: &AuditLog, request: FlowReleaseRequest) 
 mod tests {
     use super::*;
     use crate::dto::{ConnectorHeartbeatResponse, Entitlement, PolicyBundle, PolicyBundleEndpoint};
-    use axum::body::Body;
-    use axum::http::Request;
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
 
     fn store_with_entitled_device(
         gateway_id: &str,
@@ -379,13 +312,6 @@ mod tests {
 
     fn flow_table() -> Mutex<FlowTable> {
         Mutex::new(FlowTable::new())
-    }
-
-    /// A `recovered_packet_tx` for `ControlPlaneState` construction in tests that don't exercise
-    /// the pending-packet-rescue path - the paired receiver is just dropped, which is fine: a send
-    /// into it becomes a harmless, ignored error rather than a panic.
-    fn recovered_packet_tx() -> tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)> {
-        tokio::sync::mpsc::unbounded_channel().0
     }
 
     #[tokio::test]
@@ -567,8 +493,8 @@ mod tests {
     /// never serves more than one) got refused switching from one to the other using its still-
     /// valid session signature, and only worked again after a full reconnect. The spec (§B.5/§B.9,
     /// and TT-1732's own acceptance criteria) requires one session to reach every Private Gateway
-    /// at that Location without reconnecting - the old cross-gateway `SignatureBindingGuard` was
-    /// stricter than that.
+    /// at that Location without reconnecting - the old cross-gateway `SignatureBindingGuard` (TT-2144
+    /// review: removed with this fix) was stricter than that.
     #[tokio::test]
     async fn the_same_session_signature_admits_a_flow_to_a_second_gateway_on_the_same_connector() {
         let device = crypto::generate_keypair();
@@ -781,7 +707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_records_an_audit_entry_and_the_router_returns_204() {
+    async fn release_records_an_audit_entry() {
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
         handle_flow_release(
@@ -818,222 +744,5 @@ mod tests {
             },
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn a_null_signature_triple_over_real_http_extraction_gets_a_200_refuse_not_a_422() {
-        // TT-2145's actual bug: this used to fail JSON deserialization itself
-        // (422, never reaching handle_flow_admission) because the fields were
-        // typed as required String. This test exercises real axum/serde
-        // extraction, not just the already-parsed-struct unit test above -
-        // it's the only one that would have caught the original bug.
-        let store = store_with_entitled_device("gw-1", "u-1", "some-device-key");
-        let dir = tempfile::tempdir().unwrap();
-        let state = ControlPlaneState {
-            policy_store: Arc::new(store),
-            audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            flow_table: Arc::new(flow_table()),
-            recovered_packet_tx: recovered_packet_tx(),
-        };
-        let app = router(state);
-
-        let http_request = Request::builder()
-            .method("POST")
-            .uri("/api/flow/admit")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "flow_id": "flow-1",
-                    "gateway_id": "gw-1",
-                    "node_id": "n-1",
-                    "port": 51820,
-                    "user_public_key": null,
-                    "signature": null,
-                    "signed_data": null
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-
-        let response = app.oneshot(http_request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(parsed["decision"], "refuse");
-        assert_eq!(parsed["reason"], "invalid_signature");
-    }
-
-    #[tokio::test]
-    async fn the_router_wires_admit_and_release_end_to_end_over_real_http_extraction() {
-        let device = crypto::generate_keypair();
-        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
-        let dir = tempfile::tempdir().unwrap();
-        let state = ControlPlaneState {
-            policy_store: Arc::new(store),
-            audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            flow_table: Arc::new(flow_table()),
-            recovered_packet_tx: recovered_packet_tx(),
-        };
-        let app = router(state);
-
-        let signature = crypto::sign_to_base64(&device.signing_key, b"session-nonce-1");
-        // signed_data carries the base64 *encoding* of what was actually
-        // signed (TT-2107) - see admission_request's doc comment.
-        let http_request = Request::builder()
-            .method("POST")
-            .uri("/api/flow/admit")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "flow_id": "flow-1",
-                    "gateway_id": "gw-1",
-                    "node_id": "n-1",
-                    "port": 51820,
-                    "user_public_key": device.public_key_hex,
-                    "signature": signature,
-                    "signed_data": BASE64.encode("session-nonce-1")
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-
-        let response = app.clone().oneshot(http_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(parsed["decision"], "admit");
-
-        let release_request = Request::builder()
-            .method("POST")
-            .uri("/api/flow/release")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "flow_id": "flow-1",
-                    "gateway_id": "gw-1",
-                    "port": 51820
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-
-        let release_response = app.oneshot(release_request).await.unwrap();
-        assert_eq!(release_response.status(), StatusCode::NO_CONTENT);
-    }
-
-    /// The actual point of this session's admission-rescue fix: a packet that arrived and was
-    /// buffered before its own flow's admission decision came back must be handed to the
-    /// recovered-packet channel once that admission genuinely succeeds - not left stranded in
-    /// `FlowTable` forever. Exercises the real `/api/flow/admit` HTTP path, not a direct call.
-    #[tokio::test]
-    async fn admit_flow_hands_a_reclaimed_pending_packet_back_over_the_recovered_channel() {
-        let device = crypto::generate_keypair();
-        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
-        let dir = tempfile::tempdir().unwrap();
-        let table = FlowTable::new();
-        let flow_table = Arc::new(Mutex::new(table));
-        flow_table.lock().unwrap().buffer_pending_packet(
-            "n-1",
-            51820,
-            vec![9, 8, 7],
-            std::time::Instant::now(),
-        );
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = ControlPlaneState {
-            policy_store: Arc::new(store),
-            audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            flow_table,
-            recovered_packet_tx: tx,
-        };
-        let app = router(state);
-
-        let signature = crypto::sign_to_base64(&device.signing_key, b"session-nonce-1");
-        let http_request = Request::builder()
-            .method("POST")
-            .uri("/api/flow/admit")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "flow_id": "flow-1",
-                    "gateway_id": "gw-1",
-                    "node_id": "n-1",
-                    "port": 51820,
-                    "user_public_key": device.public_key_hex,
-                    "signature": signature,
-                    "signed_data": BASE64.encode("session-nonce-1")
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-
-        let response = app.oneshot(http_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(parsed["decision"], "admit");
-
-        let (recovered_node_id, recovered_packet) = rx.try_recv().expect(
-            "the buffered packet for this now-admitted (node_id, port) should have been handed back for forwarding",
-        );
-        assert_eq!(recovered_node_id, "n-1");
-        assert_eq!(recovered_packet, vec![9, 8, 7]);
-    }
-
-    /// The mirror case: a refused flow must never have its buffered packet forwarded, no matter
-    /// how one was sitting there - fail-closed has to hold for a rescued packet exactly as
-    /// strictly as it already does for an ordinary one.
-    #[tokio::test]
-    async fn admit_flow_does_not_forward_a_pending_packet_when_the_flow_is_refused() {
-        let store = store_with_entitled_device("gw-1", "u-1", "some-device-key");
-        let dir = tempfile::tempdir().unwrap();
-        let table = FlowTable::new();
-        let flow_table = Arc::new(Mutex::new(table));
-        flow_table.lock().unwrap().buffer_pending_packet(
-            "n-1",
-            51820,
-            vec![9, 8, 7],
-            std::time::Instant::now(),
-        );
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = ControlPlaneState {
-            policy_store: Arc::new(store),
-            audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-            flow_table,
-            recovered_packet_tx: tx,
-        };
-        let app = router(state);
-
-        let http_request = Request::builder()
-            .method("POST")
-            .uri("/api/flow/admit")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "flow_id": "flow-1",
-                    "gateway_id": "gw-1",
-                    "node_id": "n-1",
-                    "port": 51820,
-                    "user_public_key": null,
-                    "signature": null,
-                    "signed_data": null
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-
-        let response = app.oneshot(http_request).await.unwrap();
-        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(parsed["decision"], "refuse");
-
-        // `app` (and with it, ControlPlaneState's own recovered_packet_tx clone) is dropped once
-        // `oneshot` returns, so by the time this runs the channel is legitimately Disconnected,
-        // not Empty, if nothing was ever sent - both outcomes mean the same thing here ("nothing
-        // arrived"), so accept either rather than over-specifying which one.
-        assert!(
-            rx.try_recv().is_err(),
-            "a refused flow's buffered packet must never be handed back for forwarding"
-        );
     }
 }
