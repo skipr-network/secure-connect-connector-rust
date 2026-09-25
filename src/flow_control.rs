@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::access::{AccessDecision, decide_access_and_audit};
 use crate::audit::{AuditEvent, AuditLog};
 use crate::crypto;
+use crate::dto::PolicyBundleEndpoint;
 use crate::flow_table::FlowTable;
 use crate::policy::PolicyStore;
 
@@ -66,6 +67,34 @@ pub struct FlowReleaseRequest {
     pub port: u16,
 }
 
+/// Relayed from Gatekeeper's DNS resolver (spec §B.13, TT-2227) to ask whether a query for one of
+/// this Connector's Private Gateway hostnames may be resolved for the querying session.
+/// Deliberately shaped like `FlowAdmissionRequest` minus the flow-specific fields (`flow_id`,
+/// `node_id`, `port`) - this is a resolve/don't-resolve decision against the same entitlement
+/// data, not a NAT admission, so there is no flow to track. `hostname` isn't consulted by the
+/// entitlement check itself (only `gateway_id` is - see `authenticate_and_decide`); it rides
+/// along purely for this Connector's own logging, since Gatekeeper already resolved it to a
+/// `gateway_id` before this request was ever sent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsAdmissionRequest {
+    /// Gatekeeper-generated opaque id that must be echoed back in the admission-result POST so
+    /// Gatekeeper can match the decision to the waiting DNS query. Keyed on the same
+    /// `/api/connector/{connector_id}/admission-result` endpoint that flow admission uses.
+    pub correlation_id: String,
+    pub gateway_id: String,
+    pub hostname: String,
+    pub user_public_key: Option<String>,
+    pub signature: Option<String>,
+    pub signed_data: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DnsAdmissionResponse {
+    pub decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ControlPlaneState {
     pub policy_store: Arc<PolicyStore>,
@@ -80,45 +109,55 @@ pub struct ControlPlaneState {
     pub recovered_packet_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
 }
 
-/// The decision logic `admission_poller` calls once it has received one admission message over its
-/// own long-poll to Gatekeeper - previously invoked from an axum handler here directly (pre-TT-2144),
-/// now called from that module's own task after HTTP JSON extraction happens there instead. Public
-/// so it stays independently testable (as its own unit tests below do) without an HTTP round trip.
-pub(crate) async fn handle_flow_admission(
+/// What `authenticate_and_decide` resolves to - shared between flow admission and DNS admission,
+/// since both are "prove who's asking, then check the same entitlement list" against the same
+/// `gateway_id`, just with a different thing to do once admitted (track a flow vs. answer a DNS
+/// query).
+enum AdmissionOutcome {
+    Allowed {
+        device_public_key: String,
+        endpoints: Vec<PolicyBundleEndpoint>,
+    },
+    Refused(&'static str),
+}
+
+/// Authentication and entitlement decision shared by `handle_flow_admission` and
+/// `handle_dns_admission` - the exact same proof-of-identity and entitlement check spec §B.9
+/// describes, independent of what's being admitted (a flow's NAT'd port vs. a DNS answer).
+/// Extracted from `handle_flow_admission` (TT-2227) rather than duplicated, so the two admission
+/// paths can never drift on what counts as a valid signature or a matching entitlement.
+async fn authenticate_and_decide(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
-    flow_table: &Mutex<FlowTable>,
-    request: FlowAdmissionRequest,
-) -> FlowAdmissionResponse {
+    gateway_id: &str,
+    user_public_key: Option<String>,
+    signature: Option<String>,
+    signed_data: Option<String>,
+) -> AdmissionOutcome {
     // TT-2145: a null signature triple is a normal, anticipated input (spec
     // §B.9), not a malformed request - handle it as a considered "no
     // signature presented -> refuse" decision, with its own audit entry,
     // before ever touching decoding/verification. Deliberately not folded
     // into the invalid_signature branch below: that one always has a
     // device_public_key to record, this one usually doesn't.
-    let (Some(user_public_key), Some(signature), Some(signed_data)) = (
-        request.user_public_key.clone(),
-        request.signature.clone(),
-        request.signed_data.clone(),
-    ) else {
+    let audit_key_if_missing = user_public_key.clone().unwrap_or_default();
+    let (Some(user_public_key), Some(signature), Some(signed_data)) =
+        (user_public_key, signature, signed_data)
+    else {
         if let Err(error) = audit_log
             .record(AuditEvent::AccessRefused {
-                gateway_id: request.gateway_id.clone(),
-                device_public_key: request.user_public_key.clone().unwrap_or_default(),
+                gateway_id: gateway_id.to_string(),
+                device_public_key: audit_key_if_missing,
                 reason: "no_signature_presented".to_string(),
             })
             .await
         {
             tracing::error!(%error, "failed to write no-signature audit entry");
         }
-        return FlowAdmissionResponse {
-            flow_id: request.flow_id,
-            decision: "refuse".to_string(),
-            // Fixed four-value wire vocabulary (TT-1732 contract) has no
-            // dedicated "no signature" value - same bucket as any other
-            // authentication failure from the caller's perspective.
-            reason: Some("invalid_signature".to_string()),
-        };
+        // Fixed four-value wire vocabulary (TT-1732 contract) has no
+        // dedicated "no signature" value - same bucket as any other
+        // authentication failure from the caller's perspective.
+        return AdmissionOutcome::Refused("invalid_signature");
     };
 
     // Authentication first (spec §B.9): proves possession of user_public_key,
@@ -138,7 +177,7 @@ pub(crate) async fn handle_flow_admission(
     let Ok(signed_message) = BASE64.decode(&signed_data) else {
         if let Err(error) = audit_log
             .record(AuditEvent::AccessRefused {
-                gateway_id: request.gateway_id.clone(),
+                gateway_id: gateway_id.to_string(),
                 device_public_key: user_public_key.clone(),
                 reason: "invalid_signature".to_string(),
             })
@@ -146,11 +185,7 @@ pub(crate) async fn handle_flow_admission(
         {
             tracing::error!(%error, "failed to write invalid-signature audit entry");
         }
-        return FlowAdmissionResponse {
-            flow_id: request.flow_id,
-            decision: "refuse".to_string(),
-            reason: Some("invalid_signature".to_string()),
-        };
+        return AdmissionOutcome::Refused("invalid_signature");
     };
     if !crypto::verify_base64(&user_public_key, &signed_message, &signature) {
         // This is itself a deny decision (acceptance criteria: "Connector...
@@ -158,7 +193,7 @@ pub(crate) async fn handle_flow_admission(
         // not just an early exit - best-effort, same as decide_access_and_audit.
         if let Err(error) = audit_log
             .record(AuditEvent::AccessRefused {
-                gateway_id: request.gateway_id.clone(),
+                gateway_id: gateway_id.to_string(),
                 device_public_key: user_public_key.clone(),
                 reason: "invalid_signature".to_string(),
             })
@@ -166,37 +201,59 @@ pub(crate) async fn handle_flow_admission(
         {
             tracing::error!(%error, "failed to write invalid-signature audit entry");
         }
-        return FlowAdmissionResponse {
-            flow_id: request.flow_id,
-            decision: "refuse".to_string(),
-            reason: Some("invalid_signature".to_string()),
-        };
+        return AdmissionOutcome::Refused("invalid_signature");
     }
 
     // A cryptographically valid signature proves possession of
     // user_public_key (spec §B.9); which gateway_id it's presented for is
-    // not something the Connector restricts here (TT-2143: the original
-    // cross-gateway-replay guard bound a session signature to only the
-    // *first* gateway_id it touched, but the spec - §B.5/§B.9, and TT-1732's
-    // own acceptance criteria, "it stores policies, entitlement lists, and
-    // node list for all attached gateways" - requires one session to reach
-    // every Private Gateway at this Connector's single Location without
-    // reconnecting; a Connector process never serves more than one
-    // Location, so there is nothing to gain security-wise from refusing a
-    // valid signature reused across gateways it's already legitimately
-    // presenting to on this same Connector). Authorization is still decided
-    // per request below, against the current entitlement list for the named
-    // gateway_id specifically.
-    let decision = decide_access_and_audit(
+    // not something the Connector restricts here. TT-1732's original
+    // cross-gateway-replay guard (Tasneem's finding) bound a session
+    // signature to only the *first* gateway_id it touched, but the spec
+    // (§B.5/§B.9, and TT-1732's own acceptance criteria - "it stores
+    // policies, entitlement lists, and node list for all attached
+    // gateways") requires one session to reach every Private Gateway at
+    // this Connector's single Location without reconnecting; a Connector
+    // process never serves more than one Location, so there is nothing to
+    // gain security-wise from refusing a valid signature reused across
+    // gateways it's already legitimately presenting to on this same
+    // Connector. Authorization is still decided per request below, against
+    // the current entitlement list for the named gateway_id specifically -
+    // this only removes a same-Connector restriction the spec never called
+    // for.
+    match decide_access_and_audit(policy_store, audit_log, gateway_id, &user_public_key).await {
+        AccessDecision::Allowed { endpoints, .. } => AdmissionOutcome::Allowed {
+            device_public_key: user_public_key,
+            endpoints,
+        },
+        AccessDecision::Refused(reason) => AdmissionOutcome::Refused(reason.as_wire_str()),
+    }
+}
+
+/// The decision logic `admission_poller` calls once it has received one admission message over its
+/// own long-poll to Gatekeeper - previously invoked from an axum handler here directly (pre-TT-2144),
+/// now called from that module's own task after HTTP JSON extraction happens there instead. Public
+/// so it stays independently testable (as its own unit tests below do) without an HTTP round trip.
+pub(crate) async fn handle_flow_admission(
+    policy_store: &PolicyStore,
+    audit_log: &AuditLog,
+    flow_table: &Mutex<FlowTable>,
+    request: FlowAdmissionRequest,
+) -> FlowAdmissionResponse {
+    let outcome = authenticate_and_decide(
         policy_store,
         audit_log,
         &request.gateway_id,
-        &user_public_key,
+        request.user_public_key,
+        request.signature,
+        request.signed_data,
     )
     .await;
 
-    match decision {
-        AccessDecision::Allowed { endpoints, .. } => {
+    match outcome {
+        AdmissionOutcome::Allowed {
+            device_public_key,
+            endpoints,
+        } => {
             // The real forwarding loops (`main`) only forward traffic for a
             // (node_id, port) pair present here, in both directions
             // (forward: TT-1732 review finding #1 - "a refused, or never
@@ -213,7 +270,7 @@ pub(crate) async fn handle_flow_admission(
                 request.port,
                 request.gateway_id.clone(),
                 request.flow_id.clone(),
-                user_public_key.clone(),
+                device_public_key,
                 endpoints,
             );
             FlowAdmissionResponse {
@@ -222,11 +279,49 @@ pub(crate) async fn handle_flow_admission(
                 reason: None,
             }
         }
-        AccessDecision::Refused(reason) => FlowAdmissionResponse {
+        AdmissionOutcome::Refused(reason) => FlowAdmissionResponse {
             flow_id: request.flow_id,
             decision: "refuse".to_string(),
-            reason: Some(reason.as_wire_str().to_string()),
+            reason: Some(reason.to_string()),
         },
+    }
+}
+
+/// TT-2227: the same proof-of-identity and entitlement check `handle_flow_admission` already
+/// applies to a NAT'd flow, applied instead to "may this hostname be resolved for this session" -
+/// no flow to track, so nothing here touches `FlowTable`. Called by `admission_poller` when it
+/// receives a `dns_admission` message over the Connector-initiated long-poll channel (TT-2144),
+/// not from an inbound HTTP route.
+pub(crate) async fn handle_dns_admission(
+    policy_store: &PolicyStore,
+    audit_log: &AuditLog,
+    request: DnsAdmissionRequest,
+) -> DnsAdmissionResponse {
+    let outcome = authenticate_and_decide(
+        policy_store,
+        audit_log,
+        &request.gateway_id,
+        request.user_public_key,
+        request.signature,
+        request.signed_data,
+    )
+    .await;
+
+    match outcome {
+        AdmissionOutcome::Allowed { .. } => {
+            tracing::info!(hostname = %request.hostname, gateway_id = %request.gateway_id, "DNS resolution admitted");
+            DnsAdmissionResponse {
+                decision: "admit".to_string(),
+                reason: None,
+            }
+        }
+        AdmissionOutcome::Refused(reason) => {
+            tracing::info!(hostname = %request.hostname, gateway_id = %request.gateway_id, %reason, "DNS resolution refused");
+            DnsAdmissionResponse {
+                decision: "refuse".to_string(),
+                reason: Some(reason.to_string()),
+            }
+        }
     }
 }
 
@@ -312,6 +407,73 @@ mod tests {
 
     fn flow_table() -> Mutex<FlowTable> {
         Mutex::new(FlowTable::new())
+    }
+
+    /// Mirrors `admission_request`'s signing convention - see its own doc comment for why
+    /// `signed_data` carries `message`'s base64 *encoding*, not its raw bytes.
+    fn dns_admission_request(
+        gateway_id: &str,
+        hostname: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        public_key_hex: &str,
+        message: &str,
+    ) -> DnsAdmissionRequest {
+        DnsAdmissionRequest {
+            correlation_id: "test-corr-1".to_string(),
+            gateway_id: gateway_id.to_string(),
+            hostname: hostname.to_string(),
+            user_public_key: Some(public_key_hex.to_string()),
+            signature: Some(crypto::sign_to_base64(signing_key, message.as_bytes())),
+            signed_data: Some(BASE64.encode(message)),
+        }
+    }
+
+    #[tokio::test]
+    async fn admits_an_entitled_devices_dns_request() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        let response = handle_dns_admission(&store, &audit_log, request).await;
+
+        assert_eq!(
+            response,
+            DnsAdmissionResponse {
+                decision: "admit".to_string(),
+                reason: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unentitled_devices_dns_request() {
+        let device = crypto::generate_keypair();
+        let store = PolicyStore::new();
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        let response = handle_dns_admission(&store, &audit_log, request).await;
+
+        assert_eq!(
+            response,
+            DnsAdmissionResponse {
+                decision: "refuse".to_string(),
+                reason: Some("not_entitled".to_string()),
+            }
+        );
     }
 
     #[tokio::test]
