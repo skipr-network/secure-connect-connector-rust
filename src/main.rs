@@ -187,7 +187,6 @@ async fn main() -> anyhow::Result<()> {
     let (recovered_packet_tx, recovered_packet_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
     let mut admission_pollers = AdmissionPollers::new(
-        connector_public_key.clone(),
         config.gatekeeper_http_port,
         config.gatekeeper_wg0_address,
         ControlPlaneState {
@@ -432,7 +431,7 @@ async fn run_heartbeat(
     // audit entry must not itself change or hide the underlying apply outcome.
     let audit_event = match &apply_result {
         Ok(()) => AuditEvent::PolicyApplied {
-            connector_id,
+            connector_id: connector_id.clone(),
             gateway_count: gateways,
             node_count: nodes,
         },
@@ -456,7 +455,7 @@ async fn run_heartbeat(
 
     dial_new_nodes(tunnel_manager, wg_socket, &node_list, flow_table).await;
     // TT-2144: independent of WireGuard tunnel state - see admission_poller's module doc for why.
-    admission_pollers.sync(&node_list);
+    admission_pollers.sync(&connector_id, &node_list);
     if let Some(old_bundles) = old_bundles {
         reconcile_dropped_entitlements(flow_table, &old_bundles, &new_bundles);
     }
@@ -1073,7 +1072,6 @@ mod tests {
     /// on).
     fn admission_pollers() -> AdmissionPollers {
         AdmissionPollers::new(
-            "c-1".to_string(),
             0,
             std::net::Ipv4Addr::new(10, 66, 66, 1),
             ControlPlaneState {
@@ -1604,6 +1602,9 @@ mod tests {
         // No connector_virtual_ip in this response body - Ok(None), not an error.
         assert_eq!(result.unwrap(), None);
         assert_eq!(policy_store.current().unwrap().connector_id, "c-1");
+        // TT-2210 follow-up: the pollers poll under the heartbeat's connector_id, which Agent
+        // provisioned on Gatekeeper - never the public key ("pk-1") this Connector heartbeats with.
+        assert_eq!(admission_pollers.connector_id(), Some("c-1"));
         let entries = read_audit_lines(&dir);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["event"], "policy_applied");
