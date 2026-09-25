@@ -8,13 +8,17 @@
 use serde::{Deserialize, Serialize};
 
 /// The heartbeat request body (TT-2069) - previously an empty `POST`, now carrying this
-/// Connector's own observed state back to Agent/Portal. Unsigned, same as the rest of this
-/// request: the endpoint already accepts a heartbeat for any `connector_id` with no per-request
-/// authentication (see `heartbeat`'s module doc), so this adds no new trust boundary - worst case
-/// a spoofed request causes a spurious "unresolved" badge in Portal's UI for a gateway, not an
-/// access-control or information-disclosure issue.
+/// Connector's own identity and observed state back to Agent/Portal. Unsigned, same as the rest of
+/// this request: the endpoint has never had per-request authentication (see `heartbeat`'s module
+/// doc), so this adds no new trust boundary - worst case a spoofed request causes a spurious
+/// "unresolved" badge in Portal's UI for a gateway, not an access-control issue.
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
 pub struct ConnectorHeartbeatRequest {
+    /// This Connector's own public key (TT-2210) - how Agent and Portal find it. It is the only
+    /// identity the Connector has before an admin registers it, and the only one it ever needs:
+    /// Agent answers "not registered" until the admin pastes this key into Portal, and the very
+    /// next heartbeat after that is served, with nothing reconfigured on this host.
+    pub connector_public_key: String,
     /// Endpoint hosts, from the *previous* heartbeat's policy bundles, that `dns_cache` still had
     /// no resolved address for as of the last successful `dns_cache.refresh` (not necessarily last
     /// cycle: a heartbeat that fails before reaching `dns_cache.refresh` leaves this reporting a
@@ -39,6 +43,11 @@ pub struct ConnectorHeartbeatRequest {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ConnectorHeartbeatResponse {
     pub connector_id: String,
+    /// TT-2210: the public key Agent composed this envelope for, inside the signed body -
+    /// `heartbeat::fetch_and_verify` refuses a verified envelope carrying any key but this
+    /// Connector's own, since this Connector no longer knows its `connector_id` to check against.
+    #[serde(default)]
+    pub connector_public_key: Option<String>,
     /// TT-1838: this Connector's one stable control-channel address, assigned by Portal and
     /// relayed unchanged through Agent. `None` until Portal has assigned one (or against an
     /// older Agent that doesn't send it yet) - `main` treats that as "not ready", since the TUN
@@ -99,6 +108,7 @@ mod tests {
     #[test]
     fn heartbeat_request_serializes_its_unresolved_hosts() {
         let request = ConnectorHeartbeatRequest {
+            connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: Some(vec!["crm.internal.example.com".to_string()]),
         };
 
@@ -106,7 +116,7 @@ mod tests {
 
         assert_eq!(
             json,
-            r#"{"unresolved_endpoint_hosts":["crm.internal.example.com"]}"#
+            r#"{"connector_public_key":"pk-1","unresolved_endpoint_hosts":["crm.internal.example.com"]}"#
         );
     }
 
@@ -116,23 +126,28 @@ mod tests {
         // get skipped the way `None` is: Portal treats an explicit `[]` as "clear every mark" and
         // an absent field as "no information, leave marks alone" (TT-2069 review finding #1).
         let request = ConnectorHeartbeatRequest {
+            connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: Some(vec![]),
         };
 
         let json = serde_json::to_string(&request).unwrap();
 
-        assert_eq!(json, r#"{"unresolved_endpoint_hosts":[]}"#);
+        assert_eq!(
+            json,
+            r#"{"connector_public_key":"pk-1","unresolved_endpoint_hosts":[]}"#
+        );
     }
 
     #[test]
     fn heartbeat_request_omits_the_field_entirely_when_there_is_no_previous_cycle_to_report() {
         let request = ConnectorHeartbeatRequest {
+            connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
 
-        assert_eq!(json, r#"{}"#);
+        assert_eq!(json, r#"{"connector_public_key":"pk-1"}"#);
     }
 
     #[test]
@@ -140,6 +155,7 @@ mod tests {
         assert_eq!(
             ConnectorHeartbeatRequest::default(),
             ConnectorHeartbeatRequest {
+                connector_public_key: String::new(),
                 unresolved_endpoint_hosts: None
             }
         );

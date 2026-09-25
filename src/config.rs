@@ -11,11 +11,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub struct Config {
-    /// The connector_id the Enterprise Admin assigned when registering this
-    /// Connector's public key in Portal.
-    pub connector_id: String,
-    pub agent_base_url: String,
-    pub agent_ip_address: String,
+    /// The environment's `agents.json` list (TT-2210) - the Connector heartbeats through whichever
+    /// `operational` Agent it lists, re-resolving when that one stops answering, instead of being
+    /// pinned to one Agent address that silently breaks when that instance rotates (spec §B.4: "any
+    /// closest, publicly available instance"). There is no connector_id here either: the Connector
+    /// identifies itself by its own public key, the only identity it has before an admin registers
+    /// it, so nothing has to be configured on this host after that registration.
+    pub agents_json_url: String,
     pub registry_base_url: String,
     pub identity_key_path: PathBuf,
     pub audit_log_path: PathBuf,
@@ -61,9 +63,7 @@ const DEFAULT_HEARTBEAT_INTERVAL_SECONDS: u64 = 60;
 const AGENT_SIGNATURE_VALIDITY_SECONDS: u64 = 300;
 
 /// Shared with the standalone `--generate-identity` mode (TT-1886), which prints the Connector's
-/// public key without the rest of `Config::from_env`'s required env vars (`CONNECTOR_ID` doesn't
-/// exist yet at that point in the real admin flow - Portal only issues it after the admin submits
-/// this key).
+/// public key without the rest of `Config::from_env`'s required env vars.
 pub fn identity_key_path_from_env() -> PathBuf {
     PathBuf::from(
         env::var("CONNECTOR_IDENTITY_KEY_PATH")
@@ -76,9 +76,7 @@ pub fn identity_key_path_from_env() -> PathBuf {
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            connector_id: require_env("CONNECTOR_ID")?,
-            agent_base_url: require_env("AGENT_BASE_URL")?,
-            agent_ip_address: require_env("AGENT_IP_ADDRESS")?,
+            agents_json_url: require_env("AGENTS_JSON_URL")?,
             registry_base_url: require_env("REGISTRY_BASE_URL")?,
             identity_key_path: identity_key_path_from_env(),
             audit_log_path: PathBuf::from(
@@ -170,9 +168,7 @@ mod tests {
 
     fn clear_all() {
         for key in [
-            "CONNECTOR_ID",
-            "AGENT_BASE_URL",
-            "AGENT_IP_ADDRESS",
+            "AGENTS_JSON_URL",
             "REGISTRY_BASE_URL",
             "CONNECTOR_IDENTITY_KEY_PATH",
             "CONNECTOR_AUDIT_LOG_PATH",
@@ -194,14 +190,49 @@ mod tests {
         assert!(Config::from_env().is_err());
     }
 
+    /// TT-2210: the only per-environment values a Connector needs are the two its install command
+    /// writes - nothing issued at registration (no connector_id) and no pinned Agent address.
+    #[test]
+    fn starts_with_only_the_agents_json_url_and_registry_url_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+        }
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(
+            config.agents_json_url,
+            "https://agents.example.com/agents.json"
+        );
+        assert_eq!(config.registry_base_url, "https://registry.example.com");
+        clear_all();
+    }
+
+    #[test]
+    fn errors_when_the_agents_json_url_is_missing_or_blank() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
+        }
+        assert!(Config::from_env().is_err());
+
+        unsafe {
+            env::set_var("AGENTS_JSON_URL", "  ");
+        }
+        assert!(Config::from_env().is_err());
+        clear_all();
+    }
+
     #[test]
     fn defaults_the_heartbeat_interval_to_sixty_seconds() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
         }
 
@@ -216,9 +247,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
         }
 
@@ -236,9 +265,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
         }
 
@@ -253,9 +280,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var(
                 "CONNECTOR_CA_BUNDLE_PATH",
@@ -282,9 +307,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var(
                 "CONNECTOR_CA_BUNDLE_PATH",
@@ -306,9 +329,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("CONNECTOR_AUDIT_LOG_PATH", "/tmp/custom-audit.log");
         }
@@ -327,9 +348,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
         }
 
@@ -344,9 +363,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("CONNECTOR_GATEKEEPER_HTTP_PORT", "9000");
         }
@@ -362,9 +379,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
         }
 
@@ -381,9 +396,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("CONNECTOR_GATEKEEPER_WG0_ADDRESS", "10.66.66.9");
         }
@@ -399,9 +412,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
         }
 
@@ -416,9 +427,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("CONNECTOR_TUN_NETMASK", "255.255.0.0");
         }
@@ -434,9 +443,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("HEARTBEAT_INTERVAL_SECONDS", "90");
         }
@@ -453,9 +460,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("HEARTBEAT_INTERVAL_SECONDS", "0");
         }
@@ -471,9 +476,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("HEARTBEAT_INTERVAL_SECONDS", "not-a-number");
         }
@@ -491,9 +494,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("CONNECTOR_ID", "c-1");
-            env::set_var("AGENT_BASE_URL", "https://agent.example.com");
-            env::set_var("AGENT_IP_ADDRESS", "10.0.0.5");
+            env::set_var("AGENTS_JSON_URL", "https://agents.example.com/agents.json");
             env::set_var("REGISTRY_BASE_URL", "https://registry.example.com");
             env::set_var("HEARTBEAT_INTERVAL_SECONDS", "600");
         }

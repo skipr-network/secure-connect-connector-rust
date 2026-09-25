@@ -3,10 +3,17 @@
 //! a heartbeat response against that specific Agent - never any registered Agent
 //! globally, per the confirmed TT-1732 contract decision.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 
 use crate::dto::AgentPermittedKeyResponse;
+
+/// Bounds the whole lookup, not just connecting (the shared client's connect timeout, see `main`):
+/// it runs once per Agent tried on every heartbeat, so a Registry that accepted the connection and
+/// then hung would otherwise stall the cycle - and failover to the next Agent - indefinitely.
+const REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct RegistryClient {
     http: Client,
@@ -28,6 +35,7 @@ impl RegistryClient {
         let response = self
             .http
             .get(&url)
+            .timeout(REGISTRY_REQUEST_TIMEOUT)
             .send()
             .await
             .with_context(|| format!("request to {url} failed"))?;

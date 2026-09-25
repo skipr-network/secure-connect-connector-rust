@@ -1,5 +1,6 @@
 mod access;
 mod admission_poller;
+mod agent_directory;
 mod audit;
 mod ca_trust;
 mod config;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use admission_poller::AdmissionPollers;
+use agent_directory::AgentDirectory;
 use anyhow::Context;
 use audit::{AuditEvent, AuditLog};
 use boringtun::noise::Tunn;
@@ -26,7 +28,7 @@ use config::Config;
 use dto::{HeartbeatNode, PolicyBundle};
 use flow_control::ControlPlaneState;
 use flow_table::{FlowTable, ForwardOutcome};
-use heartbeat::HeartbeatClient;
+use heartbeat::{AgentRejected, HeartbeatClient};
 use policy::PolicyStore;
 use registry_client::RegistryClient;
 use tokio::net::UdpSocket;
@@ -97,13 +99,11 @@ async fn main() -> anyhow::Result<()> {
     let connector_identity = identity::load_or_generate(&config.identity_key_path)?;
     if identity_key_existed_already {
         info!(
-            connector_id = %config.connector_id,
             public_key = %connector_identity.public_key_base64,
             "Connector identity ready"
         );
     } else {
         warn!(
-            connector_id = %config.connector_id,
             public_key = %connector_identity.public_key_base64,
             path = %config.identity_key_path.display(),
             "Connector identity ready, but no key file existed at this path - generated a brand \
@@ -122,7 +122,11 @@ async fn main() -> anyhow::Result<()> {
     // TT-2027: CONNECTOR_CA_BUNDLE_PATH, when set, adds one or more extra trusted root CAs on
     // top of the default trust (Mozilla's bundled roots plus, via rustls-tls-native-roots, the
     // box's own OS trust store) - never a replacement for it, and never `danger_accept_invalid_certs`.
-    let mut http_builder = reqwest::Client::builder();
+    //
+    // connect_timeout (TT-2210): a rotated-away Agent's address often just drops packets, and with
+    // no bound a single connect attempt there would stall the whole heartbeat cycle - and the
+    // failover to the next operational Agent with it. Each call adds its own overall timeout.
+    let mut http_builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(5));
     if let Some(ca_bundle_path) = &config.ca_bundle_path {
         for certificate in ca_trust::load_extra_root_certificates(ca_bundle_path)? {
             http_builder = http_builder.add_root_certificate(certificate);
@@ -146,7 +150,11 @@ async fn main() -> anyhow::Result<()> {
             None => "failed to build the HTTP client".to_string(),
         })?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-    let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+    let agent_directory = AgentDirectory::new(http.clone(), config.agents_json_url.clone());
+    let heartbeat_client = HeartbeatClient::new(http);
+    // Kept past the move of connector_identity.secret below: every heartbeat identifies this
+    // Connector by it (TT-2210).
+    let connector_public_key = connector_identity.public_key_base64.clone();
     let policy_store = Arc::new(PolicyStore::new());
     let audit_log = Arc::new(AuditLog::new(&config.audit_log_path));
     // Moves connector_identity.secret - nothing else needs the identity after
@@ -179,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
     let (recovered_packet_tx, recovered_packet_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
     let mut admission_pollers = AdmissionPollers::new(
-        config.connector_id.clone(),
+        connector_public_key.clone(),
         config.gatekeeper_http_port,
         config.gatekeeper_wg0_address,
         ControlPlaneState {
@@ -199,7 +207,8 @@ async fn main() -> anyhow::Result<()> {
     // fetched twice.
     let connector_virtual_ip = loop {
         match run_heartbeat(
-            &config,
+            &connector_public_key,
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -218,9 +227,11 @@ async fn main() -> anyhow::Result<()> {
                     "heartbeat succeeded but Portal has not assigned a connector_virtual_ip yet - cannot create the TUN device until it does, retrying"
                 );
             }
-            Err(error) => {
-                error!(%error, "initial heartbeat failed - cannot create the TUN device until one succeeds, retrying");
-            }
+            Err(error) => log_heartbeat_failure(
+                &error,
+                &connector_public_key,
+                "initial heartbeat failed - cannot create the TUN device until one succeeds, retrying",
+            ),
         }
         tokio::time::sleep(config.heartbeat_interval).await;
     };
@@ -274,7 +285,8 @@ async fn main() -> anyhow::Result<()> {
     loop {
         interval.tick().await;
         match run_heartbeat(
-            &config,
+            &connector_public_key,
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -299,9 +311,26 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(_) => {}
             Err(error) => {
-                error!(%error, "heartbeat cycle failed");
+                log_heartbeat_failure(&error, &connector_public_key, "heartbeat cycle failed")
             }
         }
+    }
+}
+
+/// "Not registered" is the expected state between install and the admin pasting this Connector's
+/// public key into Portal (TT-2210, spec §B.4 point 1) - said plainly, with the key to paste, rather
+/// than logged as a failure. Anything else is a real failure.
+fn log_heartbeat_failure(error: &anyhow::Error, connector_public_key: &str, message: &str) {
+    if error
+        .downcast_ref::<AgentRejected>()
+        .is_some_and(AgentRejected::is_not_registered)
+    {
+        info!(
+            public_key = %connector_public_key,
+            "not registered - if this is a new install, paste this public key into Portal's Deploy Connector screen and the Connector activates on its next heartbeat; if it was active before, its registration was removed in Portal"
+        );
+    } else {
+        error!(error = %format!("{error:#}"), "{message}");
     }
 }
 
@@ -331,7 +360,8 @@ fn generate_identity() -> anyhow::Result<()> {
 // site instead of removing it.
 #[allow(clippy::too_many_arguments)]
 async fn run_heartbeat(
-    config: &Config,
+    connector_public_key: &str,
+    agent_directory: &AgentDirectory,
     registry_client: &RegistryClient,
     heartbeat_client: &HeartbeatClient,
     policy_store: &PolicyStore,
@@ -362,18 +392,18 @@ async fn run_heartbeat(
         .as_deref()
         .map(|bundles| unresolved_hosts_in(bundles, dns_cache));
 
-    let agent_public_key = registry_client
-        .get_agent_permitted_key(&config.agent_ip_address)
-        .await?;
-    let response = heartbeat_client
-        .fetch_and_verify(
-            &config.connector_id,
-            &agent_public_key,
+    let response = agent_directory
+        .heartbeat(
+            registry_client,
+            heartbeat_client,
             &dto::ConnectorHeartbeatRequest {
+                connector_public_key: connector_public_key.to_string(),
                 unresolved_endpoint_hosts,
             },
         )
         .await?;
+
+    let connector_id = response.connector_id.clone();
 
     let gateways = response.policy_bundles.len();
     let nodes = response.node_list.len();
@@ -402,7 +432,7 @@ async fn run_heartbeat(
     // audit entry must not itself change or hide the underlying apply outcome.
     let audit_event = match &apply_result {
         Ok(()) => AuditEvent::PolicyApplied {
-            connector_id: config.connector_id.clone(),
+            connector_id,
             gateway_count: gateways,
             node_count: nodes,
         },
@@ -998,11 +1028,9 @@ mod tests {
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn config(registry_base_url: String, agent_base_url: String) -> Config {
+    fn config(registry_base_url: String) -> Config {
         Config {
-            connector_id: "c-1".to_string(),
-            agent_base_url,
-            agent_ip_address: "10.0.0.5".to_string(),
+            agents_json_url: "unused - see test_agent_directory".to_string(),
             registry_base_url,
             identity_key_path: "/tmp/unused-in-this-test".into(),
             audit_log_path: "/tmp/unused-in-this-test-audit.log".into(),
@@ -1012,6 +1040,26 @@ mod tests {
             heartbeat_interval: Duration::from_secs(60),
             ca_bundle_path: None,
         }
+    }
+
+    /// An `agents.json` listing the one Agent every heartbeat test's Registry mock knows
+    /// (`10.0.0.5`), served at `agent_base_url`. The returned server must be kept alive for as long
+    /// as the directory is used.
+    async fn test_agent_directory(agent_base_url: String) -> (AgentDirectory, MockServer) {
+        let agents_json = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agents.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "agents": [{ "ip_address": "10.0.0.5", "status": "operational" }]
+            })))
+            .mount(&agents_json)
+            .await;
+        let directory = AgentDirectory::with_base_url_for(
+            reqwest::Client::new(),
+            format!("{}/agents.json", agents_json.uri()),
+            Box::new(move |_| agent_base_url.clone()),
+        );
+        (directory, agents_json)
     }
 
     async fn wg_socket() -> UdpSocket {
@@ -1497,7 +1545,7 @@ mod tests {
     #[tokio::test]
     async fn run_heartbeat_succeeds_against_a_correctly_signed_response() {
         let agent_identity = crypto::generate_keypair();
-        let body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
+        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
         let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
 
         let registry_server = MockServer::start().await;
@@ -1512,7 +1560,7 @@ mod tests {
 
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(body, "application/json")
@@ -1521,10 +1569,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1537,7 +1587,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -1564,7 +1615,7 @@ mod tests {
     #[tokio::test]
     async fn run_heartbeat_returns_the_parsed_connector_virtual_ip_when_present() {
         let agent_identity = crypto::generate_keypair();
-        let body = r#"{"connector_id":"c-1","connector_virtual_ip":"10.98.0.7","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
+        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","connector_virtual_ip":"10.98.0.7","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
         let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
 
         let registry_server = MockServer::start().await;
@@ -1579,7 +1630,7 @@ mod tests {
 
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(body, "application/json")
@@ -1588,10 +1639,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1604,7 +1657,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -1629,10 +1683,12 @@ mod tests {
             .mount(&registry_server)
             .await;
 
-        let config = config(registry_server.uri(), "http://127.0.0.1:1".to_string());
+        let config = config(registry_server.uri());
+        let agent_base_url = "http://127.0.0.1:1".to_string();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1645,7 +1701,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -1668,7 +1725,7 @@ mod tests {
     async fn run_heartbeat_surfaces_a_signature_verification_failure() {
         let agent_identity = crypto::generate_keypair();
         let impostor_identity = crypto::generate_keypair();
-        let body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
+        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
         let wrong_signature =
             crypto::sign_to_base64(&impostor_identity.signing_key, body.as_bytes());
 
@@ -1684,7 +1741,7 @@ mod tests {
 
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(body, "application/json")
@@ -1693,10 +1750,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1709,7 +1768,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -1732,7 +1792,7 @@ mod tests {
     async fn run_heartbeat_rejects_an_already_expired_package_and_does_not_apply_it() {
         let agent_identity = crypto::generate_keypair();
         // 2020 is always in the past relative to any real run of this test.
-        let body = r#"{"connector_id":"c-1","generated_at":"2020-01-01T09:55:00Z","expires_at":"2020-01-01T10:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
+        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2020-01-01T09:55:00Z","expires_at":"2020-01-01T10:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
         let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
 
         let registry_server = MockServer::start().await;
@@ -1747,7 +1807,7 @@ mod tests {
 
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(body, "application/json")
@@ -1756,10 +1816,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1772,7 +1834,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -1795,7 +1858,7 @@ mod tests {
     #[tokio::test]
     async fn run_heartbeat_succeeds_and_warns_when_some_nodes_have_no_wireguard_key_yet() {
         let agent_identity = crypto::generate_keypair();
-        let body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[{"node_id":"n-1","ip_address":"10.0.0.10","wireguard_public_key":null}]}"#;
+        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[{"node_id":"n-1","ip_address":"10.0.0.10","wireguard_public_key":null}]}"#;
         let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
 
         let registry_server = MockServer::start().await;
@@ -1810,7 +1873,7 @@ mod tests {
 
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(body, "application/json")
@@ -1819,10 +1882,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1837,7 +1902,8 @@ mod tests {
         // succeeds (there's simply nothing to dial yet for that node).
         let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -1875,7 +1941,7 @@ mod tests {
             .unwrap();
         let node_addr = node_socket.local_addr().unwrap();
         let body = format!(
-            r#"{{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[{{"node_id":"n-1","ip_address":"{}","wireguard_public_key":"{}"}}]}}"#,
+            r#"{{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[{{"node_id":"n-1","ip_address":"{}","wireguard_public_key":"{}"}}]}}"#,
             node_addr.ip(),
             node_public_key_base64
         );
@@ -1893,7 +1959,7 @@ mod tests {
 
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(body, "application/json")
@@ -1902,10 +1968,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1918,7 +1986,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -2077,10 +2146,10 @@ mod tests {
         // `hostname` field, say) - without ever touching the real OS resolver (PR #10 review: a
         // hostname fixture here must not risk a real, slow DNS lookup in CI).
         let agent_identity = crypto::generate_keypair();
-        let old_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"old.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let old_body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"old.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
         let old_signature =
             crypto::sign_to_base64(&agent_identity.signing_key, old_body.as_bytes());
-        let new_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"new.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let new_body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"new.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
         let new_signature =
             crypto::sign_to_base64(&agent_identity.signing_key, new_body.as_bytes());
 
@@ -2095,7 +2164,7 @@ mod tests {
             .await;
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(old_body, "application/json")
@@ -2105,7 +2174,7 @@ mod tests {
             .mount(&agent_server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(new_body, "application/json")
@@ -2114,10 +2183,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -2137,7 +2208,8 @@ mod tests {
         // call below has real old_bundles/new_bundles to diff between - not None vs. something.
         let mut admission_pollers = admission_pollers();
         run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -2153,7 +2225,8 @@ mod tests {
         requested_hosts.lock().unwrap().clear();
 
         run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -2182,10 +2255,10 @@ mod tests {
         // must then carry that host in unresolved_endpoint_hosts, proving the real
         // run_heartbeat/HeartbeatClient wiring, not just each piece tested in isolation.
         let agent_identity = crypto::generate_keypair();
-        let first_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"erp.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
+        let first_body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[{"host":"erp.internal.example.com","port":443}],"entitlement_list":[]}],"node_list":[]}"#;
         let first_signature =
             crypto::sign_to_base64(&agent_identity.signing_key, first_body.as_bytes());
-        let second_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[],"node_list":[]}"#;
+        let second_body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[],"node_list":[]}"#;
         let second_signature =
             crypto::sign_to_base64(&agent_identity.signing_key, second_body.as_bytes());
 
@@ -2202,8 +2275,11 @@ mod tests {
         // First request: an empty ConnectorHeartbeatRequest is all there is to report yet (no
         // prior cycle exists).
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
-            .and(body_json(dto::ConnectorHeartbeatRequest::default()))
+            .and(path("/api/connectors/heartbeat"))
+            .and(body_json(dto::ConnectorHeartbeatRequest {
+                connector_public_key: "pk-1".to_string(),
+                unresolved_endpoint_hosts: None,
+            }))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(first_body, "application/json")
@@ -2216,8 +2292,9 @@ mod tests {
         // Only matched if the outgoing body is exactly this - an unmatched request gets wiremock's
         // default 404, which fetch_and_verify would surface as an error, failing this test.
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .and(body_json(&dto::ConnectorHeartbeatRequest {
+                connector_public_key: "pk-1".to_string(),
                 unresolved_endpoint_hosts: Some(vec!["erp.internal.example.com".to_string()]),
             }))
             .respond_with(
@@ -2228,10 +2305,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -2246,7 +2325,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -2261,7 +2341,8 @@ mod tests {
         .unwrap();
 
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -2495,8 +2576,8 @@ mod tests {
     #[tokio::test]
     async fn a_second_heartbeat_evicts_a_flow_whose_device_dropped_out_of_entitlement_list() {
         let agent_identity = crypto::generate_keypair();
-        let first_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]},{"gateway_id":"gw-2","location":"Amsterdam","hostname":"erp.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
-        let second_body = r#"{"connector_id":"c-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[]},{"gateway_id":"gw-2","location":"Amsterdam","hostname":"erp.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
+        let first_body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]},{"gateway_id":"gw-2","location":"Amsterdam","hostname":"erp.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
+        let second_body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:01:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n2","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[]},{"gateway_id":"gw-2","location":"Amsterdam","hostname":"erp.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
         let first_signature =
             crypto::sign_to_base64(&agent_identity.signing_key, first_body.as_bytes());
         let second_signature =
@@ -2514,7 +2595,7 @@ mod tests {
 
         let agent_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(first_body, "application/json")
@@ -2524,7 +2605,7 @@ mod tests {
             .mount(&agent_server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/api/connectors/c-1/heartbeat"))
+            .and(path("/api/connectors/heartbeat"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(second_body, "application/json")
@@ -2533,10 +2614,12 @@ mod tests {
             .mount(&agent_server)
             .await;
 
-        let config = config(registry_server.uri(), agent_server.uri());
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
         let http = reqwest::Client::new();
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let heartbeat_client = HeartbeatClient::new(http, config.agent_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
         let policy_store = PolicyStore::new();
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -2549,7 +2632,8 @@ mod tests {
 
         let mut admission_pollers = admission_pollers();
         run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
@@ -2582,7 +2666,8 @@ mod tests {
         );
 
         let result = run_heartbeat(
-            &config,
+            "pk-1",
+            &agent_directory,
             &registry_client,
             &heartbeat_client,
             &policy_store,
