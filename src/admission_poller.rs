@@ -157,6 +157,16 @@ impl AdmissionPollers {
     /// pollers were started with (the Connector was re-registered in Portal under a new id), every
     /// poller is restarted, since each one polls a path built from that id.
     pub fn sync(&mut self, connector_id: &str, nodes: &[HeartbeatNode]) {
+        // Every path would be /api/connector//poll, which Gatekeeper refuses forever. Polling
+        // nothing, and saying why, beats a silent 403 loop.
+        if connector_id.trim().is_empty() {
+            error!(
+                "heartbeat response carried an empty connector_id - not starting admission pollers"
+            );
+            self.stop_all();
+            self.connector_id = None;
+            return;
+        }
         if self.connector_id.as_deref() != Some(connector_id) {
             if !self.tasks.is_empty() {
                 info!(
@@ -694,6 +704,98 @@ mod tests {
             "a new connector_id must restart the node's poller"
         );
         assert_eq!(pollers.connector_id.as_deref(), Some("c-2"));
+    }
+
+    #[test]
+    fn sync_starts_no_poller_for_an_empty_connector_id() {
+        let (state, _rx) = state();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let mut pollers = AdmissionPollers::new(4000, Ipv4Addr::new(10, 66, 66, 1), state);
+
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1")]);
+        pollers.sync("  ", &[node("n-1", "10.0.0.1")]);
+
+        assert!(pollers.running_node_ids().is_empty());
+        assert_eq!(pollers.connector_id, None);
+    }
+
+    /// Records the path of every request, answering each poll with `type=none` so the poller
+    /// simply polls again.
+    async fn spawn_path_recording_gatekeeper() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorder = paths.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            hyper::service::service_fn(move |req: Request<Incoming>| {
+                                recorder.lock().unwrap().push(req.uri().path().to_string());
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(
+                                        Response::builder()
+                                            .status(200)
+                                            .header("Content-Type", "application/json")
+                                            .body(Full::new(Bytes::from_static(
+                                                b"{\"type\":\"none\"}",
+                                            )))
+                                            .unwrap(),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (port, paths)
+    }
+
+    async fn wait_for_poll_path(paths: &Arc<Mutex<Vec<String>>>, expected: &str) {
+        for _ in 0..100 {
+            if paths.lock().unwrap().iter().any(|path| path == expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let seen = paths.lock().unwrap();
+        panic!(
+            "no poll to {expected} within 2s; saw {} polls, last ones {:?}",
+            seen.len(),
+            seen.iter().rev().take(5).collect::<Vec<_>>()
+        );
+    }
+
+    /// TT-2290: the poll really goes out under the heartbeat's connector_id, and after a change of
+    /// id every later poll uses the new one.
+    #[tokio::test]
+    async fn pollers_poll_under_the_heartbeats_connector_id_and_follow_a_change() {
+        let (state, _rx) = state();
+        let (port, paths) = spawn_path_recording_gatekeeper().await;
+        let mut pollers = AdmissionPollers::new(port, Ipv4Addr::new(127, 0, 0, 1), state);
+
+        pollers.sync("c-1", &[node("n-1", "127.0.0.1")]);
+        wait_for_poll_path(&paths, "/api/connector/c-1/poll").await;
+
+        pollers.sync("c-2", &[node("n-1", "127.0.0.1")]);
+        wait_for_poll_path(&paths, "/api/connector/c-2/poll").await;
+        let seen_after_change = paths.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let later = paths.lock().unwrap()[seen_after_change..].to_vec();
+        assert!(!later.is_empty(), "the poller should keep polling");
+        assert!(
+            later.iter().all(|path| path == "/api/connector/c-2/poll"),
+            "every poll after the change must use the new id, saw {later:?}"
+        );
     }
 
     #[test]
