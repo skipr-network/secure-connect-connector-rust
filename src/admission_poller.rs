@@ -16,12 +16,14 @@
 //!
 //! **Within the Connector<->Node tunnel, per spec §B.8** ("a reserved control channel within the
 //! Connector<->Node tunnel carries a flow-admission message"): every poll/result call dials
-//! `tun_device::GATEKEEPER_WG0_ADDRESS` (`10.66.66.1`, Gatekeeper's own fixed address on the same
-//! `wg0` interface this Connector is itself a peer on), never `node.ip_address` (Gatekeeper's
-//! public IP) directly. The kernel route `tun_device::create` already installs for that address
-//! (`ip route replace 10.66.66.0/24 dev <tun-iface>`, originally added for the pre-TT-2144 reply
-//! path - TT-1734 gap #6) means a plain TCP connection to it is transparently carried through
-//! this Connector's TUN device and the existing `run_tun_send_loop`/`run_wireguard_receive_loop`
+//! `Config::gatekeeper_wg0_address` (`10.66.66.1` by default - Gatekeeper's own fixed address on
+//! the same `wg0` interface this Connector is itself a peer on, per the orchestrator's node-
+//! provisioning convention; overridable per TT-2144 review PR #21, see that field's own doc for
+//! why this moved out of a hardcoded constant), never `node.ip_address` (Gatekeeper's public IP)
+//! directly. The kernel route `tun_device::create` already installs for that same address (`ip
+//! route replace {address}/24 dev <tun-iface>`, originally added for the pre-TT-2144 reply path -
+//! TT-1734 gap #6) means a plain TCP connection to it is transparently carried through this
+//! Connector's TUN device and the existing `run_tun_send_loop`/`run_wireguard_receive_loop`
 //! machinery, out over the real encrypted WireGuard tunnel to that specific Node's Gatekeeper - no
 //! new userspace TCP stack needed, just dialing the address that's already routed correctly. (See
 //! `connect_registered`'s own doc for why that connection is driven via a bound `TcpSocket`
@@ -86,7 +88,6 @@ use crate::flow_control::{
     ControlPlaneState, FlowAdmissionRequest, FlowReleaseRequest, handle_flow_admission,
     handle_flow_release,
 };
-use crate::tun_device::GATEKEEPER_WG0_ADDRESS;
 
 /// Backoff between poll attempts after a transport failure (connection refused, timeout, non-2xx
 /// status, unparseable body) - distinct from the poll call's own long-poll timeout, which is
@@ -120,15 +121,22 @@ struct ConnectorPollResponse {
 pub struct AdmissionPollers {
     connector_id: String,
     gatekeeper_http_port: u16,
+    gatekeeper_wg0_address: Ipv4Addr,
     state: ControlPlaneState,
     tasks: HashMap<String, JoinHandle<()>>,
 }
 
 impl AdmissionPollers {
-    pub fn new(connector_id: String, gatekeeper_http_port: u16, state: ControlPlaneState) -> Self {
+    pub fn new(
+        connector_id: String,
+        gatekeeper_http_port: u16,
+        gatekeeper_wg0_address: Ipv4Addr,
+        state: ControlPlaneState,
+    ) -> Self {
         Self {
             connector_id,
             gatekeeper_http_port,
+            gatekeeper_wg0_address,
             state,
             tasks: HashMap::new(),
         }
@@ -159,6 +167,7 @@ impl AdmissionPollers {
             let handle = tokio::spawn(run_poller(
                 node.node_id.clone(),
                 self.gatekeeper_http_port,
+                self.gatekeeper_wg0_address,
                 self.connector_id.clone(),
                 self.state.clone(),
             ));
@@ -192,12 +201,13 @@ impl Drop for AdmissionPollers {
 /// network I/O - so the assigned port is known, and can be registered, strictly before `connect()`
 /// is ever called and a single packet leaves.
 ///
-/// `gatekeeper_addr` is always `GATEKEEPER_WG0_ADDRESS` in production (every real call site below
-/// passes it unconditionally) - a parameter here, not a hardcoded constant, purely so tests can
-/// point this at a loopback listener instead: `GATEKEEPER_WG0_ADDRESS` has no route to it at all
-/// in a plain test process (no real TUN device), so hardcoding it here would make every
-/// network-calling function in this module untestable rather than just the handful of lines that
-/// actually need a real tunnel.
+/// `gatekeeper_addr` is always `Config::gatekeeper_wg0_address` in production (every real call
+/// site below passes it through unconditionally) - a parameter here, not a hardcoded constant,
+/// both because it's itself configurable now (TT-2144 review PR #21) and so tests can point this
+/// at a loopback listener instead: the real address has no route to it at all in a plain test
+/// process (no real TUN device), so hardcoding it here would make every network-calling function
+/// in this module untestable rather than just the handful of lines that actually need a real
+/// tunnel.
 async fn connect_registered(
     node_id: &str,
     flow_table: &std::sync::Mutex<crate::flow_table::FlowTable>,
@@ -268,16 +278,17 @@ async fn send_once(
 async fn run_poller(
     node_id: String,
     gatekeeper_http_port: u16,
+    gatekeeper_wg0_address: Ipv4Addr,
     connector_id: String,
     state: ControlPlaneState,
 ) {
     let poll_path = format!("/api/connector/{connector_id}/poll");
-    let host_header = format!("{GATEKEEPER_WG0_ADDRESS}:{gatekeeper_http_port}");
+    let host_header = format!("{gatekeeper_wg0_address}:{gatekeeper_http_port}");
     loop {
         let stream = match connect_registered(
             &node_id,
             &state.flow_table,
-            GATEKEEPER_WG0_ADDRESS,
+            gatekeeper_wg0_address,
             gatekeeper_http_port,
         )
         .await
@@ -312,7 +323,7 @@ async fn run_poller(
                     Ok(message) => {
                         handle_message(
                             &node_id,
-                            GATEKEEPER_WG0_ADDRESS,
+                            gatekeeper_wg0_address,
                             gatekeeper_http_port,
                             &connector_id,
                             &state,
@@ -385,7 +396,6 @@ async fn handle_admission(
     let response = handle_flow_admission(
         &state.policy_store,
         &state.audit_log,
-        &state.signature_binding,
         &state.flow_table,
         request,
     )
@@ -471,7 +481,6 @@ mod tests {
     use crate::audit::AuditLog;
     use crate::flow_table::FlowTable;
     use crate::policy::PolicyStore;
-    use crate::signature_binding::SignatureBindingGuard;
     use std::sync::{Arc, Mutex};
 
     fn state() -> (
@@ -484,7 +493,6 @@ mod tests {
             ControlPlaneState {
                 policy_store: Arc::new(PolicyStore::new()),
                 audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
-                signature_binding: Arc::new(Mutex::new(SignatureBindingGuard::new())),
                 flow_table: Arc::new(Mutex::new(FlowTable::new())),
                 recovered_packet_tx: tx,
             },
@@ -504,13 +512,14 @@ mod tests {
     fn sync_starts_a_poller_for_each_new_node_and_stops_it_when_the_node_disappears() {
         let (state, _rx) = state();
         // A Tokio runtime is needed to spawn tasks on, but this test never actually drives them -
-        // there is no route to GATEKEEPER_WG0_ADDRESS in a plain test process, so any spawned
+        // there is no route to the real gatekeeper_wg0_address in a plain test process, so any spawned
         // poller just sits retrying against a connection failure, exercised only for its lifecycle
         // bookkeeping (tasks map), not its behavior.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
 
-        let mut pollers = AdmissionPollers::new("c-1".to_string(), 4000, state);
+        let mut pollers =
+            AdmissionPollers::new("c-1".to_string(), 4000, Ipv4Addr::new(10, 66, 66, 1), state);
         pollers.sync(&[node("n-1", "10.0.0.1"), node("n-2", "10.0.0.2")]);
         assert_eq!(
             pollers.running_node_ids(),
@@ -535,7 +544,8 @@ mod tests {
         let (state, _rx) = state();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
-        let mut pollers = AdmissionPollers::new("c-1".to_string(), 4000, state);
+        let mut pollers =
+            AdmissionPollers::new("c-1".to_string(), 4000, Ipv4Addr::new(10, 66, 66, 1), state);
 
         pollers.sync(&[node("n-1", "10.0.0.1")]);
         let first_id = pollers.tasks.get("n-1").unwrap().id();
@@ -555,7 +565,7 @@ mod tests {
     /// `main.rs`'s `run_tun_send_loop` uses for this Connector's own outbound packets), not the
     /// unrelated `node_for_control_channel_port` (keyed the opposite way, for the opposite,
     /// Gatekeeper-dials-in direction - see both doc comments). Can't dial the real
-    /// `GATEKEEPER_WG0_ADDRESS` constant in a test process (no route to it without a real TUN
+    /// the real `gatekeeper_wg0_address` in a test process (no route to it without a real TUN
     /// device), so this points `connect_registered` at a loopback address instead.
     #[tokio::test]
     async fn connect_registered_registers_the_connections_own_local_port_as_an_outbound_one() {
@@ -741,7 +751,7 @@ mod tests {
     /// pair to pass as `handle_admission`/`handle_message`'s `gatekeeper_addr`/
     /// `gatekeeper_http_port` - what makes this module's real network-calling code (not just
     /// `connect_registered`/`send_once` in isolation) exercisable in a test process at all, since
-    /// the real `GATEKEEPER_WG0_ADDRESS` constant has no route to it without an actual TUN device.
+    /// the real `gatekeeper_wg0_address` has no route to it without an actual TUN device.
     /// `on_admission_result` receives each posted-back `FlowAdmissionResponse` body, for tests that
     /// need to assert on what was actually sent.
     async fn spawn_mock_gatekeeper(
@@ -830,7 +840,7 @@ mod tests {
                     endpoints: vec![],
                     entitlement_list: vec![crate::dto::Entitlement {
                         user_id: "u-1".to_string(),
-                        device_public_key: device.public_key_hex.clone(),
+                        device_public_key: Some(device.public_key_hex.clone()),
                     }],
                 }],
                 node_list: vec![],

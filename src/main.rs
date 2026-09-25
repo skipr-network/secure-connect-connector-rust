@@ -12,7 +12,6 @@ mod heartbeat;
 mod identity;
 mod policy;
 mod registry_client;
-mod signature_binding;
 mod tun_device;
 mod tunnel;
 
@@ -182,12 +181,10 @@ async fn main() -> anyhow::Result<()> {
     let mut admission_pollers = AdmissionPollers::new(
         config.connector_id.clone(),
         config.gatekeeper_http_port,
+        config.gatekeeper_wg0_address,
         ControlPlaneState {
             policy_store: policy_store.clone(),
             audit_log: audit_log.clone(),
-            signature_binding: Arc::new(std::sync::Mutex::new(
-                signature_binding::SignatureBindingGuard::new(),
-            )),
             flow_table: flow_table.clone(),
             recovered_packet_tx,
         },
@@ -232,9 +229,13 @@ async fn main() -> anyhow::Result<()> {
     // proven for real via two Docker containers exchanging genuine ICMP
     // traffic through actual WireGuard encryption before this was wired in
     // (see tunnel.rs's module doc comment).
-    let (tun_reader, tun_writer) =
-        tun_device::create(connector_virtual_ip, config.tun_netmask, 1400)
-            .context("failed to create the Connector's TUN device")?;
+    let (tun_reader, tun_writer) = tun_device::create(
+        connector_virtual_ip,
+        config.tun_netmask,
+        1400,
+        config.gatekeeper_wg0_address,
+    )
+    .context("failed to create the Connector's TUN device")?;
     info!(tun_addr = %connector_virtual_ip, tun_netmask = %config.tun_netmask, "TUN device ready");
 
     tokio::spawn(run_wireguard_receive_loop(
@@ -499,20 +500,24 @@ fn reconcile_dropped_entitlements(
                 bundle
                     .entitlement_list
                     .iter()
-                    .map(|e| e.device_public_key.as_str())
+                    .filter_map(|e| e.device_public_key.as_deref())
                     .collect()
             })
             .unwrap_or_default();
         for entitlement in &old_bundle.entitlement_list {
-            if still_entitled.contains(entitlement.device_public_key.as_str()) {
+            // No device ever means no admitted flow to evict either - `access::decide_access_at`
+            // can never have matched a real connecting device against a `None` entitlement.
+            let Some(device_public_key) = entitlement.device_public_key.as_deref() else {
+                continue;
+            };
+            if still_entitled.contains(device_public_key) {
                 continue;
             }
-            let evicted =
-                table.evict_gateway_device(&old_bundle.gateway_id, &entitlement.device_public_key);
+            let evicted = table.evict_gateway_device(&old_bundle.gateway_id, device_public_key);
             if evicted > 0 {
                 info!(
                     gateway_id = %old_bundle.gateway_id,
-                    device_public_key = %entitlement.device_public_key,
+                    device_public_key,
                     evicted,
                     "entitlement dropped: tore down admitted flow(s) for this gateway"
                 );
@@ -1002,6 +1007,7 @@ mod tests {
             identity_key_path: "/tmp/unused-in-this-test".into(),
             audit_log_path: "/tmp/unused-in-this-test-audit.log".into(),
             gatekeeper_http_port: 0,
+            gatekeeper_wg0_address: std::net::Ipv4Addr::new(10, 66, 66, 1),
             tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
             ca_bundle_path: None,
@@ -1021,6 +1027,7 @@ mod tests {
         AdmissionPollers::new(
             "c-1".to_string(),
             0,
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
             ControlPlaneState {
                 policy_store: Arc::new(PolicyStore::new()),
                 // AuditLog::new only stores the path lazily - never opened unless something
@@ -1028,9 +1035,6 @@ mod tests {
                 // tests do, so a fixed path under the OS temp dir is fine here.
                 audit_log: Arc::new(AuditLog::new(
                     std::env::temp_dir().join("connector-rust-test-unused-audit.log"),
-                )),
-                signature_binding: Arc::new(std::sync::Mutex::new(
-                    signature_binding::SignatureBindingGuard::new(),
                 )),
                 flow_table: Arc::new(std::sync::Mutex::new(FlowTable::new())),
                 recovered_packet_tx: tokio::sync::mpsc::unbounded_channel().0,
@@ -2288,7 +2292,7 @@ mod tests {
                 .iter()
                 .map(|key| Entitlement {
                     user_id: "u-1".to_string(),
-                    device_public_key: key.to_string(),
+                    device_public_key: Some(key.to_string()),
                 })
                 .collect(),
         }
