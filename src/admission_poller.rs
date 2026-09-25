@@ -120,8 +120,13 @@ struct ConnectorPollResponse {
 /// Tracks one long-poll task per currently-paired Node, spawned/aborted to match each heartbeat's
 /// own `node_list` (see `sync`). Owns the `ControlPlaneState` every poller task shares (cheaply
 /// `Clone`, `Arc`-backed).
+///
+/// The poll/result paths are keyed by the `connector_id` Portal assigned, which is what Agent
+/// provisions on each Gatekeeper - not this Connector's public key. Since TT-2210 the Connector no
+/// longer has that id at startup (it heartbeats by public key alone), so it comes from each
+/// heartbeat response via `sync`.
 pub struct AdmissionPollers {
-    connector_id: String,
+    connector_id: Option<String>,
     gatekeeper_http_port: u16,
     gatekeeper_wg0_address: Ipv4Addr,
     state: ControlPlaneState,
@@ -130,13 +135,12 @@ pub struct AdmissionPollers {
 
 impl AdmissionPollers {
     pub fn new(
-        connector_id: String,
         gatekeeper_http_port: u16,
         gatekeeper_wg0_address: Ipv4Addr,
         state: ControlPlaneState,
     ) -> Self {
         Self {
-            connector_id,
+            connector_id: None,
             gatekeeper_http_port,
             gatekeeper_wg0_address,
             state,
@@ -148,7 +152,23 @@ impl AdmissionPollers {
     /// any running poller for a node no longer present - called on every heartbeat, mirroring
     /// `TunnelManager::sync_nodes`'s own add/drop shape but against the raw node list directly (see
     /// the module doc for why this is deliberately not gated on a reported WireGuard key).
-    pub fn sync(&mut self, nodes: &[HeartbeatNode]) {
+    ///
+    /// `connector_id` is the heartbeat response's own. If it differs from the one the running
+    /// pollers were started with (the Connector was re-registered in Portal under a new id), every
+    /// poller is restarted, since each one polls a path built from that id.
+    pub fn sync(&mut self, connector_id: &str, nodes: &[HeartbeatNode]) {
+        if self.connector_id.as_deref() != Some(connector_id) {
+            if !self.tasks.is_empty() {
+                info!(
+                    previous = ?self.connector_id,
+                    %connector_id,
+                    "connector_id changed - restarting every admission poller"
+                );
+            }
+            self.stop_all();
+            self.connector_id = Some(connector_id.to_string());
+        }
+
         let seen: HashSet<&str> = nodes.iter().map(|node| node.node_id.as_str()).collect();
 
         self.tasks.retain(|node_id, handle| {
@@ -170,11 +190,23 @@ impl AdmissionPollers {
                 node.node_id.clone(),
                 self.gatekeeper_http_port,
                 self.gatekeeper_wg0_address,
-                self.connector_id.clone(),
+                connector_id.to_string(),
                 self.state.clone(),
             ));
             self.tasks.insert(node.node_id.clone(), handle);
         }
+    }
+
+    fn stop_all(&mut self) {
+        for handle in self.tasks.values() {
+            handle.abort();
+        }
+        self.tasks.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connector_id(&self) -> Option<&str> {
+        self.connector_id.as_deref()
     }
 
     #[cfg(test)]
@@ -185,9 +217,7 @@ impl AdmissionPollers {
 
 impl Drop for AdmissionPollers {
     fn drop(&mut self) {
-        for handle in self.tasks.values() {
-            handle.abort();
-        }
+        self.stop_all();
     }
 }
 
@@ -277,6 +307,10 @@ async fn send_once(
     }
 }
 
+fn poll_path(connector_id: &str) -> String {
+    format!("/api/connector/{connector_id}/poll")
+}
+
 async fn run_poller(
     node_id: String,
     gatekeeper_http_port: u16,
@@ -284,7 +318,7 @@ async fn run_poller(
     connector_id: String,
     state: ControlPlaneState,
 ) {
-    let poll_path = format!("/api/connector/{connector_id}/poll");
+    let poll_path = poll_path(&connector_id);
     let host_header = format!("{gatekeeper_wg0_address}:{gatekeeper_http_port}");
     loop {
         let stream = match connect_registered(
@@ -600,21 +634,20 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
 
-        let mut pollers =
-            AdmissionPollers::new("c-1".to_string(), 4000, Ipv4Addr::new(10, 66, 66, 1), state);
-        pollers.sync(&[node("n-1", "10.0.0.1"), node("n-2", "10.0.0.2")]);
+        let mut pollers = AdmissionPollers::new(4000, Ipv4Addr::new(10, 66, 66, 1), state);
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1"), node("n-2", "10.0.0.2")]);
         assert_eq!(
             pollers.running_node_ids(),
             HashSet::from(["n-1".to_string(), "n-2".to_string()])
         );
 
-        pollers.sync(&[node("n-1", "10.0.0.1")]);
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1")]);
         assert_eq!(
             pollers.running_node_ids(),
             HashSet::from(["n-1".to_string()])
         );
 
-        pollers.sync(&[node("n-1", "10.0.0.1"), node("n-3", "10.0.0.3")]);
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1"), node("n-3", "10.0.0.3")]);
         assert_eq!(
             pollers.running_node_ids(),
             HashSet::from(["n-1".to_string(), "n-3".to_string()])
@@ -622,16 +655,57 @@ mod tests {
     }
 
     #[test]
+    fn the_poll_path_is_keyed_by_connector_id() {
+        assert_eq!(
+            poll_path("4021b2a9-f9d2-4a3c-ae6e-c5adf8c70424"),
+            "/api/connector/4021b2a9-f9d2-4a3c-ae6e-c5adf8c70424/poll"
+        );
+    }
+
+    /// TT-2210 follow-up: the pollers take the id from the heartbeat, not the public key they were
+    /// once constructed with. Gatekeeper refuses a poll under any other id.
+    #[test]
+    fn sync_records_the_heartbeats_connector_id() {
+        let (state, _rx) = state();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let mut pollers = AdmissionPollers::new(4000, Ipv4Addr::new(10, 66, 66, 1), state);
+
+        assert_eq!(pollers.connector_id, None);
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1")]);
+
+        assert_eq!(pollers.connector_id.as_deref(), Some("c-1"));
+    }
+
+    #[test]
+    fn sync_restarts_every_poller_when_the_connector_id_changes() {
+        let (state, _rx) = state();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let mut pollers = AdmissionPollers::new(4000, Ipv4Addr::new(10, 66, 66, 1), state);
+
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1")]);
+        let first_id = pollers.tasks.get("n-1").unwrap().id();
+        pollers.sync("c-2", &[node("n-1", "10.0.0.1")]);
+        let second_id = pollers.tasks.get("n-1").unwrap().id();
+
+        assert_ne!(
+            first_id, second_id,
+            "a new connector_id must restart the node's poller"
+        );
+        assert_eq!(pollers.connector_id.as_deref(), Some("c-2"));
+    }
+
+    #[test]
     fn sync_does_not_restart_an_already_running_poller_for_the_same_node() {
         let (state, _rx) = state();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _guard = runtime.enter();
-        let mut pollers =
-            AdmissionPollers::new("c-1".to_string(), 4000, Ipv4Addr::new(10, 66, 66, 1), state);
+        let mut pollers = AdmissionPollers::new(4000, Ipv4Addr::new(10, 66, 66, 1), state);
 
-        pollers.sync(&[node("n-1", "10.0.0.1")]);
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1")]);
         let first_id = pollers.tasks.get("n-1").unwrap().id();
-        pollers.sync(&[node("n-1", "10.0.0.1")]);
+        pollers.sync("c-1", &[node("n-1", "10.0.0.1")]);
         let second_id = pollers.tasks.get("n-1").unwrap().id();
 
         assert_eq!(
