@@ -669,8 +669,21 @@ fn prepare_decrypted_packet_for_forwarding(
         // (the admission/release decision itself) has somewhere to route back to - previously
         // nothing was recorded here at all, so Gatekeeper's own admission call could never
         // complete, regardless of whether the client flow it was deciding about was admitted.
+        //
+        // TT-2297: except a reply on one of this Connector's OWN outbound connections (its
+        // destination port is one the admission poller registered). Its source port is
+        // Gatekeeper's fixed HTTP port, the same on every node, so recording it would claim that
+        // port for this node and misroute every other node's polls.
         if let Some(source_port) = tunnel::parse_source_port(packet) {
-            flow_table.record_control_channel_port(node_id, source_port);
+            let is_reply_to_own_connection =
+                tunnel::parse_destination_port(packet).is_some_and(|port| {
+                    flow_table
+                        .node_for_outbound_control_channel_source_port(port)
+                        .is_some()
+                });
+            if !is_reply_to_own_connection {
+                flow_table.record_control_channel_port(node_id, source_port);
+            }
         }
         return true;
     }
@@ -878,27 +891,30 @@ fn prepare_reply_packet_for_forwarding(
     destination_port: u16,
     flow_table: &FlowTable,
 ) -> Option<String> {
-    // TT-2102: a reply to this Connector's own control-plane API (Gatekeeper's admission/release
-    // decision) needs no address rewrite at all - it was forwarded to the local server unchanged
-    // on the way in (see prepare_decrypted_packet_for_forwarding's connector_virtual_ip branch),
-    // so its reply already carries the right addresses on the way out too. Checked first, and
-    // returns immediately: node_for_port below has no entry for this port at all (control-channel
-    // connections are never admitted flows), so falling through would only ever drop it.
-    if let Some(node_id) = flow_table.node_for_control_channel_port(destination_port) {
-        return Some(node_id.to_string());
-    }
-
     // TT-2144: this Connector's OWN outbound connection to Gatekeeper's tunnel address (the
     // admission poller's poll/admission-result calls) - matched on this packet's own *source*
-    // port, never destination_port above (which is Gatekeeper's fixed HTTP port, identical across
-    // every node, and so carries no information at all about which node a brand new outbound
-    // connection is even for - see `FlowTable::outbound_control_channel_ports`'s doc). Needs no
-    // address rewrite either, for the same reason as the branch above: this connection's own
-    // packets already carry this Connector's real (connector_virtual_ip) source address, nothing
-    // masqueraded to restore.
+    // port, never its destination (Gatekeeper's fixed HTTP port, identical across every node, and
+    // so carrying no information at all about which node a connection is for - see
+    // `FlowTable::outbound_control_channel_ports`'s doc). Needs no address rewrite: these packets
+    // already carry this Connector's real (connector_virtual_ip) source address.
+    //
+    // TT-2297: checked FIRST. The source port was registered before the connection's first packet
+    // and belongs to exactly one connection, so it is the one lookup here that can't be wrong. The
+    // destination-port lookup below was checked first before, and once any Gatekeeper reply had
+    // recorded its source port (4000) there, every node's polls went to whichever node answered
+    // last - and to nowhere at all once that node left the node_list.
     if let Some(source_port) = tunnel::parse_source_port(packet)
         && let Some(node_id) = flow_table.node_for_outbound_control_channel_source_port(source_port)
     {
+        return Some(node_id.to_string());
+    }
+
+    // TT-2102: a reply on a connection Gatekeeper opened to this Connector's own control-plane
+    // address needs no address rewrite at all - it was forwarded unchanged on the way in (see
+    // prepare_decrypted_packet_for_forwarding's connector_virtual_ip branch). node_for_port below
+    // has no entry for this port (control-channel connections are never admitted flows), so
+    // falling through would only ever drop it.
+    if let Some(node_id) = flow_table.node_for_control_channel_port(destination_port) {
         return Some(node_id.to_string());
     }
 
@@ -1399,13 +1415,12 @@ mod tests {
     }
 
     /// The two directions must never be conflated even when the raw port number happens to
-    /// coincide - see `FlowTable`'s own test of the same property; this proves it holds through
-    /// `prepare_reply_packet_for_forwarding`'s actual lookup order too; the inbound
-    /// (destination-port-keyed) mapping takes precedence when both happen to have an entry at the
-    /// same numeric port, matching the existing control-channel-vs-admitted-flow precedence test
-    /// above.
+    /// coincide - see `FlowTable`'s own test of the same property. TT-2297: the outbound
+    /// (source-port-keyed) mapping takes precedence. It names exactly one connection this Connector
+    /// opened itself; the inbound key is only the peer's port, which for every Gatekeeper reply is
+    /// the same fixed HTTP port on every node.
     #[test]
-    fn prepare_reply_packet_prefers_the_inbound_control_channel_mapping_over_an_outbound_one_at_the_same_port_number()
+    fn prepare_reply_packet_prefers_the_outbound_control_channel_mapping_over_an_inbound_one_at_the_same_port_number()
      {
         let mut flow_table = FlowTable::new();
         flow_table.record_control_channel_port("n-1", 51234);
@@ -1425,9 +1440,103 @@ mod tests {
 
         assert_eq!(
             node_id,
-            Some("n-1".to_string()),
-            "the inbound (destination-port) mapping, checked first, must take precedence"
+            Some("n-2".to_string()),
+            "the outbound (source-port) mapping, checked first, must take precedence"
         );
+    }
+
+    /// TT-2297: the live failure. Two nodes each hold a poll open to the same Gatekeeper port, and
+    /// an entry for that port from an earlier reply points at the first node. The second node's
+    /// poll must still go through the second node's tunnel.
+    #[test]
+    fn a_polls_packets_follow_its_own_node_not_the_node_that_answered_last() {
+        let mut flow_table = FlowTable::new();
+        flow_table.record_outbound_control_channel_port("n-1", 50001);
+        flow_table.record_outbound_control_channel_port("n-2", 50002);
+        flow_table.record_control_channel_port("n-1", 4000);
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 98, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            50002,
+            4000,
+        );
+
+        let node_id = prepare_reply_packet_for_forwarding(&mut packet, 4000, &flow_table);
+
+        assert_eq!(node_id, Some("n-2".to_string()));
+    }
+
+    /// TT-2297: after the first node leaves the node_list (a rotation), the second node's polls
+    /// still reach it.
+    #[test]
+    fn a_polls_packets_still_reach_their_node_after_another_node_is_evicted() {
+        let mut flow_table = FlowTable::new();
+        flow_table.record_outbound_control_channel_port("n-1", 50001);
+        flow_table.record_outbound_control_channel_port("n-2", 50002);
+        flow_table.record_control_channel_port("n-1", 4000);
+        flow_table.evict_node("n-1");
+        let mut packet = udp_packet(
+            std::net::Ipv4Addr::new(10, 98, 0, 5),
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            50002,
+            4000,
+        );
+
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut packet, 4000, &flow_table),
+            Some("n-2".to_string())
+        );
+    }
+
+    /// TT-2297: Gatekeeper's reply to one of this Connector's own polls must not be recorded as an
+    /// inbound control-channel connection - its source port is Gatekeeper's fixed HTTP port, the
+    /// same on every node.
+    #[test]
+    fn a_reply_to_the_connectors_own_poll_is_not_recorded_as_an_inbound_control_channel_port() {
+        let mut flow_table = FlowTable::new();
+        flow_table.record_outbound_control_channel_port("n-2", 50002);
+        let connector_virtual_ip = std::net::Ipv4Addr::new(10, 98, 0, 5);
+        let mut reply = udp_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            connector_virtual_ip,
+            4000,
+            50002,
+        );
+
+        let forwarded = prepare_decrypted_packet_for_forwarding(
+            &mut reply,
+            "n-2",
+            std::net::IpAddr::V4(connector_virtual_ip),
+            &mut flow_table,
+            &dns_cache::DnsCache::new(),
+        );
+
+        assert!(forwarded, "the reply itself is still delivered");
+        assert!(flow_table.node_for_control_channel_port(4000).is_none());
+    }
+
+    /// A genuinely inbound connection (Gatekeeper dialing this Connector) is still recorded, as
+    /// before (TT-2102).
+    #[test]
+    fn an_inbound_control_channel_connection_is_still_recorded() {
+        let mut flow_table = FlowTable::new();
+        let connector_virtual_ip = std::net::Ipv4Addr::new(10, 98, 0, 5);
+        let mut request = udp_packet(
+            std::net::Ipv4Addr::new(10, 66, 66, 1),
+            connector_virtual_ip,
+            51234,
+            8443,
+        );
+
+        prepare_decrypted_packet_for_forwarding(
+            &mut request,
+            "n-1",
+            std::net::IpAddr::V4(connector_virtual_ip),
+            &mut flow_table,
+            &dns_cache::DnsCache::new(),
+        );
+
+        assert_eq!(flow_table.node_for_control_channel_port(51234), Some("n-1"));
     }
 
     #[test]
