@@ -25,8 +25,12 @@
 # Usage:
 #   sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... packaging/install-systemd.sh
 #                                               install (or update) and start the service
-#   packaging/install-systemd.sh --uninstall   stop, disable, and remove the service and binary
-#                                               (connector.env is left in place)
+#   packaging/install-systemd.sh --uninstall   stop, disable, and remove the service, the binary
+#                                               and the identity key (connector.env is left in
+#                                               place), so the next install is a new Connector
+#   packaging/install-systemd.sh --uninstall --keep-identity
+#                                               same, but keep the identity key, so a later
+#                                               install comes back as the same Connector
 set -euo pipefail
 
 SERVICE_NAME="secure-connect-connector"
@@ -34,12 +38,36 @@ UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_DIR="/etc/skipr/connector"
 ENV_FILE="${ENV_DIR}/connector.env"
 INSTALLED_BINARY_PATH="/usr/local/bin/secure_connect_connector"
+DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
 
 if [ "${1:-}" = "--uninstall" ]; then
+  KEEP_IDENTITY=false
+  case "${2:-}" in
+    "") ;;
+    --keep-identity) KEEP_IDENTITY=true ;;
+    *)
+      echo "error: unknown option '${2}' - usage: $0 --uninstall [--keep-identity]" >&2
+      exit 1
+      ;;
+  esac
   sudo systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   sudo rm -f "$UNIT_PATH" "$INSTALLED_BINARY_PATH"
   sudo systemctl daemon-reload
   echo "Uninstalled $SERVICE_NAME - $ENV_FILE was left in place."
+  # TT-2326: the identity key used to survive an uninstall, so uninstalling and installing again
+  # silently brought back the same public key - and with it the same, possibly stale, registration
+  # in Portal. Uninstall now means "this Connector is gone"; --keep-identity is for an uninstall
+  # that is only temporary. The install below always writes the path it used back into
+  # $ENV_FILE unquoted, so reading that line is enough to find a custom path.
+  IDENTITY_KEY_PATH="$(sudo grep -E '^CONNECTOR_IDENTITY_KEY_PATH=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  IDENTITY_KEY_PATH="${IDENTITY_KEY_PATH:-$DEFAULT_IDENTITY_KEY_PATH}"
+  if [ "$KEEP_IDENTITY" = true ]; then
+    echo "Identity key kept at $IDENTITY_KEY_PATH - installing again brings back the same Connector."
+  elif sudo test -f "$IDENTITY_KEY_PATH"; then
+    sudo rm -f "$IDENTITY_KEY_PATH"
+    echo "Removed identity key $IDENTITY_KEY_PATH - installing again creates a new Connector"
+    echo "identity, whose public key has to be registered in Portal's Deploy Connector screen."
+  fi
   exit 0
 fi
 
@@ -86,8 +114,6 @@ if [ ! -x "$BUILT_BINARY_PATH" ]; then
     exit 1
   fi
 fi
-
-DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
 
 sudo mkdir -p "$ENV_DIR"
 sudo install -d -o "$RUN_AS_USER" -m 750 /var/skipr/connector/audit /var/skipr/connector/.keys
@@ -342,4 +368,5 @@ else
   fi
 fi
 echo ""
-echo "To uninstall: packaging/install-systemd.sh --uninstall"
+echo "To uninstall: packaging/install-systemd.sh --uninstall (also deletes the identity key;"
+echo "  add --keep-identity to keep it, so a later install comes back as the same Connector)"
