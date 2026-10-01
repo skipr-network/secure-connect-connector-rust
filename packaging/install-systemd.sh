@@ -24,7 +24,13 @@
 #
 # Usage:
 #   sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... packaging/install-systemd.sh
-#                                               install (or update) and start the service
+#                                               install (or update) and start the service. If an
+#                                               identity key already exists, an interactive run asks
+#                                               whether to keep it (the default) or generate a new
+#                                               one; a non-interactive run keeps it
+#   sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... packaging/install-systemd.sh --regenerate-identity
+#                                               same, but always replace an existing identity key with
+#                                               a new one, without asking (for scripted installs)
 #   packaging/install-systemd.sh --uninstall   stop, disable, and remove the service, the binary
 #                                               and the identity key (connector.env is left in
 #                                               place), so the next install is a new Connector
@@ -40,16 +46,48 @@ ENV_FILE="${ENV_DIR}/connector.env"
 INSTALLED_BINARY_PATH="/usr/local/bin/secure_connect_connector"
 DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
 
-if [ "${1:-}" = "--uninstall" ]; then
-  KEEP_IDENTITY=false
-  case "${2:-}" in
-    "") ;;
+usage_error() {
+  echo "error: $1" >&2
+  echo "usage: $0 [--regenerate-identity] | --uninstall [--keep-identity]" >&2
+  exit 1
+}
+
+UNINSTALL=false
+KEEP_IDENTITY=false
+REGENERATE_IDENTITY=false
+for arg in "$@"; do
+  case "$arg" in
+    --uninstall) UNINSTALL=true ;;
     --keep-identity) KEEP_IDENTITY=true ;;
-    *)
-      echo "error: unknown option '${2}' - usage: $0 --uninstall [--keep-identity]" >&2
-      exit 1
-      ;;
+    --regenerate-identity) REGENERATE_IDENTITY=true ;;
+    *) usage_error "unknown option '$arg'" ;;
   esac
+done
+if [ "$KEEP_IDENTITY" = true ] && [ "$UNINSTALL" = false ]; then
+  usage_error "--keep-identity only applies to --uninstall"
+fi
+if [ "$REGENERATE_IDENTITY" = true ] && [ "$UNINSTALL" = true ]; then
+  usage_error "--regenerate-identity only applies to an install"
+fi
+
+# The identity key path the daemon actually uses: CONNECTOR_IDENTITY_KEY_PATH from $ENV_FILE as
+# systemd's EnvironmentFile parser reads it, or the default when it is unset or only commented
+# out. systemd strips surrounding whitespace, then a matching pair of leading/trailing quotes
+# (CONNECTOR_IDENTITY_KEY_PATH="/path" or ='/path') before the daemon ever sees the value - grep +
+# cut alone doesn't, so a quoted value (a natural thing to write) or a stray trailing space would
+# otherwise give a path that still has the quote characters (or the space) in it. Trim first, then
+# unquote - trimming first also handles a quoted value with trailing whitespace, which would
+# otherwise break the quote-stripping pattern and leave the quotes in place. Install and uninstall
+# both read the path through here (TT-2326), so they can never disagree on which file is the key.
+identity_key_path() {
+  local configured
+  configured="$(sudo grep -E '^CONNECTOR_IDENTITY_KEY_PATH=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  configured="$(printf '%s' "$configured" |
+    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
+  printf '%s' "${configured:-$DEFAULT_IDENTITY_KEY_PATH}"
+}
+
+if [ "$UNINSTALL" = true ]; then
   sudo systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   sudo rm -f "$UNIT_PATH" "$INSTALLED_BINARY_PATH"
   sudo systemctl daemon-reload
@@ -57,16 +95,16 @@ if [ "${1:-}" = "--uninstall" ]; then
   # TT-2326: the identity key used to survive an uninstall, so uninstalling and installing again
   # silently brought back the same public key - and with it the same, possibly stale, registration
   # in Portal. Uninstall now means "this Connector is gone"; --keep-identity is for an uninstall
-  # that is only temporary. The install below always writes the path it used back into
-  # $ENV_FILE unquoted, so reading that line is enough to find a custom path.
-  IDENTITY_KEY_PATH="$(sudo grep -E '^CONNECTOR_IDENTITY_KEY_PATH=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
-  IDENTITY_KEY_PATH="${IDENTITY_KEY_PATH:-$DEFAULT_IDENTITY_KEY_PATH}"
+  # that is only temporary.
+  IDENTITY_KEY_PATH="$(identity_key_path)"
   if [ "$KEEP_IDENTITY" = true ]; then
     echo "Identity key kept at $IDENTITY_KEY_PATH - installing again brings back the same Connector."
   elif sudo test -f "$IDENTITY_KEY_PATH"; then
     sudo rm -f "$IDENTITY_KEY_PATH"
     echo "Removed identity key $IDENTITY_KEY_PATH - installing again creates a new Connector"
     echo "identity, whose public key has to be registered in Portal's Deploy Connector screen."
+  else
+    echo "No identity key found at $IDENTITY_KEY_PATH - nothing to remove."
   fi
   exit 0
 fi
@@ -201,22 +239,42 @@ fi
 # CONNECTOR_IDENTITY_KEY_PATH unset would otherwise let the daemon silently generate its own,
 # unregistered identity at first start instead of failing - generating it here first means the
 # right file already exists by the time that happens, for both the default path and a custom
-# one the admin already uncommented in $ENV_FILE. Safe to re-run: load_or_generate loads an
-# existing key file rather than overwriting it.
-CONFIGURED_IDENTITY_KEY_PATH="$(grep -E '^CONNECTOR_IDENTITY_KEY_PATH=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
-# systemd's EnvironmentFile parser strips surrounding whitespace, then a matching pair of
-# leading/trailing quotes (CONNECTOR_IDENTITY_KEY_PATH="/path" or ='/path') before the daemon
-# ever sees the value - grep + cut above doesn't, so an admin who quotes the value (a natural
-# thing to do) or leaves a stray trailing space would otherwise get a path here that still has
-# the quote characters (or the space) in it, generating the identity at a path the daemon itself
-# never actually resolves to. Trim first, then unquote - trimming first also correctly handles a
-# quoted value with trailing whitespace, which would otherwise break the quote-stripping pattern
-# and leave the quotes in place too.
-CONFIGURED_IDENTITY_KEY_PATH="$(printf '%s' "$CONFIGURED_IDENTITY_KEY_PATH" |
-  sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
-IDENTITY_KEY_PATH="${CONFIGURED_IDENTITY_KEY_PATH:-$DEFAULT_IDENTITY_KEY_PATH}"
+# one the admin already uncommented in $ENV_FILE. load_or_generate loads an existing key file
+# rather than overwriting it, so an existing key is only replaced when the admin asks for that below.
+IDENTITY_KEY_PATH="$(identity_key_path)"
 sudo install -d -o "$RUN_AS_USER" -m 750 "$(dirname "$IDENTITY_KEY_PATH")"
-IDENTITY_PUBLIC_KEY="$(sudo -u "$RUN_AS_USER" env CONNECTOR_IDENTITY_KEY_PATH="$IDENTITY_KEY_PATH" "$BUILT_BINARY_PATH" --generate-identity)"
+
+generate_identity() {
+  sudo -u "$RUN_AS_USER" env CONNECTOR_IDENTITY_KEY_PATH="$IDENTITY_KEY_PATH" "$BUILT_BINARY_PATH" --generate-identity
+}
+
+# TT-2326: re-running the install after a first attempt that failed or was abandoned used to keep
+# that attempt's key silently, so the redo came back with a public key that may already have been
+# pasted (or half-registered) somewhere. An existing key is now a choice: keep it - the default, so
+# an upgrade or a re-run after a rebuild keeps the same Connector - or replace it with a new one.
+# --regenerate-identity makes that choice without a prompt, for scripted installs.
+if sudo test -f "$IDENTITY_KEY_PATH"; then
+  REPLACE_IDENTITY="$REGENERATE_IDENTITY"
+  if [ "$REPLACE_IDENTITY" = false ] && [ -t 0 ]; then
+    echo "An identity key already exists at $IDENTITY_KEY_PATH, with public key:"
+    echo "  $(generate_identity)"
+    echo "Keep it if this host is already registered in Portal with that key (an upgrade or re-run)."
+    echo "Generate a new one if a previous install here failed or should not be reused."
+    read -r -p "Keep the existing identity? [Y/n] " IDENTITY_ANSWER
+    case "$IDENTITY_ANSWER" in
+      [nN]|[nN][oO]) REPLACE_IDENTITY=true ;;
+    esac
+  elif [ "$REPLACE_IDENTITY" = false ]; then
+    echo "Keeping the existing identity key at $IDENTITY_KEY_PATH (no terminal to ask);"
+    echo "re-run with --regenerate-identity to replace it with a new one."
+  fi
+  if [ "$REPLACE_IDENTITY" = true ]; then
+    sudo rm -f "$IDENTITY_KEY_PATH"
+    echo "Removed the existing identity key - generating a new one. Register the new public key"
+    echo "below in Portal's Deploy Connector screen; the old key no longer identifies this host."
+  fi
+fi
+IDENTITY_PUBLIC_KEY="$(generate_identity)"
 
 # Write the exact path just used back into $ENV_FILE, canonical and unquoted, replacing whatever
 # commented/quoted/spaced form the admin had (or adding the line if it was never there). This is
@@ -370,3 +428,4 @@ fi
 echo ""
 echo "To uninstall: packaging/install-systemd.sh --uninstall (also deletes the identity key;"
 echo "  add --keep-identity to keep it, so a later install comes back as the same Connector)"
+echo "To reinstall with a new identity: re-run with --regenerate-identity"

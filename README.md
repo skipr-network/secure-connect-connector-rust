@@ -180,8 +180,16 @@ the same Connector, add `--keep-identity`:
 ./packaging/install-systemd.sh --uninstall --keep-identity
 ```
 
-Re-running the install command without uninstalling (for example after a rebuild) always keeps
-the existing key.
+Re-running the install command without uninstalling, when an identity key already exists, asks
+whether to keep it or generate a new one. Keeping it is the default: it is what an upgrade or a
+re-run after a rebuild needs, since the Connector stays registered in Portal under that key.
+Generate a new one when a previous install on this host failed or its key should not be reused,
+then register the new public key in Portal. A run without a terminal keeps the key; to replace it
+there, pass `--regenerate-identity`:
+
+```sh
+sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... ./packaging/install-systemd.sh --regenerate-identity
+```
 
 ## Development
 
