@@ -265,7 +265,20 @@ pub(crate) async fn handle_flow_admission(
             // admitted (TT-2046) - being entitled to a gateway says nothing
             // about which address that gateway is actually configured to
             // expose.
-            flow_table.lock().expect("flow table lock poisoned").admit(
+            let mut table = flow_table.lock().expect("flow table lock poisoned");
+            // TT-2298: admissions run concurrently with the poll loop, so this flow's release may
+            // already have been handled. Checked under the same lock as the admit below, so a
+            // release cannot slip in between; admitting it now would leave a closed flow admitted.
+            if table.was_recently_released(&request.flow_id) {
+                drop(table);
+                tracing::warn!(flow_id = %request.flow_id, "flow was released before its admission finished - not admitting it");
+                return FlowAdmissionResponse {
+                    flow_id: request.flow_id,
+                    decision: "refuse".to_string(),
+                    reason: Some("flow_already_released".to_string()),
+                };
+            }
+            table.admit(
                 request.node_id.clone(),
                 request.port,
                 request.gateway_id.clone(),
@@ -273,6 +286,7 @@ pub(crate) async fn handle_flow_admission(
                 device_public_key,
                 endpoints,
             );
+            drop(table);
             FlowAdmissionResponse {
                 flow_id: request.flow_id,
                 decision: "admit".to_string(),
@@ -545,6 +559,53 @@ mod tests {
 
         handle_flow_admission(&store, &audit_log, &table, request).await;
 
+        assert_eq!(
+            table.lock().unwrap().gateway_for("n-1", 51820),
+            Some("gw-1")
+        );
+    }
+
+    /// TT-2298: admissions run concurrently with the poll loop, so a short-lived flow's release can
+    /// be handled before its own admission finishes. That admission must not record the flow.
+    #[tokio::test]
+    async fn a_flow_released_before_its_admission_finishes_is_not_admitted() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        table.lock().unwrap().release("flow-1");
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &table, request).await;
+
+        assert_eq!(response.decision, "refuse");
+        assert_eq!(response.reason.as_deref(), Some("flow_already_released"));
+        assert!(table.lock().unwrap().gateway_for("n-1", 51820).is_none());
+    }
+
+    /// Only that flow's own release counts - another flow's release does not block this admission.
+    #[tokio::test]
+    async fn another_flows_release_does_not_block_an_admission() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        table.lock().unwrap().release("flow-other");
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &table, request).await;
+
+        assert_eq!(response.decision, "admit");
         assert_eq!(
             table.lock().unwrap().gateway_for("n-1", 51820),
             Some("gw-1")

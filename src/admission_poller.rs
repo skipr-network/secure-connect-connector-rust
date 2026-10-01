@@ -71,6 +71,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -80,7 +81,8 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
+use tokio::sync::Semaphore;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
 use crate::dto::HeartbeatNode;
@@ -106,6 +108,14 @@ const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 /// Bounds the admission-result POST - a small fixed JSON body with no long-poll wait on Gatekeeper's
 /// side, so this only ever needs to cover plain network latency, not a deliberate server-side hold.
 const RESULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TT-2298: how many flow/DNS admissions one node's poller works on at once. The poll loop hands each
+/// admission to its own task and polls again straight away, instead of finishing one (decision plus
+/// result POST) before receiving the next - a page opening many connections at once no longer queues
+/// them behind each other. Capped, so a burst cannot overload this Connector, and so the outbound
+/// control-channel port table (`FlowTable`, 256 entries) stays far from evicting a port still in use.
+/// When all slots are busy the poll loop waits for one, which is plain back-pressure.
+const MAX_CONCURRENT_ADMISSIONS_PER_NODE: usize = 16;
 
 #[derive(Debug, Deserialize)]
 struct ConnectorPollResponse {
@@ -330,7 +340,13 @@ async fn run_poller(
 ) {
     let poll_path = poll_path(&connector_id);
     let host_header = format!("{gatekeeper_wg0_address}:{gatekeeper_http_port}");
+    // TT-2298: admissions in flight for this node. Owned by this task, so aborting the poller (the
+    // node left the node list) aborts them too - as before, when they ran inline.
+    let admission_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_ADMISSIONS_PER_NODE));
+    let mut in_flight: JoinSet<()> = JoinSet::new();
     loop {
+        // Reap finished admissions so the set does not grow for the life of the poller.
+        while in_flight.try_join_next().is_some() {}
         let stream = match connect_registered(
             &node_id,
             &state.flow_table,
@@ -367,13 +383,15 @@ async fn run_poller(
             Ok((status, body)) if status.is_success() => {
                 match serde_json::from_slice::<ConnectorPollResponse>(&body) {
                     Ok(message) => {
-                        handle_message(
+                        dispatch_message(
                             &node_id,
                             gatekeeper_wg0_address,
                             gatekeeper_http_port,
                             &connector_id,
                             &state,
                             message,
+                            &admission_slots,
+                            &mut in_flight,
                         )
                         .await;
                         // No sleep: the long-poll itself paces this loop - a "none" response
@@ -395,6 +413,55 @@ async fn run_poller(
             }
         }
     }
+}
+
+/// TT-2298: flow and DNS admissions run as their own task (at most
+/// `MAX_CONCURRENT_ADMISSIONS_PER_NODE` at once); everything else - above all a release - is handled
+/// right here, in the order Gatekeeper sent it. A release that overtakes its own still-running
+/// admission is caught by `FlowTable::was_recently_released`.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_message(
+    node_id: &str,
+    gatekeeper_addr: Ipv4Addr,
+    gatekeeper_http_port: u16,
+    connector_id: &str,
+    state: &ControlPlaneState,
+    message: ConnectorPollResponse,
+    admission_slots: &Arc<Semaphore>,
+    in_flight: &mut JoinSet<()>,
+) {
+    if !matches!(message.kind.as_str(), "admission" | "dns_admission") {
+        handle_message(
+            node_id,
+            gatekeeper_addr,
+            gatekeeper_http_port,
+            connector_id,
+            state,
+            message,
+        )
+        .await;
+        return;
+    }
+    let permit = admission_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("admission semaphore is never closed");
+    let node_id = node_id.to_string();
+    let connector_id = connector_id.to_string();
+    let state = state.clone();
+    in_flight.spawn(async move {
+        let _permit = permit;
+        handle_message(
+            &node_id,
+            gatekeeper_addr,
+            gatekeeper_http_port,
+            &connector_id,
+            &state,
+            message,
+        )
+        .await;
+    });
 }
 
 async fn handle_message(
@@ -798,6 +865,149 @@ mod tests {
         );
     }
 
+    /// Serves `admissions` flow-admission messages on `/poll` (then `type=none`, paced so the poller
+    /// does not spin), and answers each `/admission-result` after `result_delay`, recording how many
+    /// results were in progress at once and how many arrived in total.
+    async fn spawn_admission_gatekeeper(
+        admissions: usize,
+        result_delay: Duration,
+    ) -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let served = Arc::new(AtomicUsize::new(0));
+        let in_progress = Arc::new(AtomicUsize::new(0));
+        let max_in_progress = Arc::new(AtomicUsize::new(0));
+        let results = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (max_out, results_out) = (max_in_progress.clone(), results.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (served, in_progress, max_in_progress, results) = (
+                    served.clone(),
+                    in_progress.clone(),
+                    max_in_progress.clone(),
+                    results.clone(),
+                );
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            hyper::service::service_fn(move |req: Request<Incoming>| {
+                                let (served, in_progress, max_in_progress, results) = (
+                                    served.clone(),
+                                    in_progress.clone(),
+                                    max_in_progress.clone(),
+                                    results.clone(),
+                                );
+                                async move {
+                                    let body = if req.uri().path().ends_with("/poll") {
+                                        let n = served.fetch_add(1, Ordering::SeqCst);
+                                        if n < admissions {
+                                            serde_json::json!({
+                                                "type": "admission",
+                                                "admission": {
+                                                    "flow_id": format!("flow-{n}"),
+                                                    "gateway_id": "gw-unknown",
+                                                    "node_id": "n-1",
+                                                    "port": 40000 + n,
+                                                    "user_public_key": null,
+                                                    "signature": null,
+                                                    "signed_data": null
+                                                }
+                                            })
+                                            .to_string()
+                                        } else {
+                                            tokio::time::sleep(Duration::from_millis(50)).await;
+                                            "{\"type\":\"none\"}".to_string()
+                                        }
+                                    } else {
+                                        let now = in_progress.fetch_add(1, Ordering::SeqCst) + 1;
+                                        max_in_progress.fetch_max(now, Ordering::SeqCst);
+                                        tokio::time::sleep(result_delay).await;
+                                        in_progress.fetch_sub(1, Ordering::SeqCst);
+                                        results.fetch_add(1, Ordering::SeqCst);
+                                        "{}".to_string()
+                                    };
+                                    Ok::<_, std::convert::Infallible>(
+                                        Response::builder()
+                                            .status(200)
+                                            .header("Content-Type", "application/json")
+                                            .body(Full::new(Bytes::from(body)))
+                                            .unwrap(),
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (port, max_out, results_out)
+    }
+
+    async fn wait_for_results(
+        results: &std::sync::atomic::AtomicUsize,
+        expected: usize,
+        within: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + within;
+        while results.load(std::sync::atomic::Ordering::SeqCst) < expected {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of {expected} admission results arrived within {within:?}",
+                results.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// TT-2298: admissions for one node run at the same time instead of one after another. Each
+    /// result takes 300ms to be accepted; one at a time, four would take at least 1.2s and never
+    /// overlap.
+    #[tokio::test]
+    async fn a_nodes_admissions_do_not_wait_for_each_other() {
+        let (state, _rx) = state();
+        let (port, max_in_progress, results) =
+            spawn_admission_gatekeeper(4, Duration::from_millis(300)).await;
+        let mut pollers = AdmissionPollers::new(port, Ipv4Addr::new(127, 0, 0, 1), state);
+
+        pollers.sync("c-1", &[node("n-1", "127.0.0.1")]);
+        wait_for_results(&results, 4, Duration::from_millis(1000)).await;
+
+        assert!(
+            max_in_progress.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "admissions ran one at a time"
+        );
+    }
+
+    /// TT-2298: a burst larger than the cap never has more than MAX_CONCURRENT_ADMISSIONS_PER_NODE
+    /// results in progress at once, and every admission is still answered.
+    #[tokio::test]
+    async fn a_burst_of_admissions_stays_within_the_per_node_cap() {
+        let (state, _rx) = state();
+        let burst = MAX_CONCURRENT_ADMISSIONS_PER_NODE + 8;
+        let (port, max_in_progress, results) =
+            spawn_admission_gatekeeper(burst, Duration::from_millis(300)).await;
+        let mut pollers = AdmissionPollers::new(port, Ipv4Addr::new(127, 0, 0, 1), state);
+
+        pollers.sync("c-1", &[node("n-1", "127.0.0.1")]);
+        wait_for_results(&results, burst, Duration::from_secs(5)).await;
+
+        let max = max_in_progress.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            max <= MAX_CONCURRENT_ADMISSIONS_PER_NODE,
+            "{max} results in progress at once"
+        );
+        assert!(max >= 2, "admissions ran one at a time");
+    }
+
     #[test]
     fn sync_does_not_restart_an_already_running_poller_for_the_same_node() {
         let (state, _rx) = state();
@@ -1071,7 +1281,7 @@ mod tests {
             spawn_mock_gatekeeper(move |body| posted_writer.lock().unwrap().push(body)).await;
         // Warms the audit log's lazy first-write path (file creation, tokio's blocking-thread-pool
         // cold start) outside the timed window below - otherwise that one-time cost can occasionally
-        // eat enough of the 300ms TTL under a large parallel test run to make this flaky for reasons
+        // eat enough of PENDING_PACKET_TTL under a large parallel test run to make this flaky for reasons
         // that have nothing to do with the actual behavior under test.
         state
             .audit_log
@@ -1113,7 +1323,7 @@ mod tests {
         // (`take_pending_packet`) spans a real `.await` on `handle_flow_admission` - including a
         // genuine disk write via `decide_access_and_audit`'s audit entry - which a sufficiently
         // busy parallel test run (many other tests' own spawn_blocking work contending for the
-        // same pool) can occasionally push past the 300ms production TTL, for reasons that have
+        // same pool) can occasionally push past the production PENDING_PACKET_TTL, for reasons that have
         // nothing to do with whether the reclaim wiring itself is correct. Retried a few times
         // with a fresh buffer+flow_id each attempt rather than lengthened, since the TTL itself is
         // a fixed production value this test must exercise as-is, not something to relax.

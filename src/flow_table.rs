@@ -40,9 +40,26 @@ use crate::dto::PolicyBundleEndpoint;
 /// consistently preceded Gatekeeper's matching admit/refuse log line by 15-35ms, and none of
 /// those flows' packets ever reached the real backend afterward, even though the flow sat
 /// genuinely admitted for minutes - nothing ever gave the already-in-flight decision a chance to
-/// catch up with the packet that lost the race. 300ms is generous headroom above that measured
-/// window without holding a doomed packet meaningfully longer than today's instant drop.
-const PENDING_PACKET_TTL: Duration = Duration::from_millis(300);
+/// catch up with the packet that lost the race.
+///
+/// TT-2298: 2s, up from 300ms. That 15-35ms figure is one admission on its own; a page opening many
+/// connections at once queues several, and one measured on test took 510ms - past the old 300ms, so
+/// its SYN was dropped and the client waited ~1s (then ~3s) to resend. 2s covers a burst without a
+/// held packet ever being forwarded unless its flow is admitted.
+const PENDING_PACKET_TTL: Duration = Duration::from_secs(2);
+
+/// TT-2298: how long a released flow_id is remembered (`FlowTable::release`). Admissions now run
+/// concurrently with the poll loop, so a short-lived flow's release can be handled before its own
+/// admission finishes; the admission then sees the flow was already released and does not record
+/// it. Comfortably above Gatekeeper's own admission-result timeout (10s by default), after which
+/// no late admission can still be in flight.
+const RELEASED_FLOW_MEMORY: Duration = Duration::from_secs(30);
+
+/// TT-2298: most packets held for a pending admission at once. A longer `PENDING_PACKET_TTL` would
+/// otherwise let a client firing many connections that are never admitted (a port scan, say) keep
+/// that many more packets in memory. When full, a new packet is simply not held - the pre-buffering
+/// behaviour - and nothing unadmitted is ever forwarded either way.
+const MAX_PENDING_PACKETS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 struct AdmittedFlow {
@@ -164,6 +181,8 @@ pub struct FlowTable {
     /// exists to rescue, any single copy of the client's SYN reaching the real destination once
     /// is enough - there's nothing to gain from remembering more than one.
     pending_packets: HashMap<(String, u16), (Vec<u8>, Instant)>,
+    /// TT-2298: flow_ids released within `RELEASED_FLOW_MEMORY`, with when - see that constant.
+    recently_released: HashMap<String, Instant>,
 }
 
 /// How many distinct control-channel connections' worth of routing state to remember at once
@@ -277,6 +296,19 @@ impl FlowTable {
         for (node_id, port) in removed {
             self.deindex(&node_id, port);
         }
+        let now = Instant::now();
+        self.recently_released
+            .retain(|_, released_at| now.duration_since(*released_at) <= RELEASED_FLOW_MEMORY);
+        self.recently_released.insert(flow_id.to_string(), now);
+    }
+
+    /// TT-2298: whether `flow_id` was released within `RELEASED_FLOW_MEMORY` - checked by the
+    /// admission path, under the same lock as its `admit`, so a release that overtook its own
+    /// admission cannot leave the flow admitted.
+    pub fn was_recently_released(&self, flow_id: &str) -> bool {
+        self.recently_released
+            .get(flow_id)
+            .is_some_and(|released_at| released_at.elapsed() <= RELEASED_FLOW_MEMORY)
     }
 
     /// Drops every flow admitted for `node_id` (TT-1732 review, Tasneem, TT-1847
@@ -461,9 +493,14 @@ impl FlowTable {
         now: Instant,
     ) {
         self.pending_packets
-            .insert((node_id.to_string(), port), (packet, now));
-        self.pending_packets
             .retain(|_, (_, buffered_at)| now.duration_since(*buffered_at) <= PENDING_PACKET_TTL);
+        let key = (node_id.to_string(), port);
+        if self.pending_packets.len() >= MAX_PENDING_PACKETS
+            && !self.pending_packets.contains_key(&key)
+        {
+            return;
+        }
+        self.pending_packets.insert(key, (packet, now));
     }
 
     /// Reclaims a packet `buffer_pending_packet` held for `(node_id, port)`, if one exists and is
@@ -879,6 +916,61 @@ mod tests {
 
         assert_eq!(table.node_for_port(40001), Some("n-1"));
         assert_eq!(table.node_for_port(40002), Some("n-1"));
+    }
+
+    /// TT-2298: a first packet held while several admissions are queued is still forwarded well
+    /// after the old 300ms limit.
+    #[test]
+    fn a_pending_packet_is_still_reclaimable_after_one_and_a_half_seconds() {
+        let mut table = FlowTable::new();
+        let buffered_at = Instant::now();
+        table.buffer_pending_packet("n-1", 40001, vec![1, 2, 3], buffered_at);
+
+        let reclaimed =
+            table.take_pending_packet("n-1", 40001, buffered_at + Duration::from_millis(1500));
+
+        assert_eq!(reclaimed, Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn a_pending_packet_expires_after_two_seconds() {
+        let mut table = FlowTable::new();
+        let buffered_at = Instant::now();
+        table.buffer_pending_packet("n-1", 40001, vec![1, 2, 3], buffered_at);
+
+        let reclaimed =
+            table.take_pending_packet("n-1", 40001, buffered_at + Duration::from_millis(2001));
+
+        assert_eq!(reclaimed, None);
+    }
+
+    /// TT-2298: the held-packet buffer is bounded - once full, a packet for a new (node, port) is not
+    /// held, while an already-held one can still be replaced by its latest packet.
+    #[test]
+    fn the_pending_packet_buffer_is_capped() {
+        let mut table = FlowTable::new();
+        let now = Instant::now();
+        for port in 0..MAX_PENDING_PACKETS {
+            table.buffer_pending_packet("n-1", port as u16, vec![1], now);
+        }
+
+        table.buffer_pending_packet("n-1", 60000, vec![2], now);
+        table.buffer_pending_packet("n-1", 0, vec![3], now);
+
+        assert_eq!(table.take_pending_packet("n-1", 60000, now), None);
+        assert_eq!(table.take_pending_packet("n-1", 0, now), Some(vec![3]));
+    }
+
+    /// TT-2298: release remembers the flow_id, so a late admission for it can be told apart.
+    #[test]
+    fn release_remembers_only_the_released_flow_id() {
+        let mut table = FlowTable::new();
+        assert!(!table.was_recently_released("flow-1"));
+
+        table.release("flow-1");
+
+        assert!(table.was_recently_released("flow-1"));
+        assert!(!table.was_recently_released("flow-2"));
     }
 
     #[test]
