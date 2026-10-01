@@ -164,10 +164,31 @@ Re-running `install-systemd.sh` after a rebuild or an env-file change picks up t
 install command, or `sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... ./packaging/install-systemd.sh`.
 Its identity key, and so its registration in Portal, carry over unchanged. Re-running without them
 warns that the still-running old process will not survive its next restart. The old lines can be
-deleted from `connector.env`; they are ignored. To remove it entirely (`connector.env` is left in place):
+deleted from `connector.env`; they are ignored.
+
+To remove it entirely (`connector.env` is left in place):
 
 ```sh
 ./packaging/install-systemd.sh --uninstall
+```
+
+This also deletes the identity key, so installing again later creates a new Connector identity
+whose public key has to be registered in Portal. To keep the key, so a later install comes back as
+the same Connector, add `--keep-identity`:
+
+```sh
+./packaging/install-systemd.sh --uninstall --keep-identity
+```
+
+Re-running the install command without uninstalling, when an identity key already exists, asks
+whether to keep it or generate a new one. Keeping it is the default: it is what an upgrade or a
+re-run after a rebuild needs, since the Connector stays registered in Portal under that key.
+Generate a new one when a previous install on this host failed or its key should not be reused,
+then register the new public key in Portal. A run without a terminal keeps the key; to replace it
+there, pass `--regenerate-identity`:
+
+```sh
+sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... ./packaging/install-systemd.sh --regenerate-identity
 ```
 
 ## Development
