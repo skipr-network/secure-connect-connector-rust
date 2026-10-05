@@ -9,6 +9,7 @@ mod dns_cache;
 mod dto;
 mod flow_control;
 mod flow_table;
+mod gateway_end;
 mod heartbeat;
 mod identity;
 mod policy;
@@ -157,6 +158,13 @@ async fn main() -> anyhow::Result<()> {
     let connector_public_key = connector_identity.public_key_base64.clone();
     let policy_store = Arc::new(PolicyStore::new());
     let audit_log = Arc::new(AuditLog::new(&config.audit_log_path));
+    // TT-2464: kept next to the audit log, so undelivered gateway-end reports survive a restart.
+    let gateway_end_queue = gateway_end::GatewayEndQueue::load(
+        config
+            .audit_log_path
+            .with_file_name("pending-gateway-end-reports.json"),
+    )
+    .await;
     // Moves connector_identity.secret - nothing else needs the identity after
     // the "ready" log line above.
     let tunnel_manager = Arc::new(Mutex::new(TunnelManager::new(connector_identity.secret)));
@@ -217,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &gateway_end_queue,
         )
         .await
         {
@@ -295,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &gateway_end_queue,
         )
         .await
         {
@@ -370,6 +380,7 @@ async fn run_heartbeat(
     flow_table: &std::sync::Mutex<FlowTable>,
     dns_cache: &dns_cache::DnsCache,
     admission_pollers: &mut AdmissionPollers,
+    gateway_end_queue: &gateway_end::GatewayEndQueue,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
     // Snapshotted before `policy_store.apply(response)` replaces it and before `response` is moved
     // (TT-1640): the entitlement lists this Connector had *before* this heartbeat, diffed after a
@@ -390,6 +401,14 @@ async fn run_heartbeat(
     let unresolved_endpoint_hosts = old_bundles
         .as_deref()
         .map(|bundles| unresolved_hosts_in(bundles, dns_cache));
+    // TT-2464: every gateway-end report not yet delivered, including ones from before a restart.
+    let ended_flows = gateway_end_queue
+        .pending(chrono::Utc::now().timestamp_millis())
+        .await;
+    let sent_report_ids: Vec<String> = ended_flows
+        .iter()
+        .map(|report| report.report_id.clone())
+        .collect();
 
     let response = agent_directory
         .heartbeat(
@@ -398,9 +417,17 @@ async fn run_heartbeat(
             &dto::ConnectorHeartbeatRequest {
                 connector_public_key: connector_public_key.to_string(),
                 unresolved_endpoint_hosts,
+                ended_flows,
             },
         )
         .await?;
+
+    // A verified response means Agent relayed the request to Portal, which processed it: the
+    // reports it carried are delivered, whatever happens to this package below. Portal accepts a
+    // report_id once, so a resend after a failed write here is harmless.
+    if let Err(error) = gateway_end_queue.acknowledge(&sent_report_ids).await {
+        warn!(%error, "failed to save the gateway-end report queue after delivery");
+    }
 
     let connector_id = response.connector_id.clone();
 
@@ -457,7 +484,13 @@ async fn run_heartbeat(
     // TT-2144: independent of WireGuard tunnel state - see admission_poller's module doc for why.
     admission_pollers.sync(&connector_id, &node_list);
     if let Some(old_bundles) = old_bundles {
-        reconcile_dropped_entitlements(flow_table, &old_bundles, &new_bundles);
+        let reports = reconcile_dropped_entitlements(
+            flow_table,
+            &old_bundles,
+            &new_bundles,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        queue_gateway_end_reports(reports, audit_log, gateway_end_queue).await;
     }
     reconcile_endpoint_changes(flow_table, &new_bundles);
 
@@ -515,11 +548,17 @@ fn unresolved_hosts_in(bundles: &[PolicyBundle], dns_cache: &dns_cache::DnsCache
 /// holds on that gateway is evicted. A device that's still entitled, or a gateway that's unchanged,
 /// is left completely alone. Idempotent and order-independent - evicting a device with no admitted
 /// flow is a no-op (`FlowTable::evict_gateway_device`).
+///
+/// Returns one gateway-end report per gateway and device whose admitted flow(s) it actually tore
+/// down (TT-2464, spec §B.18) - none for a device that had no admitted flow, since the event must
+/// never be emitted merely because an entitlement changed.
 fn reconcile_dropped_entitlements(
     flow_table: &std::sync::Mutex<FlowTable>,
     old_bundles: &[PolicyBundle],
     new_bundles: &[PolicyBundle],
-) {
+    now_ms: i64,
+) -> Vec<gateway_end::GatewayEndReport> {
+    let mut reports = Vec::new();
     let mut table = flow_table.lock().expect("flow table lock poisoned");
     for old_bundle in old_bundles {
         let still_entitled: std::collections::HashSet<&str> = new_bundles
@@ -550,8 +589,42 @@ fn reconcile_dropped_entitlements(
                     evicted,
                     "entitlement dropped: tore down admitted flow(s) for this gateway"
                 );
+                reports.push(gateway_end::GatewayEndReport {
+                    report_id: gateway_end::new_report_id(),
+                    gateway_id: old_bundle.gateway_id.clone(),
+                    user_id: entitlement.user_id.clone(),
+                    device_public_key: device_public_key.to_string(),
+                    ended_at: now_ms,
+                    flows_ended: evicted,
+                });
             }
         }
+    }
+    reports
+}
+
+/// Audits and queues the reports `reconcile_dropped_entitlements` produced (spec §B.10, §B.18).
+/// Both are best-effort: neither failure may undo the flow teardown that already happened. A
+/// queue-file write failure still leaves the reports queued in memory for the next heartbeat.
+async fn queue_gateway_end_reports(
+    reports: Vec<gateway_end::GatewayEndReport>,
+    audit_log: &AuditLog,
+    gateway_end_queue: &gateway_end::GatewayEndQueue,
+) {
+    for report in &reports {
+        let event = AuditEvent::FlowsEnded {
+            gateway_id: report.gateway_id.clone(),
+            user_id: report.user_id.clone(),
+            device_public_key: report.device_public_key.clone(),
+            flows_ended: report.flows_ended,
+            report_id: report.report_id.clone(),
+        };
+        if let Err(error) = audit_log.record(event).await {
+            error!(%error, "failed to write flows-ended audit entry");
+        }
+    }
+    if let Err(error) = gateway_end_queue.enqueue(reports).await {
+        error!(%error, "failed to save the gateway-end report queue - reports stay queued in memory only");
     }
 }
 
@@ -1705,6 +1778,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -1778,6 +1852,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -1822,6 +1897,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -1889,6 +1965,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -1955,6 +2032,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -2023,6 +2101,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -2107,6 +2186,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -2329,6 +2409,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await
         .unwrap();
@@ -2346,6 +2427,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await
         .unwrap();
@@ -2355,6 +2437,237 @@ mod tests {
         assert_eq!(
             *requested_hosts.lock().unwrap(),
             vec!["new.internal.example.com".to_string()]
+        );
+    }
+
+    fn signed_heartbeat(
+        agent_identity: &crypto::KeyPair,
+        nonce: &str,
+        bundles_json: &str,
+    ) -> ResponseTemplate {
+        let body = format!(
+            r#"{{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"{nonce}","policy_bundles":{bundles_json},"node_list":[]}}"#
+        );
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+        ResponseTemplate::new(200)
+            .set_body_raw(body, "application/json")
+            .insert_header("X-Signature", signature.as_str())
+    }
+
+    /// TT-2464, end to end through run_heartbeat: a revoke that ends an admitted flow queues and
+    /// audits a report, the next heartbeat's request carries it, and once that heartbeat succeeds
+    /// the queue is empty.
+    #[tokio::test]
+    async fn run_heartbeat_reports_an_ended_flow_on_the_next_heartbeat_then_acknowledges_it() {
+        let agent_identity = crypto::generate_keypair();
+        let entitled = r#"[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-7","device_public_key":"dev-A"}]}]"#;
+        let revoked = r#"[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[]}]"#;
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(signed_heartbeat(&agent_identity, "n1", entitled))
+            .up_to_n_times(1)
+            .mount(&agent_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(signed_heartbeat(&agent_identity, "n2", revoked))
+            .up_to_n_times(1)
+            .mount(&agent_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(signed_heartbeat(&agent_identity, "n3", revoked))
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_server.uri()).await;
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let queue_path = dir.path().join("pending-gateway-end-reports.json");
+        let gateway_end_queue = gateway_end::GatewayEndQueue::load(&queue_path).await;
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
+        let mut admission_pollers = admission_pollers();
+
+        macro_rules! heartbeat {
+            () => {
+                run_heartbeat(
+                    "pk-1",
+                    &agent_directory,
+                    &registry_client,
+                    &heartbeat_client,
+                    &policy_store,
+                    &audit_log,
+                    &tunnel_manager,
+                    &wg_socket,
+                    &flow_table,
+                    &dns_cache,
+                    &mut admission_pollers,
+                    &gateway_end_queue,
+                )
+                .await
+                .unwrap()
+            };
+        }
+
+        heartbeat!();
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![],
+        );
+
+        heartbeat!(); // the revoke: tears the flow down and queues a report
+        let queued = gateway_end_queue
+            .pending(chrono::Utc::now().timestamp_millis())
+            .await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].gateway_id, "gw-1");
+        assert_eq!(queued[0].user_id, "u-7");
+        assert_eq!(queued[0].device_public_key, "dev-A");
+        assert!(
+            queue_path.exists(),
+            "the report must be on disk before it is delivered"
+        );
+        let audit = read_audit_lines(&dir);
+        let ended: Vec<_> = audit
+            .iter()
+            .filter(|e| e["event"] == "flows_ended")
+            .collect();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0]["report_id"], queued[0].report_id.as_str());
+        assert_eq!(ended[0]["user_id"], "u-7");
+
+        heartbeat!(); // carries the report, then acknowledges it
+        let requests = agent_server.received_requests().await.unwrap();
+        let third: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        assert_eq!(
+            third["ended_flows"],
+            serde_json::to_value(&queued).unwrap(),
+            "the third heartbeat must carry exactly the queued report"
+        );
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            second.get("ended_flows").is_none(),
+            "nothing was pending before the revoke"
+        );
+        assert!(
+            gateway_end_queue
+                .pending(chrono::Utc::now().timestamp_millis())
+                .await
+                .is_empty()
+        );
+        let reloaded = gateway_end::GatewayEndQueue::load(&queue_path).await;
+        assert!(
+            reloaded
+                .pending(chrono::Utc::now().timestamp_millis())
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A heartbeat that fails must not drop the reports it was carrying - they go out again on
+    /// the next attempt.
+    #[tokio::test]
+    async fn run_heartbeat_keeps_the_reports_when_the_heartbeat_fails() {
+        let agent_identity = crypto::generate_keypair();
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_server.uri()).await;
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let gateway_end_queue =
+            gateway_end::GatewayEndQueue::load(dir.path().join("queue.json")).await;
+        let report = gateway_end::GatewayEndReport {
+            report_id: gateway_end::new_report_id(),
+            gateway_id: "gw-1".to_string(),
+            user_id: "u-7".to_string(),
+            device_public_key: "dev-A".to_string(),
+            ended_at: chrono::Utc::now().timestamp_millis(),
+            flows_ended: 1,
+        };
+        gateway_end_queue
+            .enqueue(vec![report.clone()])
+            .await
+            .unwrap();
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
+        let mut admission_pollers = admission_pollers();
+
+        let result = run_heartbeat(
+            "pk-1",
+            &agent_directory,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+            &mut admission_pollers,
+            &gateway_end_queue,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let requests = agent_server.received_requests().await.unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            sent["ended_flows"][0]["report_id"],
+            report.report_id.as_str()
+        );
+        assert_eq!(
+            gateway_end_queue
+                .pending(chrono::Utc::now().timestamp_millis())
+                .await,
+            vec![report]
         );
     }
 
@@ -2389,6 +2702,7 @@ mod tests {
             .and(body_json(dto::ConnectorHeartbeatRequest {
                 connector_public_key: "pk-1".to_string(),
                 unresolved_endpoint_hosts: None,
+                ended_flows: vec![],
             }))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -2406,6 +2720,7 @@ mod tests {
             .and(body_json(&dto::ConnectorHeartbeatRequest {
                 connector_public_key: "pk-1".to_string(),
                 unresolved_endpoint_hosts: Some(vec!["erp.internal.example.com".to_string()]),
+                ended_flows: vec![],
             }))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -2446,6 +2761,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await
         .unwrap();
@@ -2462,6 +2778,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 
@@ -2470,6 +2787,14 @@ mod tests {
             "second heartbeat's request must have matched the body_json mock above, or this is \
              an unmatched-request error instead: {result:?}"
         );
+    }
+
+    /// A queue for tests that don't inspect it: backed by a unique file under the OS temp dir,
+    /// which is only ever written if the test produces a gateway-end report.
+    fn test_gateway_end_queue() -> gateway_end::GatewayEndQueue {
+        gateway_end::GatewayEndQueue::new(
+            std::env::temp_dir().join(format!("gateway-end-{}.json", gateway_end::new_report_id())),
+        )
     }
 
     fn bundle(gateway_id: &str, entitled_device_keys: &[&str]) -> PolicyBundle {
@@ -2503,7 +2828,7 @@ mod tests {
         let old_bundles = vec![bundle("gw-1", &["dev-A"])];
         let new_bundles = vec![bundle("gw-1", &[])];
 
-        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles, 0);
 
         assert!(
             flow_table
@@ -2512,6 +2837,92 @@ mod tests {
                 .gateway_for("n-1", 40001)
                 .is_none()
         );
+    }
+
+    /// TT-2464: the report names the gateway, the user from the entitlement row, the device and
+    /// how many flows ended - exactly what Portal needs to accept it (spec §B.18 point 3).
+    #[test]
+    fn reconcile_dropped_entitlements_reports_the_ended_flows_of_a_dropped_device() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        for (port, flow_id) in [(40001, "flow-1"), (40002, "flow-2")] {
+            flow_table.lock().unwrap().admit(
+                "n-1".to_string(),
+                port,
+                "gw-1".to_string(),
+                flow_id.to_string(),
+                "dev-A".to_string(),
+                vec![],
+            );
+        }
+        let old_bundles = vec![bundle("gw-1", &["dev-A"])];
+        let new_bundles = vec![bundle("gw-1", &[])];
+
+        let reports =
+            reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles, 1_234);
+
+        assert_eq!(
+            reports.len(),
+            1,
+            "one report per gateway and device, not per flow"
+        );
+        let report = &reports[0];
+        assert_eq!(report.gateway_id, "gw-1");
+        assert_eq!(report.user_id, "u-1");
+        assert_eq!(report.device_public_key, "dev-A");
+        assert_eq!(report.flows_ended, 2);
+        assert_eq!(report.ended_at, 1_234);
+        assert_eq!(report.report_id.len(), 36);
+    }
+
+    /// TT-1734: no event merely because an entitlement changed - the device had no active flow.
+    #[test]
+    fn reconcile_dropped_entitlements_reports_nothing_for_a_dropped_device_with_no_flow() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let old_bundles = vec![bundle("gw-1", &["dev-A"])];
+        let new_bundles = vec![bundle("gw-1", &[])];
+
+        let reports = reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles, 0);
+
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn reconcile_dropped_entitlements_reports_nothing_for_a_still_entitled_device() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![],
+        );
+        let bundles = vec![bundle("gw-1", &["dev-A"])];
+
+        let reports = reconcile_dropped_entitlements(&flow_table, &bundles, &bundles, 0);
+
+        assert!(reports.is_empty());
+    }
+
+    /// A deleted or disabled gateway drops its whole bundle - its active flows still end and must
+    /// still be reported (TT-501 "Remove a Private Gateway").
+    #[test]
+    fn reconcile_dropped_entitlements_reports_flows_ended_by_a_vanished_gateway_bundle() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![],
+        );
+        let old_bundles = vec![bundle("gw-1", &["dev-A"])];
+
+        let reports = reconcile_dropped_entitlements(&flow_table, &old_bundles, &[], 0);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].gateway_id, "gw-1");
     }
 
     #[test]
@@ -2528,7 +2939,7 @@ mod tests {
         let old_bundles = vec![bundle("gw-1", &["dev-A"])];
         let new_bundles = vec![bundle("gw-1", &["dev-A"])];
 
-        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles, 0);
 
         assert_eq!(
             flow_table.lock().unwrap().gateway_for("n-1", 40001),
@@ -2560,7 +2971,7 @@ mod tests {
         let old_bundles = vec![bundle("gw-1", &["dev-A"]), bundle("gw-2", &["dev-A"])];
         let new_bundles = vec![bundle("gw-1", &[]), bundle("gw-2", &["dev-A"])];
 
-        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles, 0);
 
         assert!(
             flow_table
@@ -2589,7 +3000,7 @@ mod tests {
         let old_bundles = vec![bundle("gw-1", &["dev-A"])];
         let new_bundles: Vec<PolicyBundle> = vec![];
 
-        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles);
+        reconcile_dropped_entitlements(&flow_table, &old_bundles, &new_bundles, 0);
 
         assert!(
             flow_table
@@ -2604,7 +3015,7 @@ mod tests {
     fn reconcile_dropped_entitlements_with_no_prior_bundles_is_a_no_op() {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
 
-        reconcile_dropped_entitlements(&flow_table, &[], &[bundle("gw-1", &["dev-A"])]);
+        reconcile_dropped_entitlements(&flow_table, &[], &[bundle("gw-1", &["dev-A"])], 0);
     }
 
     fn bundle_with_endpoint(gateway_id: &str, host: &str, port: u16) -> PolicyBundle {
@@ -2753,6 +3164,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await
         .unwrap();
@@ -2787,6 +3199,7 @@ mod tests {
             &flow_table,
             &dns_cache,
             &mut admission_pollers,
+            &test_gateway_end_queue(),
         )
         .await;
 

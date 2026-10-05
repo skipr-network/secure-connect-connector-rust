@@ -107,6 +107,11 @@ exact count of what the running HTTP client ends up trusting (a certificate that
 a valid trust anchor is silently skipped by the client itself, the same way a native store's own
 occasional ancient or malformed entry always has been).
 
+**`CONNECTOR_AUDIT_LOG_PATH`** - the local, append-only audit log. The Connector also keeps
+`pending-gateway-end-reports.json` in the same directory: the gateway-end reports (TT-2464)
+waiting for a successful heartbeat, so a revoked user's **Access removed** notice still arrives
+after a Connector restart. The directory must stay writable by the service user.
+
 **`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** when
 running the raw binary by hand - it is not persisted anywhere by itself (the systemd install below
 handles this for you, writing the path it used into `connector.env`). Starting the daemon with a

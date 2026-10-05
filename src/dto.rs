@@ -38,6 +38,11 @@ pub struct ConnectorHeartbeatRequest {
     /// wipe a real, still-true unresolved-host warning off Portal's UI on every restart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unresolved_endpoint_hosts: Option<Vec<String>>,
+    /// TT-2464 (spec §B.18): gateway-end reports still waiting for a successful heartbeat - see
+    /// `gateway_end`. Omitted when empty, so a heartbeat with nothing to report is byte-for-byte
+    /// what it was before this field existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ended_flows: Vec<crate::gateway_end::GatewayEndReport>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -110,6 +115,7 @@ mod tests {
         let request = ConnectorHeartbeatRequest {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: Some(vec!["crm.internal.example.com".to_string()]),
+            ended_flows: vec![],
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -128,6 +134,7 @@ mod tests {
         let request = ConnectorHeartbeatRequest {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: Some(vec![]),
+            ended_flows: vec![],
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -143,11 +150,36 @@ mod tests {
         let request = ConnectorHeartbeatRequest {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: None,
+            ended_flows: vec![],
         };
 
         let json = serde_json::to_string(&request).unwrap();
 
         assert_eq!(json, r#"{"connector_public_key":"pk-1"}"#);
+    }
+
+    /// TT-2464: the field names Agent relays and Portal reads (spec §B.18 point 1).
+    #[test]
+    fn heartbeat_request_serializes_gateway_end_reports_with_the_contract_field_names() {
+        let request = ConnectorHeartbeatRequest {
+            connector_public_key: "pk-1".to_string(),
+            unresolved_endpoint_hosts: None,
+            ended_flows: vec![crate::gateway_end::GatewayEndReport {
+                report_id: "r-1".to_string(),
+                gateway_id: "gw-1".to_string(),
+                user_id: "u-1".to_string(),
+                device_public_key: "dev-A".to_string(),
+                ended_at: 1_234,
+                flows_ended: 2,
+            }],
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"connector_public_key":"pk-1","ended_flows":[{"report_id":"r-1","gateway_id":"gw-1","user_id":"u-1","device_public_key":"dev-A","ended_at":1234,"flows_ended":2}]}"#
+        );
     }
 
     #[test]
@@ -156,7 +188,8 @@ mod tests {
             ConnectorHeartbeatRequest::default(),
             ConnectorHeartbeatRequest {
                 connector_public_key: String::new(),
-                unresolved_endpoint_hosts: None
+                unresolved_endpoint_hosts: None,
+                ended_flows: vec![],
             }
         );
     }
