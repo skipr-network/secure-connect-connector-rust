@@ -44,6 +44,15 @@ pub enum AuditEvent {
         flow_id: String,
         gateway_id: String,
     },
+    /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
+    /// to this gateway, and a gateway-end report was queued for it.
+    FlowsEnded {
+        gateway_id: String,
+        user_id: String,
+        device_public_key: String,
+        flows_ended: usize,
+        report_id: String,
+    },
 }
 
 #[derive(Debug, Serialize)]

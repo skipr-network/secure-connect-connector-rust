@@ -166,6 +166,7 @@ mod tests {
         ConnectorHeartbeatRequest {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: None,
+            ended_flows: vec![],
         }
     }
 
@@ -378,6 +379,7 @@ mod tests {
         let request = ConnectorHeartbeatRequest {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: Some(vec!["crm.internal.example.com".to_string()]),
+            ended_flows: vec![],
         };
 
         let server = MockServer::start().await;
