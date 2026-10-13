@@ -29,7 +29,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::dto::{ConnectorHeartbeatRequest, ConnectorHeartbeatResponse};
+use crate::dto::{
+    ConnectorDeregisterRequest, ConnectorDeregisterResponse, ConnectorHeartbeatRequest,
+    ConnectorHeartbeatResponse,
+};
 use crate::heartbeat::{AgentRejected, HeartbeatClient};
 use crate::registry_client::RegistryClient;
 
@@ -124,6 +127,41 @@ impl AgentDirectory {
         }
         bail!(
             "no operational Agent answered the heartbeat ({})",
+            failures.join("; ")
+        )
+    }
+
+    /// TT-2126: deregisters this Connector through the first operational Agent that answers, verifying the answer
+    /// against that Agent's own Registry key - the same failover and trust as [`Self::heartbeat`]. A refusal is
+    /// an answer: any Agent would relay the same one from Portal.
+    pub async fn deregister(
+        &self,
+        registry_client: &RegistryClient,
+        heartbeat_client: &HeartbeatClient,
+        request: &ConnectorDeregisterRequest,
+    ) -> Result<ConnectorDeregisterResponse> {
+        let candidates = self.candidates().await?;
+        let mut failures = Vec::new();
+        for agent in candidates {
+            let attempt = async {
+                let agent_public_key = registry_client
+                    .get_agent_permitted_key(&agent.ip_address)
+                    .await?;
+                heartbeat_client
+                    .deregister_and_verify(&agent.base_url, &agent_public_key, request)
+                    .await
+            };
+            match attempt.await {
+                Ok(response) => return Ok(response),
+                Err(error) if error.downcast_ref::<AgentRejected>().is_some() => return Err(error),
+                Err(error) => {
+                    warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent did not answer the deregistration - trying the next operational Agent");
+                    failures.push(format!("{}: {error:#}", agent.ip_address));
+                }
+            }
+        }
+        bail!(
+            "no operational Agent answered the deregistration ({})",
             failures.join("; ")
         )
     }

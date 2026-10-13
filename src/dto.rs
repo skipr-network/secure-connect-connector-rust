@@ -100,6 +100,25 @@ pub struct HeartbeatNode {
     pub wireguard_public_key: Option<String>,
 }
 
+/// `POST /api/connectors/deregister` body (TT-2126, spec §B.19 point 4): this Connector's own public key, the
+/// only identity it has.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ConnectorDeregisterRequest {
+    pub connector_public_key: String,
+}
+
+/// Agent's signed confirmation that Portal accepted the deregistration - checked like a heartbeat response
+/// (signature, this Connector's own key) and for expiry before the host removes anything.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ConnectorDeregisterResponse {
+    pub connector_id: String,
+    pub connector_public_key: String,
+    pub status: String,
+    pub generated_at: String,
+    pub expires_at: String,
+    pub nonce: String,
+}
+
 /// Registry's `GET /api/agents/{ipAddress}/permitted-key` response (TT-1742).
 #[derive(Debug, Deserialize)]
 pub struct AgentPermittedKeyResponse {

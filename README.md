@@ -171,7 +171,24 @@ Its identity key, and so its registration in Portal, carry over unchanged. Re-ru
 warns that the still-running old process will not survive its next restart. The old lines can be
 deleted from `connector.env`; they are ignored.
 
-To remove it entirely (`connector.env` is left in place):
+To **decommission** the Connector for good (TT-2126), first select **Decommission Connector** on
+its details page in Portal, then run the command Portal shows on this host - from the checkout it
+was installed from:
+
+```sh
+sudo ./packaging/install-systemd.sh --decommission
+```
+
+It deregisters the Connector (`secure_connect_connector --deregister`, using the daemon's own
+`connector.env` and identity key) and changes nothing on the host unless that succeeds, so a run
+before the admin confirmed in Portal leaves a working Connector. Then it stops and removes the
+service, the binary, the identity key, `/etc/skipr/connector` and the pending gateway-end reports,
+and removes the IP-forwarding sysctl file and NAT rule the install added. The local audit log is
+kept. It is safe to run again. If this host cannot reach an Agent, Portal shows the Connector as
+Unreachable and offers to remove it; after that, this command completes.
+
+To remove the service without decommissioning, for a reinstall on the same host (`connector.env` is
+left in place):
 
 ```sh
 ./packaging/install-systemd.sh --uninstall
