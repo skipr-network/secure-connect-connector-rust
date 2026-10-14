@@ -50,6 +50,18 @@ pub fn load_or_generate(path: &Path) -> Result<ConnectorIdentity> {
     }
 }
 
+/// Loads an identity that must already exist - never generates one (TT-2126). Deregistering has to name the key
+/// Portal registered; a freshly generated one would deregister nothing.
+pub fn load_existing(path: &Path) -> Result<ConnectorIdentity> {
+    if !path.exists() {
+        anyhow::bail!(
+            "no identity key file at {} - nothing to deregister",
+            path.display()
+        );
+    }
+    load(path)
+}
+
 fn load(path: &Path) -> Result<ConnectorIdentity> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read identity key file at {}", path.display()))?;

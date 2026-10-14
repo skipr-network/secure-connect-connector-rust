@@ -45,14 +45,25 @@ use tunnel::{TunnelEvent, TunnelManager};
 enum CliMode {
     Normal,
     GenerateIdentity,
+    Deregister,
     Help,
 }
 
-const USAGE: &str = "Usage: secure_connect_connector [--generate-identity | --help]\n\n\
+const USAGE: &str = "Usage: secure_connect_connector [--generate-identity | --deregister | --help]\n\n\
 With no arguments, runs the Connector daemon (reads its config from the environment).\n\
   --generate-identity  Generate (or load) this Connector's identity keypair, print its\n\
                        public key, and exit. No other config or network calls required.\n\
+  --deregister         Deregister this Connector during its guided decommissioning, after an\n\
+                       admin confirmed it in the Portal. Reads the daemon's environment and its\n\
+                       existing identity key; exits 0 when confirmed, 2 when it is not registered,\n\
+                       3 when it is not being decommissioned, 1 on any other error.\n\
   --help, -h           Show this message and exit.";
+
+/// `--deregister` exit codes, read by `install-systemd.sh --decommission` (TT-2126, spec §B.19 point 5).
+const EXIT_DEREGISTERED: i32 = 0;
+const EXIT_FAILED: i32 = 1;
+const EXIT_NOT_REGISTERED: i32 = 2;
+const EXIT_NOT_DECOMMISSIONING: i32 = 3;
 
 fn parse_cli_mode(args: std::env::ArgsOs) -> Result<CliMode, String> {
     // `.to_str()` (not `.to_string_lossy()`/`args()`) so a non-UTF-8 argument is gracefully
@@ -62,6 +73,7 @@ fn parse_cli_mode(args: std::env::ArgsOs) -> Result<CliMode, String> {
         [] => Ok(CliMode::Normal),
         [only] => match only.to_str() {
             Some("--generate-identity") => Ok(CliMode::GenerateIdentity),
+            Some("--deregister") => Ok(CliMode::Deregister),
             Some("--help") | Some("-h") => Ok(CliMode::Help),
             _ => Err(format!("unrecognized argument: {only:?}\n\n{USAGE}")),
         },
@@ -75,6 +87,7 @@ fn parse_cli_mode(args: std::env::ArgsOs) -> Result<CliMode, String> {
 async fn main() -> anyhow::Result<()> {
     match parse_cli_mode(std::env::args_os()) {
         Ok(CliMode::GenerateIdentity) => return generate_identity(),
+        Ok(CliMode::Deregister) => std::process::exit(deregister().await),
         Ok(CliMode::Help) => {
             println!("{USAGE}");
             return Ok(());
@@ -120,36 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // path visible too, purely for that log line (see ca_trust's own doc).
     ca_trust::log_native_root_certificate_count();
 
-    // TT-2027: CONNECTOR_CA_BUNDLE_PATH, when set, adds one or more extra trusted root CAs on
-    // top of the default trust (Mozilla's bundled roots plus, via rustls-tls-native-roots, the
-    // box's own OS trust store) - never a replacement for it, and never `danger_accept_invalid_certs`.
-    //
-    // connect_timeout (TT-2210): a rotated-away Agent's address often just drops packets, and with
-    // no bound a single connect attempt there would stall the whole heartbeat cycle - and the
-    // failover to the next operational Agent with it. Each call adds its own overall timeout.
-    let mut http_builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(5));
-    if let Some(ca_bundle_path) = &config.ca_bundle_path {
-        for certificate in ca_trust::load_extra_root_certificates(ca_bundle_path)? {
-            http_builder = http_builder.add_root_certificate(certificate);
-        }
-    }
-    // reqwest::Certificate::from_pem_bundle doesn't validate DER structure under the rustls
-    // backend - it just carries the bytes through - so a structurally-broken certificate in
-    // CONNECTOR_CA_BUNDLE_PATH passes load_extra_root_certificates above with Ok, and only fails
-    // here, once the TLS backend actually tries to load it as a trust anchor (PR #11 review
-    // finding #1). Naming the path in this error, when one was configured, is the difference
-    // between an admin immediately knowing which file to check and a bare "failed to build the
-    // HTTP client" that gives no hint the CA bundle is even involved.
-    let http = http_builder
-        .build()
-        .with_context(|| match &config.ca_bundle_path {
-            Some(path) => format!(
-                "failed to build the HTTP client - check that every certificate in \
-             CONNECTOR_CA_BUNDLE_PATH ({}) is structurally valid DER, not just well-formed PEM",
-                path.display()
-            ),
-            None => "failed to build the HTTP client".to_string(),
-        })?;
+    let http = build_http_client(&config)?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
     let agent_directory = AgentDirectory::new(http.clone(), config.agents_json_url.clone());
     let heartbeat_client = HeartbeatClient::new(http);
@@ -340,6 +324,86 @@ fn log_heartbeat_failure(error: &anyhow::Error, connector_public_key: &str, mess
         );
     } else {
         error!(error = %format!("{error:#}"), "{message}");
+    }
+}
+
+/// The HTTP client the daemon and `--deregister` share: the default trust plus any `CONNECTOR_CA_BUNDLE_PATH` roots,
+/// and a bounded connect.
+fn build_http_client(config: &Config) -> anyhow::Result<reqwest::Client> {
+    // TT-2027: CONNECTOR_CA_BUNDLE_PATH, when set, adds one or more extra trusted root CAs on
+    // top of the default trust (Mozilla's bundled roots plus, via rustls-tls-native-roots, the
+    // box's own OS trust store) - never a replacement for it, and never `danger_accept_invalid_certs`.
+    //
+    // connect_timeout (TT-2210): a rotated-away Agent's address often just drops packets, and with
+    // no bound a single connect attempt there would stall the whole heartbeat cycle - and the
+    // failover to the next operational Agent with it. Each call adds its own overall timeout.
+    let mut http_builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(5));
+    if let Some(ca_bundle_path) = &config.ca_bundle_path {
+        for certificate in ca_trust::load_extra_root_certificates(ca_bundle_path)? {
+            http_builder = http_builder.add_root_certificate(certificate);
+        }
+    }
+    // reqwest::Certificate::from_pem_bundle doesn't validate DER structure under the rustls
+    // backend - it just carries the bytes through - so a structurally-broken certificate in
+    // CONNECTOR_CA_BUNDLE_PATH passes load_extra_root_certificates above with Ok, and only fails
+    // here, once the TLS backend actually tries to load it as a trust anchor (PR #11 review
+    // finding #1). Naming the path in this error, when one was configured, is the difference
+    // between an admin immediately knowing which file to check and a bare "failed to build the
+    // HTTP client" that gives no hint the CA bundle is even involved.
+    http_builder
+        .build()
+        .with_context(|| match &config.ca_bundle_path {
+            Some(path) => format!(
+                "failed to build the HTTP client - check that every certificate in \
+             CONNECTOR_CA_BUNDLE_PATH ({}) is structurally valid DER, not just well-formed PEM",
+                path.display()
+            ),
+            None => "failed to build the HTTP client".to_string(),
+        })
+}
+
+/// `--deregister` (TT-2126, spec §B.19 points 4-5): deregisters this Connector through the first answering Agent and
+/// returns the exit code `install-systemd.sh --decommission` acts on. Never generates an identity.
+async fn deregister() -> i32 {
+    let outcome = async {
+        let config = Config::from_env()?;
+        let identity = identity::load_existing(&config.identity_key_path)?;
+        let http = build_http_client(&config)?;
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let agent_directory = AgentDirectory::new(http.clone(), config.agents_json_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        agent_directory
+            .deregister(
+                &registry_client,
+                &heartbeat_client,
+                &dto::ConnectorDeregisterRequest {
+                    connector_public_key: identity.public_key_base64.clone(),
+                },
+            )
+            .await
+    }
+    .await;
+    match outcome {
+        Ok(confirmed) => {
+            println!("Connector {} deregistered.", confirmed.connector_id);
+            EXIT_DEREGISTERED
+        }
+        Err(error) => match error.downcast_ref::<heartbeat::AgentRejected>() {
+            Some(rejected) if rejected.is_not_registered() => {
+                eprintln!("This Connector is not registered - nothing to deregister.");
+                EXIT_NOT_REGISTERED
+            }
+            Some(rejected) if rejected.is_not_decommissioning() => {
+                eprintln!(
+                    "This Connector is not being decommissioned. Confirm Decommission Connector in the Portal first, then run this again."
+                );
+                EXIT_NOT_DECOMMISSIONING
+            }
+            _ => {
+                eprintln!("Deregistration failed: {error:#}");
+                EXIT_FAILED
+            }
+        },
     }
 }
 

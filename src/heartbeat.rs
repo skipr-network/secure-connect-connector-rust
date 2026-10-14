@@ -27,7 +27,10 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, StatusCode};
 
 use crate::crypto;
-use crate::dto::{ConnectorHeartbeatRequest, ConnectorHeartbeatResponse};
+use crate::dto::{
+    ConnectorDeregisterRequest, ConnectorDeregisterResponse, ConnectorHeartbeatRequest,
+    ConnectorHeartbeatResponse,
+};
 
 const SIGNATURE_HEADER: &str = "X-Signature";
 
@@ -39,6 +42,12 @@ const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Portal's reason code for a public key no admin has registered yet, relayed unchanged by Agent.
 const NOT_REGISTERED_REASON: &str = "connectornotregistered";
+
+/// TT-2126: Portal's reason code for a deregistration of a Connector no admin has confirmed for decommissioning.
+const NOT_DECOMMISSIONING_REASON: &str = "connectornotdecommissioning";
+
+/// TT-2126: the only deregistration status the host acts on.
+const DEREGISTERED_STATUS: &str = "DEREGISTERED";
 
 /// Agent answered, and the answer is a refusal (HTTP 400): a decision, not an outage - the most
 /// common one being "not registered" for a key no admin has pasted into Portal yet. Kept distinct
@@ -56,13 +65,19 @@ impl AgentRejected {
             .as_deref()
             .is_some_and(|reason| reason.contains(NOT_REGISTERED_REASON))
     }
+
+    pub fn is_not_decommissioning(&self) -> bool {
+        self.reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(NOT_DECOMMISSIONING_REASON))
+    }
 }
 
 impl fmt::Display for AgentRejected {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.reason {
-            Some(reason) => write!(f, "Agent refused the heartbeat ({}): {reason}", self.status),
-            None => write!(f, "Agent refused the heartbeat ({})", self.status),
+            Some(reason) => write!(f, "Agent refused the request ({}): {reason}", self.status),
+            None => write!(f, "Agent refused the request ({})", self.status),
         }
     }
 }
@@ -148,6 +163,87 @@ impl HeartbeatClient {
                 "verified heartbeat response is for public key {:?}, not this Connector's - rejecting package, not updating local policy state",
                 parsed.connector_public_key
             );
+        }
+        Ok(parsed)
+    }
+
+    /// TT-2126 (spec §B.19 point 4): asks Agent to deregister this Connector during its guided decommissioning,
+    /// and accepts the answer only as a heartbeat response would be accepted - signed by this Agent, for this
+    /// Connector's own key - and only while it has not expired: the host removes its service and key on it.
+    ///
+    /// Fails with [`AgentRejected`] for Portal's refusals (400 `connectornotregistered`, 409
+    /// `connectornotdecommissioning`), and with a plain error for anything else.
+    pub async fn deregister_and_verify(
+        &self,
+        agent_base_url: &str,
+        agent_public_key_hex: &str,
+        request: &ConnectorDeregisterRequest,
+    ) -> Result<ConnectorDeregisterResponse> {
+        let url = format!(
+            "{}/api/connectors/deregister",
+            agent_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .http
+            .post(&url)
+            .timeout(HEARTBEAT_REQUEST_TIMEOUT)
+            .json(request)
+            .send()
+            .await
+            .with_context(|| format!("deregistration request to {url} failed"))?;
+
+        let status = response.status();
+        if status == StatusCode::BAD_REQUEST || status == StatusCode::CONFLICT {
+            let reason = response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| body.get("reason")?.as_str().map(str::to_string));
+            return Err(AgentRejected { status, reason }.into());
+        }
+        if !status.is_success() {
+            bail!("Agent returned {status} for the deregistration at {url}");
+        }
+
+        let signature_base64 = response
+            .headers()
+            .get(SIGNATURE_HEADER)
+            .context("Agent deregistration response is missing the X-Signature header")?
+            .to_str()
+            .context("X-Signature header is not valid UTF-8")?
+            .to_string();
+        let body_bytes = response
+            .bytes()
+            .await
+            .context("failed to read the deregistration response body")?;
+        if !crypto::verify_base64(agent_public_key_hex, &body_bytes, &signature_base64) {
+            bail!("deregistration response signature verification failed - not trusting it");
+        }
+        let parsed: ConnectorDeregisterResponse = serde_json::from_slice(&body_bytes)
+            .context("failed to parse the verified deregistration response")?;
+        if parsed.connector_public_key != request.connector_public_key {
+            bail!(
+                "verified deregistration response is for public key {:?}, not this Connector's - not trusting it",
+                parsed.connector_public_key
+            );
+        }
+        // The host removes its service, key and configuration on this answer: act only on the one status that
+        // means the Portal record is gone.
+        if parsed.status != DEREGISTERED_STATUS {
+            bail!(
+                "deregistration response has status {:?}, not {DEREGISTERED_STATUS} - not trusting it",
+                parsed.status
+            );
+        }
+        let expires_at =
+            chrono::DateTime::parse_from_rfc3339(&parsed.expires_at).with_context(|| {
+                format!(
+                    "deregistration response expires_at {:?} is not a timestamp",
+                    parsed.expires_at
+                )
+            })?;
+        if expires_at <= chrono::Utc::now() {
+            bail!("deregistration response expired at {expires_at} - not trusting it");
         }
         Ok(parsed)
     }
@@ -402,6 +498,196 @@ mod tests {
             result.is_ok(),
             "request body must match exactly what was passed in, or wiremock's body_json \
              matcher above would have refused the request with a 404"
+        );
+    }
+
+    // --- TT-2126: deregistration (spec §B.19 point 4) ---
+
+    fn deregister_request() -> ConnectorDeregisterRequest {
+        ConnectorDeregisterRequest {
+            connector_public_key: "pk-1".to_string(),
+        }
+    }
+
+    fn confirmation(public_key: &str, expires_at: &str) -> String {
+        format!(
+            r#"{{"connector_id":"c-1","connector_public_key":"{public_key}","status":"DEREGISTERED","generated_at":"2026-10-13T10:00:00Z","expires_at":"{expires_at}","nonce":"n1"}}"#
+        )
+    }
+
+    async fn agent_deregistering(template: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/deregister"))
+            .and(body_json(
+                serde_json::json!({ "connector_public_key": "pk-1" }),
+            ))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn accepts_a_signed_current_deregistration_for_its_own_key() {
+        let agent_identity = crypto::generate_keypair();
+        let body = confirmation("pk-1", "2099-01-01T00:00:00Z");
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+        let server = agent_deregistering(
+            ResponseTemplate::new(200)
+                .set_body_raw(body, "application/json")
+                .insert_header("X-Signature", signature.as_str()),
+        )
+        .await;
+
+        let confirmed = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                &deregister_request(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(confirmed.connector_id, "c-1");
+        assert_eq!(confirmed.status, "DEREGISTERED");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_deregistration_signed_by_another_key() {
+        let agent_identity = crypto::generate_keypair();
+        let impostor = crypto::generate_keypair();
+        let body = confirmation("pk-1", "2099-01-01T00:00:00Z");
+        let signature = crypto::sign_to_base64(&impostor.signing_key, body.as_bytes());
+        let server = agent_deregistering(
+            ResponseTemplate::new(200)
+                .set_body_raw(body, "application/json")
+                .insert_header("X-Signature", signature.as_str()),
+        )
+        .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                &deregister_request(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("signature verification failed"));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_deregistration_for_another_connectors_key() {
+        let agent_identity = crypto::generate_keypair();
+        let body = confirmation("pk-other", "2099-01-01T00:00:00Z");
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+        let server = agent_deregistering(
+            ResponseTemplate::new(200)
+                .set_body_raw(body, "application/json")
+                .insert_header("X-Signature", signature.as_str()),
+        )
+        .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                &deregister_request(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("not this Connector's"));
+    }
+
+    /// A captured old confirmation replayed later must not make a host remove its key.
+    #[tokio::test]
+    async fn rejects_an_expired_deregistration() {
+        let agent_identity = crypto::generate_keypair();
+        let body = confirmation("pk-1", "2026-01-01T00:00:00Z");
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+        let server = agent_deregistering(
+            ResponseTemplate::new(200)
+                .set_body_raw(body, "application/json")
+                .insert_header("X-Signature", signature.as_str()),
+        )
+        .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                &deregister_request(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("expired"));
+    }
+
+    /// A signed, current answer for its own key with any other status removes nothing.
+    #[tokio::test]
+    async fn rejects_a_deregistration_with_another_status() {
+        let agent_identity = crypto::generate_keypair();
+        let body = confirmation("pk-1", "2099-01-01T00:00:00Z").replace("DEREGISTERED", "PENDING");
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+        let server = agent_deregistering(
+            ResponseTemplate::new(200)
+                .set_body_raw(body, "application/json")
+                .insert_header("X-Signature", signature.as_str()),
+        )
+        .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                &deregister_request(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("not DEREGISTERED"));
+    }
+
+    #[tokio::test]
+    async fn a_409_not_decommissioning_is_an_agent_refusal() {
+        let server =
+            agent_deregistering(ResponseTemplate::new(409).set_body_json(
+                serde_json::json!({ "reason": "error.connectornotdecommissioning" }),
+            ))
+            .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(&server.uri(), "unused", &deregister_request())
+            .await
+            .unwrap_err();
+
+        let rejected = error.downcast_ref::<AgentRejected>().expect("a refusal");
+        assert!(rejected.is_not_decommissioning());
+        assert!(!rejected.is_not_registered());
+    }
+
+    #[tokio::test]
+    async fn a_400_not_registered_is_an_agent_refusal() {
+        let server = agent_deregistering(
+            ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({ "reason": "error.connectornotregistered" })),
+        )
+        .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(&server.uri(), "unused", &deregister_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<AgentRejected>()
+                .expect("a refusal")
+                .is_not_registered()
         );
     }
 }

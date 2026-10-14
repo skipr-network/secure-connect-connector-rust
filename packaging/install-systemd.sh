@@ -37,6 +37,13 @@
 #   packaging/install-systemd.sh --uninstall --keep-identity
 #                                               same, but keep the identity key, so a later
 #                                               install comes back as the same Connector
+#   packaging/install-systemd.sh --decommission
+#                                               TT-2126: after an admin confirmed Decommission
+#                                               Connector in the Portal, deregister this Connector,
+#                                               then remove its service, binary, identity key,
+#                                               configuration and the forwarding/NAT this script
+#                                               added. Changes nothing until deregistration has
+#                                               succeeded; safe to run again. Keeps the audit log.
 set -euo pipefail
 
 SERVICE_NAME="secure-connect-connector"
@@ -45,19 +52,25 @@ ENV_DIR="/etc/skipr/connector"
 ENV_FILE="${ENV_DIR}/connector.env"
 INSTALLED_BINARY_PATH="/usr/local/bin/secure_connect_connector"
 DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
+# TT-2126: every MASQUERADE rule this script (or the unit's ExecStartPre) adds carries this iptables
+# comment, so --decommission removes exactly those - on whatever interface they were added - and never a
+# rule something else on the host owns. No spaces: it is also written into the unit's ExecStartPre.
+NAT_RULE_COMMENT="skipr-connector-nat"
 
 usage_error() {
   echo "error: $1" >&2
-  echo "usage: $0 [--regenerate-identity] | --uninstall [--keep-identity]" >&2
+  echo "usage: $0 [--regenerate-identity] | --uninstall [--keep-identity] | --decommission" >&2
   exit 1
 }
 
 UNINSTALL=false
 KEEP_IDENTITY=false
 REGENERATE_IDENTITY=false
+DECOMMISSION=false
 for arg in "$@"; do
   case "$arg" in
     --uninstall) UNINSTALL=true ;;
+    --decommission) DECOMMISSION=true ;;
     --keep-identity) KEEP_IDENTITY=true ;;
     --regenerate-identity) REGENERATE_IDENTITY=true ;;
     *) usage_error "unknown option '$arg'" ;;
@@ -68,6 +81,9 @@ if [ "$KEEP_IDENTITY" = true ] && [ "$UNINSTALL" = false ]; then
 fi
 if [ "$REGENERATE_IDENTITY" = true ] && [ "$UNINSTALL" = true ]; then
   usage_error "--regenerate-identity only applies to an install"
+fi
+if [ "$DECOMMISSION" = true ] && { [ "$UNINSTALL" = true ] || [ "$KEEP_IDENTITY" = true ] || [ "$REGENERATE_IDENTITY" = true ]; }; then
+  usage_error "--decommission takes no other option"
 fi
 
 # The identity key path the daemon actually uses: CONNECTOR_IDENTITY_KEY_PATH from $ENV_FILE as
@@ -80,12 +96,101 @@ fi
 # otherwise break the quote-stripping pattern and leave the quotes in place. Install and uninstall
 # both read the path through here (TT-2326), so they can never disagree on which file is the key.
 identity_key_path() {
+  env_file_value CONNECTOR_IDENTITY_KEY_PATH "$DEFAULT_IDENTITY_KEY_PATH"
+}
+
+# A value from $ENV_FILE as systemd reads it (see identity_key_path), or $2 when unset.
+env_file_value() {
   local configured
-  configured="$(sudo grep -E '^CONNECTOR_IDENTITY_KEY_PATH=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  configured="$(sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
   configured="$(printf '%s' "$configured" |
     sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
-  printf '%s' "${configured:-$DEFAULT_IDENTITY_KEY_PATH}"
+  printf '%s' "${configured:-$2}"
 }
+
+# TT-2126 (spec §B.19 point 5): decommissioning, after an admin confirmed it in the Portal. Deregisters
+# first - through the installed binary, with the daemon's own environment and key - and changes nothing
+# on this host unless that succeeded (or the Connector is already gone from the Portal), so a run the
+# Portal refuses leaves a working Connector behind. Every step tolerates having already been done.
+if [ "$DECOMMISSION" = true ]; then
+  IDENTITY_KEY_PATH="$(identity_key_path)"
+  AUDIT_LOG_PATH="$(env_file_value CONNECTOR_AUDIT_LOG_PATH /var/skipr/connector/audit/audit.log)"
+  PENDING_REPORTS_PATH="$(dirname "$AUDIT_LOG_PATH")/pending-gateway-end-reports.json"
+
+  if sudo test -x "$INSTALLED_BINARY_PATH" && sudo test -f "$IDENTITY_KEY_PATH"; then
+    echo "Deregistering this Connector..."
+    # As root, so the service user's key and connector.env (mode 600) are readable; `set -a` exports
+    # every KEY=value in connector.env exactly as the daemon gets them.
+    set +e
+    sudo sh -c 'set -a; [ -f "$1" ] && . "$1"; set +a; exec "$2" --deregister' sh "$ENV_FILE" "$INSTALLED_BINARY_PATH"
+    DEREGISTER_STATUS=$?
+    set -e
+    case "$DEREGISTER_STATUS" in
+      0) ;;
+      2) echo "The Portal no longer has this Connector - completing the cleanup." ;;
+      3)
+        echo "error: this Connector is not being decommissioned. Confirm Decommission Connector in the" >&2
+        echo "       Portal first, then run this again. Nothing was changed on this host." >&2
+        exit 1
+        ;;
+      *)
+        echo "error: deregistration failed - nothing was changed on this host. Run this again. If the" >&2
+        echo "       Agent stays unreachable, the Portal shows the Connector as Unreachable and offers to" >&2
+        echo "       remove it; after that this command completes." >&2
+        exit 1
+        ;;
+    esac
+  elif ! sudo test -e "$INSTALLED_BINARY_PATH" && ! sudo test -f "$IDENTITY_KEY_PATH"; then
+    echo "The Connector binary and identity key are already gone - completing the cleanup."
+  else
+    echo "error: cannot deregister - the Connector binary ($INSTALLED_BINARY_PATH) or its identity key" >&2
+    echo "       ($IDENTITY_KEY_PATH) is missing. Nothing was changed. If only the binary is gone, re-run the" >&2
+    echo "       install (it keeps an existing key); otherwise remove the Connector in the Portal as" >&2
+    echo "       unreachable. Then run this again." >&2
+    exit 1
+  fi
+
+  sudo systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+  sudo rm -f "$UNIT_PATH"
+  sudo systemctl daemon-reload 2>/dev/null || true
+
+  sudo rm -f "$INSTALLED_BINARY_PATH" "$IDENTITY_KEY_PATH" "$PENDING_REPORTS_PATH"
+  sudo rmdir "$(dirname "$IDENTITY_KEY_PATH")" 2>/dev/null || true
+  sudo rm -rf "$ENV_DIR"
+
+  # The forwarding the install turned on: its sysctl file goes, and sysctl reloads from what is left,
+  # without forcing ip_forward off - other software on this host may need it. The running value
+  # follows the host's own configuration from the next reboot.
+  sudo rm -f /etc/sysctl.d/99-skipr-connector.conf
+  sudo sysctl --system > /dev/null 2>&1 || true
+  # Every rule tagged as ours, whatever interface it was added for (ExecStartPre adds one for the
+  # interface of the default route at each start, which can change); never an untagged one.
+  REMOVED_NAT_RULES=0
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    read -r -a rule_parts <<< "$rule"
+    # "-A POSTROUTING <match...>" -> "-D POSTROUTING <match...>"
+    if sudo iptables -t nat -D "${rule_parts[@]:1}"; then
+      REMOVED_NAT_RULES=$((REMOVED_NAT_RULES + 1))
+    fi
+  done <<< "$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -F -- "--comment $NAT_RULE_COMMENT" || true)"
+
+  echo "Decommissioned $SERVICE_NAME: service, binary, identity key and $ENV_DIR removed, the"
+  echo "forwarding sysctl file removed, and $REMOVED_NAT_RULES NAT rule(s) this script added removed."
+  # A host installed before the rule was tagged still has its untagged rule, even when a later update
+  # added (and this run removed) a tagged one - so look at what is left, not at how many were removed.
+  UNTAGGED_NAT_RULES="$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -- '-j MASQUERADE' | grep -vF -- "--comment $NAT_RULE_COMMENT" || true)"
+  if [ -n "$UNTAGGED_NAT_RULES" ]; then
+    echo "POSTROUTING still has untagged MASQUERADE rule(s) (sudo iptables -t nat -S POSTROUTING):"
+    while IFS= read -r rule; do echo "  $rule"; done <<< "$UNTAGGED_NAT_RULES"
+    echo "One may be this Connector's, added before its NAT rule was tagged. If nothing else on this host"
+    echo "needs it, remove it with:"
+    while IFS= read -r rule; do echo "  sudo iptables -t nat -D ${rule#-A }"; done <<< "$UNTAGGED_NAT_RULES"
+  fi
+  echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
+  echo "when it is no longer needed. This checkout and the Rust toolchain can be removed too."
+  exit 0
+fi
 
 if [ "$UNINSTALL" = true ]; then
   sudo systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
@@ -318,13 +423,13 @@ NAT_INTERFACE="$(ip route show default | awk '{print $5; exit}')"
 if [ -z "$NAT_INTERFACE" ]; then
   echo "warning: could not determine the default outbound interface (no default route yet?) -" >&2
   echo "         skipping NAT setup. Re-run this script once the box has one, or add the rule" >&2
-  echo "         yourself: sudo iptables -t nat -A POSTROUTING -o <interface> -j MASQUERADE" >&2
+  echo "         yourself: sudo iptables -t nat -A POSTROUTING -o <interface> -m comment --comment $NAT_RULE_COMMENT -j MASQUERADE" >&2
 else
   # Checked before added (`-C` ... `|| ... -A`), not appended unconditionally - this script is
   # documented as safe to re-run (after a rebuild, a config change), and an unconditional -A would
   # silently stack up a duplicate MASQUERADE rule on every re-run instead of staying a no-op.
-  if ! sudo iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE 2>/dev/null; then
-    sudo iptables -t nat -A POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE
+  if ! sudo iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -m comment --comment "$NAT_RULE_COMMENT" -j MASQUERADE 2>/dev/null; then
+    sudo iptables -t nat -A POSTROUTING -o "$NAT_INTERFACE" -m comment --comment "$NAT_RULE_COMMENT" -j MASQUERADE
   fi
   echo "NAT configured on interface $NAT_INTERFACE"
 fi
@@ -377,7 +482,7 @@ EnvironmentFile=${ENV_FILE}
 # in-double-quotes ambiguity. Verified live: an awk version here produced a real
 # "interface name ... must be shorter than 16 characters" iptables error on a test box; this
 # version doesn't.
-ExecStartPre=+/bin/sh -c 'set -- \$(ip route show default); IFACE=\$5; [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE; } || true'
+ExecStartPre=+/bin/sh -c 'set -- \$(ip route show default); IFACE=\$5; [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -m comment --comment ${NAT_RULE_COMMENT} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -m comment --comment ${NAT_RULE_COMMENT} -j MASQUERADE; } || true'
 ExecStart=${INSTALLED_BINARY_PATH}
 Restart=on-failure
 RestartSec=5
