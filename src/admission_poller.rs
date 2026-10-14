@@ -517,6 +517,7 @@ async fn handle_admission(
     };
     let flow_id = request.flow_id.clone();
     let port = request.port;
+    let dialled = request.dialled();
     let response = handle_flow_admission(
         &state.policy_store,
         &state.audit_log,
@@ -528,12 +529,16 @@ async fn handle_admission(
     // Same reclaim-on-admit behavior the pre-TT-2144 HTTP handler had: only on an actual admit, a
     // refused flow's buffered packet stays dropped (fail-closed) and is simply left to age out on
     // its own via the shared TTL sweep - no need to explicitly clear it here.
+    // TT-2639: a flow admitted with its dialled identity reclaims only the packet held under it.
     if response.decision == "admit"
-        && let Some(packet) = state
-            .flow_table
-            .lock()
-            .expect("flow table lock poisoned")
-            .take_pending_packet(node_id, port, std::time::Instant::now())
+        && let Some(packet) = {
+            let mut table = state.flow_table.lock().expect("flow table lock poisoned");
+            let now = std::time::Instant::now();
+            match dialled {
+                Some(dialled) => table.take_pending_dialled_packet(node_id, port, dialled, now),
+                None => table.take_pending_packet(node_id, port, now),
+            }
+        }
         && let Err(error) = state
             .recovered_packet_tx
             .send((node_id.to_string(), packet))
@@ -1338,6 +1343,9 @@ mod tests {
                 user_public_key: Some(device.public_key_hex.clone()),
                 signature: Some(signature.clone()),
                 signed_data: Some(signed_data.clone()),
+                transport: None,
+                gateway_address: None,
+                destination_port: None,
             };
             state.flow_table.lock().unwrap().buffer_pending_packet(
                 "n-1",
@@ -1394,6 +1402,9 @@ mod tests {
             user_public_key: None,
             signature: None,
             signed_data: None,
+            transport: None,
+            gateway_address: None,
+            destination_port: None,
         };
 
         handle_admission(

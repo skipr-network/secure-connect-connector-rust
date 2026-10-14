@@ -6,13 +6,16 @@
 //! checked, device's traffic could still be forwarded once its IP was
 //! observed once on the wire.
 //!
-//! A flow is identified by `(node_id, port)` per spec §B.8
-//! ("Many-users-to-one-Connector is distinguished by translated source
-//! port"). Release only ever carries `flow_id` (the agreed
-//! `FlowReleaseRequest` schema has no `node_id` field), so entries are also
-//! looked up by `flow_id` for removal - a linear scan, not a second index,
-//! since the number of concurrently admitted flows on one Connector is
-//! bounded by real concurrent user sessions, not internet-scale traffic.
+//! A flow is identified by node, transport, translated source port, gateway virtual address and
+//! destination port (spec §B.8, TT-2639): the node's NAT keeps a client's source port whenever only
+//! the gateway, the port or the transport differs, so the translated port alone mixed up flows to
+//! different gateways (reproduced on TEST, TT-2651). Each such flow gets a source port this
+//! Connector allocates for the internal network, which is also how its replies find it
+//! (`dialled_reply`). A flow admitted without that identity - from a node that predates it - is
+//! still identified by `(node_id, port)` as before (`admit`, `forward_target`, `node_for_port`).
+//! Release only ever carries `flow_id`, so entries are also looked up by `flow_id` for removal - a
+//! linear scan, not a second index, since the number of concurrently admitted flows on one
+//! Connector is bounded by real concurrent user sessions, not internet-scale traffic.
 //!
 //! **Also the source of truth for routing return traffic** (TT-1847): every
 //! node in the fleet masquerades outbound traffic behind the identical wg0
@@ -61,6 +64,94 @@ const RELEASED_FLOW_MEMORY: Duration = Duration::from_secs(30);
 /// behaviour - and nothing unadmitted is ever forwarded either way.
 const MAX_PENDING_PACKETS: usize = 1024;
 
+/// The source ports this Connector allocates for dialled flows (TT-2639, spec §B.8): every
+/// non-system port, unique among the flows to one internal host:port on one transport - so two live
+/// connections to the same internal service never look alike to it.
+const SOURCE_PORT_RANGE: std::ops::RangeInclusive<u16> = 1024..=65535;
+
+/// A flow's transport (spec §B.8): part of what identifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Transport {
+    Tcp,
+    Udp,
+}
+
+impl Transport {
+    /// From the admission message's `transport` field; `None` for anything but `tcp`/`udp`.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "tcp" => Some(Self::Tcp),
+            "udp" => Some(Self::Udp),
+            _ => None,
+        }
+    }
+
+    /// From an IP header's protocol number (6 = TCP, 17 = UDP).
+    pub fn from_ip_protocol(protocol: u8) -> Option<Self> {
+        match protocol {
+            6 => Some(Self::Tcp),
+            17 => Some(Self::Udp),
+            _ => None,
+        }
+    }
+}
+
+/// What the user dialled (TT-2639, spec §B.8): with the node and the translated port, it
+/// identifies a flow. Gatekeeper sends it on admission; the Connector reads the same values from
+/// each packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Dialled {
+    pub transport: Transport,
+    pub gateway_address: Ipv4Addr,
+    pub destination_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DialledKey {
+    node_id: String,
+    port: u16,
+    dialled: Dialled,
+}
+
+/// A flow admitted with its dialled identity (TT-2639).
+#[derive(Debug, Clone, PartialEq)]
+struct DialledFlow {
+    flow: AdmittedFlow,
+    /// Where its packets go on the internal network and the source port they carry there. Set when
+    /// its first packet is forwarded - the internal address is only known then (a configured host
+    /// can be a name still being resolved) - and replaced if that address changes.
+    allocation: Option<Allocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Allocation {
+    /// The internal address and port - a reply must come from exactly there.
+    target: (Ipv4Addr, u16),
+    /// The source port, unique among this Connector's flows to `target` on that transport.
+    port: u16,
+}
+
+/// How to forward a packet on a dialled flow (`FlowTable::dialled_forward_target`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialledForward {
+    /// Rewrite the destination to `address` (the dialled port is unchanged) and the source port to
+    /// `source_port`.
+    Forward { address: Ipv4Addr, source_port: u16 },
+    /// Why not: any `ForwardOutcome` but `Forward`/`NotAdmitted`.
+    Refused(ForwardOutcome),
+}
+
+/// How to restore a reply from the internal service before sending it to its flow's node
+/// (TT-2639): the gateway address and dialled port become its source again, and the translated
+/// port its destination port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialledReply {
+    pub node_id: String,
+    pub gateway_address: Ipv4Addr,
+    pub destination_port: u16,
+    pub translated_port: u16,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct AdmittedFlow {
     gateway_id: String,
@@ -83,13 +174,14 @@ struct AdmittedFlow {
     /// comment), so nothing downstream can work at all without this.
     endpoints: Vec<PolicyBundleEndpoint>,
     /// The fake/virtual destination address this flow's packets actually arrive addressed to
-    /// (Gatekeeper's invented per-gateway address) - learned from the first forwarded packet, not
-    /// known at admission time (Gatekeeper's admission request carries no such field). Needed to
+    /// (Gatekeeper's invented per-gateway address). For a flow from an older node it is learned from
+    /// the first forwarded packet, since that admission carries no such field; a flow admitted with
+    /// its dialled identity has it from admission (TT-2639) and its replies use that. Needed to
     /// rewrite a *reply* packet's source back to what the client actually dialed before sending it
     /// back through the tunnel (TT-2046 review finding #1): a real kernel DNAT gets this reversal
     /// for free via conntrack; this rewrite happens in userspace with no conntrack entry to
-    /// reverse it automatically, so the Connector has to remember it explicitly. `None` until the
-    /// first forwarded packet for this flow has been seen.
+    /// reverse it automatically, so the Connector has to remember it explicitly. For an older node's
+    /// flow, `None` until its first forwarded packet has been seen.
     virtual_address: Option<Ipv4Addr>,
 }
 
@@ -120,6 +212,10 @@ pub enum ForwardOutcome {
     /// black-holes every packet for that gateway until it resolves, so this needs its own loud,
     /// specific message rather than folding into a generic "can't forward" line.
     HostUnresolved,
+    /// TT-2639: admitted and resolved, but every source port toward that internal host:port on that
+    /// transport is in use, so the flow could not be kept apart from the others there. Dropped (fail
+    /// closed); a later packet gets a port once one is freed.
+    NoFreeSourcePort,
 }
 
 #[derive(Default)]
@@ -183,6 +279,19 @@ pub struct FlowTable {
     pending_packets: HashMap<(String, u16), (Vec<u8>, Instant)>,
     /// TT-2298: flow_ids released within `RELEASED_FLOW_MEMORY`, with when - see that constant.
     recently_released: HashMap<String, Instant>,
+    /// TT-2639: flows admitted with their dialled identity - see the module doc.
+    dialled_flows: HashMap<DialledKey, DialledFlow>,
+    /// TT-2639: `(transport, internal address, internal port, allocated port) -> flow` - a reply's
+    /// own transport, source and destination port, so it matches exactly one flow.
+    dialled_by_allocation: HashMap<(Transport, Ipv4Addr, u16, u16), DialledKey>,
+    /// TT-2639: where the next source-port search starts, per transport and internal host:port (so a
+    /// freed port is not reused at once while its old connection may still be closing there).
+    next_source_port: HashMap<(Transport, Ipv4Addr, u16), u16>,
+    /// TT-2639: the allocatable range - `SOURCE_PORT_RANGE` except in tests of exhaustion.
+    source_port_range: Option<std::ops::RangeInclusive<u16>>,
+    /// TT-2639: packets buffered for a pending admission under their dialled key, the counterpart
+    /// of `pending_packets`, sharing its TTL and capacity.
+    pending_dialled_packets: HashMap<DialledKey, (Vec<u8>, Instant)>,
 }
 
 /// How many distinct control-channel connections' worth of routing state to remember at once
@@ -193,6 +302,15 @@ const MAX_TRACKED_CONTROL_CHANNEL_PORTS: usize = 256;
 impl FlowTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A table allocating source ports from `range` only - for testing exhaustion.
+    #[cfg(test)]
+    pub(crate) fn with_source_port_range(range: std::ops::RangeInclusive<u16>) -> Self {
+        Self {
+            source_port_range: Some(range),
+            ..Self::default()
+        }
     }
 
     /// Shared bounded-FIFO insert behind both `control_channel_ports` and
@@ -284,7 +402,105 @@ impl FlowTable {
         );
     }
 
+    /// TT-2639: admits a flow with its dialled identity (spec §B.8). Its source port toward the
+    /// internal network is allocated when its first packet is forwarded (`dialled_forward_target`).
+    /// Re-admitting the same identity (its release never arrived) replaces the old entry and frees
+    /// its port.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_dialled(
+        &mut self,
+        node_id: String,
+        port: u16,
+        dialled: Dialled,
+        gateway_id: String,
+        flow_id: String,
+        device_public_key: String,
+        endpoints: Vec<PolicyBundleEndpoint>,
+    ) {
+        let key = DialledKey {
+            node_id,
+            port,
+            dialled,
+        };
+        self.remove_dialled(&key);
+        self.dialled_flows.insert(
+            key,
+            DialledFlow {
+                flow: AdmittedFlow {
+                    gateway_id,
+                    flow_id,
+                    device_public_key,
+                    endpoints,
+                    virtual_address: Some(dialled.gateway_address),
+                },
+                allocation: None,
+            },
+        );
+    }
+
+    /// The next free source port toward `target` on `transport`, searching on from the last one
+    /// handed out there. A field-level function so it can run while one flow is borrowed.
+    fn allocate_source_port(
+        allocations: &HashMap<(Transport, Ipv4Addr, u16, u16), DialledKey>,
+        cursors: &mut HashMap<(Transport, Ipv4Addr, u16), u16>,
+        range: std::ops::RangeInclusive<u16>,
+        transport: Transport,
+        target: (Ipv4Addr, u16),
+    ) -> Option<u16> {
+        let (first, last) = (*range.start(), *range.end());
+        let size = u32::from(last - first) + 1;
+        let cursor = (transport, target.0, target.1);
+        let start = cursors
+            .get(&cursor)
+            .copied()
+            .filter(|port| range.contains(port))
+            .unwrap_or(first);
+        for offset in 0..size {
+            let candidate = first + ((u32::from(start - first) + offset) % size) as u16;
+            if !allocations.contains_key(&(transport, target.0, target.1, candidate)) {
+                let next = if candidate == last {
+                    first
+                } else {
+                    candidate + 1
+                };
+                cursors.insert(cursor, next);
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Removes a dialled flow and frees its allocated port; a no-op if it isn't admitted.
+    fn remove_dialled(&mut self, key: &DialledKey) {
+        if let Some(Allocation { target, port }) = self
+            .dialled_flows
+            .remove(key)
+            .and_then(|removed| removed.allocation)
+        {
+            self.dialled_by_allocation
+                .remove(&(key.dialled.transport, target.0, target.1, port));
+        }
+    }
+
+    /// Removes every dialled flow `drop_it` selects and frees their ports; returns how many.
+    fn remove_dialled_where(
+        &mut self,
+        drop_it: impl Fn(&DialledKey, &AdmittedFlow) -> bool,
+    ) -> usize {
+        let removed: Vec<DialledKey> = self
+            .dialled_flows
+            .iter()
+            .filter(|(key, entry)| drop_it(key, &entry.flow))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &removed {
+            self.remove_dialled(key);
+        }
+        removed.len()
+    }
+
     pub fn release(&mut self, flow_id: &str) {
+        self.remove_dialled_where(|_, flow| flow.flow_id == flow_id);
         let mut removed = Vec::new();
         self.flows.retain(|key, flow| {
             let keep = flow.flow_id != flow_id;
@@ -330,6 +546,7 @@ impl FlowTable {
         for port in removed_ports {
             self.deindex(node_id, port);
         }
+        self.remove_dialled_where(|key, _| key.node_id == node_id);
         // TT-2297: a departed node's control-channel ports route to a tunnel that no longer
         // exists - left in place, a packet matching one is dropped instead of reaching the node
         // that now owns that port.
@@ -375,6 +592,9 @@ impl FlowTable {
             self.deindex(node_id, *port);
         }
         removed.len()
+            + self.remove_dialled_where(|_, flow| {
+                flow.gateway_id == gateway_id && flow.device_public_key == device_public_key
+            })
     }
 
     /// Refreshes every currently-admitted flow's remembered endpoint list for one gateway to this
@@ -388,7 +608,8 @@ impl FlowTable {
     /// no-op for a gateway with no currently-admitted flow, or one whose endpoint list didn't
     /// change - both normal, expected cases, not something to log.
     pub fn update_endpoints(&mut self, gateway_id: &str, endpoints: &[PolicyBundleEndpoint]) {
-        for flow in self.flows.values_mut() {
+        let dialled = self.dialled_flows.values_mut().map(|entry| &mut entry.flow);
+        for flow in self.flows.values_mut().chain(dialled) {
             if flow.gateway_id == gateway_id {
                 flow.endpoints = endpoints.to_vec();
             }
@@ -461,19 +682,96 @@ impl FlowTable {
         let Some(flow) = self.flows.get(&(node_id.to_string(), port)) else {
             return ForwardOutcome::NotAdmitted;
         };
-        let matching: Vec<&PolicyBundleEndpoint> = flow
-            .endpoints
-            .iter()
-            .filter(|endpoint| endpoint.port == packet_destination_port)
-            .collect();
-        match matching.as_slice() {
-            [] => ForwardOutcome::PortNotConfigured,
-            [endpoint] => match dns_cache.resolve(&endpoint.host) {
-                Some(ip) => ForwardOutcome::Forward(ip),
-                None => ForwardOutcome::HostUnresolved,
-            },
-            _ => ForwardOutcome::AmbiguousEndpoint,
+        resolve_endpoint(&flow.endpoints, packet_destination_port, dns_cache)
+    }
+
+    /// TT-2639: the same decision as `forward_target`, for a flow admitted with its dialled
+    /// identity - matched on everything that identifies it (spec §B.8), so a packet addressed to one
+    /// gateway can never match a flow admitted for another. `None` if no flow is admitted for exactly
+    /// this identity, so the caller can fall back to a flow from an older node (`forward_target`).
+    ///
+    /// On the first packet, or once the flow's internal address has changed (an endpoint update or a
+    /// new DNS answer), allocates the source port its packets carry there - unique among this
+    /// Connector's flows to that internal host:port on that transport - freeing any previous one.
+    pub fn dialled_forward_target(
+        &mut self,
+        node_id: &str,
+        port: u16,
+        dialled: Dialled,
+        dns_cache: &crate::dns_cache::DnsCache,
+    ) -> Option<DialledForward> {
+        let key = DialledKey {
+            node_id: node_id.to_string(),
+            port,
+            dialled,
+        };
+        let entry = self.dialled_flows.get_mut(&key)?;
+        let address =
+            match resolve_endpoint(&entry.flow.endpoints, dialled.destination_port, dns_cache) {
+                ForwardOutcome::Forward(address) => address,
+                refused => return Some(DialledForward::Refused(refused)),
+            };
+        let target = (address, dialled.destination_port);
+        if let Some(allocation) = entry.allocation
+            && allocation.target == target
+        {
+            return Some(DialledForward::Forward {
+                address,
+                source_port: allocation.port,
+            });
         }
+        let transport = dialled.transport;
+        if let Some(Allocation {
+            target: old,
+            port: old_port,
+        }) = entry.allocation.take()
+        {
+            self.dialled_by_allocation
+                .remove(&(transport, old.0, old.1, old_port));
+        }
+        let range = self.source_port_range.clone().unwrap_or(SOURCE_PORT_RANGE);
+        let Some(source_port) = Self::allocate_source_port(
+            &self.dialled_by_allocation,
+            &mut self.next_source_port,
+            range,
+            transport,
+            target,
+        ) else {
+            return Some(DialledForward::Refused(ForwardOutcome::NoFreeSourcePort));
+        };
+        entry.allocation = Some(Allocation {
+            target,
+            port: source_port,
+        });
+        self.dialled_by_allocation
+            .insert((transport, target.0, target.1, source_port), key);
+        Some(DialledForward::Forward {
+            address,
+            source_port,
+        })
+    }
+
+    /// TT-2639: the flow a reply read from the TUN device belongs to - by its transport, its source
+    /// (an internal host:port a flow's packets were forwarded to) and its destination port (the
+    /// source port allocated to that flow there). `None` otherwise, for the caller's other lookups
+    /// (a flow from an older node, or a control-channel connection).
+    pub fn dialled_reply(
+        &self,
+        transport: Transport,
+        source: Ipv4Addr,
+        source_port: u16,
+        destination_port: u16,
+    ) -> Option<DialledReply> {
+        let key =
+            self.dialled_by_allocation
+                .get(&(transport, source, source_port, destination_port))?;
+        self.dialled_flows.get(key)?;
+        Some(DialledReply {
+            node_id: key.node_id.clone(),
+            gateway_address: key.dialled.gateway_address,
+            destination_port: key.dialled.destination_port,
+            translated_port: key.port,
+        })
     }
 
     /// Buffers one decrypted packet that hit `ForwardOutcome::NotAdmitted`, in case its own
@@ -492,15 +790,65 @@ impl FlowTable {
         packet: Vec<u8>,
         now: Instant,
     ) {
-        self.pending_packets
-            .retain(|_, (_, buffered_at)| now.duration_since(*buffered_at) <= PENDING_PACKET_TTL);
+        self.sweep_pending_packets(now);
         let key = (node_id.to_string(), port);
-        if self.pending_packets.len() >= MAX_PENDING_PACKETS
+        if self.pending_packet_count() >= MAX_PENDING_PACKETS
             && !self.pending_packets.contains_key(&key)
         {
             return;
         }
         self.pending_packets.insert(key, (packet, now));
+    }
+
+    /// TT-2639: `buffer_pending_packet` for a packet whose dialled identity could be read, held
+    /// under that identity so only the admission of exactly that flow reclaims it.
+    pub fn buffer_pending_dialled_packet(
+        &mut self,
+        node_id: &str,
+        port: u16,
+        dialled: Dialled,
+        packet: Vec<u8>,
+        now: Instant,
+    ) {
+        self.sweep_pending_packets(now);
+        let key = DialledKey {
+            node_id: node_id.to_string(),
+            port,
+            dialled,
+        };
+        if self.pending_packet_count() >= MAX_PENDING_PACKETS
+            && !self.pending_dialled_packets.contains_key(&key)
+        {
+            return;
+        }
+        self.pending_dialled_packets.insert(key, (packet, now));
+    }
+
+    /// TT-2639: `take_pending_packet` for a flow admitted with its dialled identity.
+    pub fn take_pending_dialled_packet(
+        &mut self,
+        node_id: &str,
+        port: u16,
+        dialled: Dialled,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        let key = DialledKey {
+            node_id: node_id.to_string(),
+            port,
+            dialled,
+        };
+        let (packet, buffered_at) = self.pending_dialled_packets.remove(&key)?;
+        (now.duration_since(buffered_at) <= PENDING_PACKET_TTL).then_some(packet)
+    }
+
+    fn sweep_pending_packets(&mut self, now: Instant) {
+        let fresh = |buffered_at: &Instant| now.duration_since(*buffered_at) <= PENDING_PACKET_TTL;
+        self.pending_packets.retain(|_, (_, at)| fresh(at));
+        self.pending_dialled_packets.retain(|_, (_, at)| fresh(at));
+    }
+
+    fn pending_packet_count(&self) -> usize {
+        self.pending_packets.len() + self.pending_dialled_packets.len()
     }
 
     /// Reclaims a packet `buffer_pending_packet` held for `(node_id, port)`, if one exists and is
@@ -514,7 +862,21 @@ impl FlowTable {
         port: u16,
         now: Instant,
     ) -> Option<Vec<u8>> {
-        let (packet, buffered_at) = self.pending_packets.remove(&(node_id.to_string(), port))?;
+        // TT-2639: a packet whose dialled identity could be read is held under it, even when it
+        // comes from a node that predates it; that node's admission (without the identity) reclaims
+        // it by node and port alone, as before.
+        let (packet, buffered_at) = match self.pending_packets.remove(&(node_id.to_string(), port))
+        {
+            Some(held) => held,
+            None => {
+                let key = self
+                    .pending_dialled_packets
+                    .keys()
+                    .find(|key| key.node_id == node_id && key.port == port)
+                    .cloned()?;
+                self.pending_dialled_packets.remove(&key)?
+            }
+        };
         (now.duration_since(buffered_at) <= PENDING_PACKET_TTL).then_some(packet)
     }
 
@@ -561,6 +923,27 @@ impl FlowTable {
             return None;
         }
         nodes.iter().next().map(String::as_str)
+    }
+}
+
+/// Which configured endpoint a packet to `destination_port` goes to, resolved to an address -
+/// shared by `forward_target` and `dialled_forward_target`; see `forward_target`'s doc.
+fn resolve_endpoint(
+    endpoints: &[PolicyBundleEndpoint],
+    destination_port: u16,
+    dns_cache: &crate::dns_cache::DnsCache,
+) -> ForwardOutcome {
+    let matching: Vec<&PolicyBundleEndpoint> = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.port == destination_port)
+        .collect();
+    match matching.as_slice() {
+        [] => ForwardOutcome::PortNotConfigured,
+        [endpoint] => match dns_cache.resolve(&endpoint.host) {
+            Some(ip) => ForwardOutcome::Forward(ip),
+            None => ForwardOutcome::HostUnresolved,
+        },
+        _ => ForwardOutcome::AmbiguousEndpoint,
     }
 }
 
@@ -1648,6 +2031,505 @@ mod tests {
         assert_eq!(
             table.take_pending_packet("n-1", 40001, now),
             Some(vec![1, 2, 3])
+        );
+    }
+
+    // --- TT-2639: flows identified by what the user dialled, with an allocated source port ---
+
+    const ERP: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 3);
+    const FIN: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 2);
+    const ERP_HOST: Ipv4Addr = Ipv4Addr::new(172, 31, 4, 176);
+    const FIN_HOST: Ipv4Addr = Ipv4Addr::new(172, 31, 11, 207);
+
+    fn dialled(transport: Transport, gateway_address: Ipv4Addr, destination_port: u16) -> Dialled {
+        Dialled {
+            transport,
+            gateway_address,
+            destination_port,
+        }
+    }
+
+    fn admit_dialled(
+        table: &mut FlowTable,
+        node_id: &str,
+        port: u16,
+        to: Dialled,
+        gateway_id: &str,
+        flow_id: &str,
+        host: Ipv4Addr,
+    ) {
+        table.admit_dialled(
+            node_id.to_string(),
+            port,
+            to,
+            gateway_id.to_string(),
+            flow_id.to_string(),
+            "dev-1".to_string(),
+            vec![endpoint(&host.to_string(), to.destination_port)],
+        );
+    }
+
+    fn forward(
+        table: &mut FlowTable,
+        node_id: &str,
+        port: u16,
+        to: Dialled,
+    ) -> Option<DialledForward> {
+        table.dialled_forward_target(node_id, port, to, &crate::dns_cache::DnsCache::new())
+    }
+
+    /// The source port a forwarded packet gets, panicking if it isn't forwarded.
+    fn source_port(table: &mut FlowTable, node_id: &str, port: u16, to: Dialled) -> u16 {
+        match forward(table, node_id, port, to) {
+            Some(DialledForward::Forward { source_port, .. }) => source_port,
+            other => panic!("expected a forward, got {other:?}"),
+        }
+    }
+
+    /// TT-2651's reproduction: one translated port, two gateways on the same destination port.
+    #[test]
+    fn two_gateways_on_one_translated_port_are_two_flows() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        let fin = dialled(Transport::Tcp, FIN, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-erp", ERP_HOST,
+        );
+        admit_dialled(
+            &mut table, "n-1", 40100, fin, "gw-fin", "flow-fin", FIN_HOST,
+        );
+
+        assert!(matches!(
+            forward(&mut table, "n-1", 40100, erp),
+            Some(DialledForward::Forward {
+                address: ERP_HOST,
+                ..
+            })
+        ));
+        assert!(matches!(
+            forward(&mut table, "n-1", 40100, fin),
+            Some(DialledForward::Forward {
+                address: FIN_HOST,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_packet_to_another_gateway_never_matches_an_admitted_flow() {
+        let mut table = FlowTable::new();
+        admit_dialled(
+            &mut table,
+            "n-1",
+            40100,
+            dialled(Transport::Tcp, ERP, 80),
+            "gw-erp",
+            "flow-erp",
+            ERP_HOST,
+        );
+
+        assert_eq!(
+            forward(&mut table, "n-1", 40100, dialled(Transport::Tcp, FIN, 80)),
+            None
+        );
+        assert_eq!(
+            forward(&mut table, "n-1", 40100, dialled(Transport::Tcp, ERP, 22)),
+            None
+        );
+        assert_eq!(
+            forward(&mut table, "n-1", 40100, dialled(Transport::Udp, ERP, 80)),
+            None
+        );
+        assert_eq!(
+            forward(&mut table, "n-2", 40100, dialled(Transport::Tcp, ERP, 80)),
+            None
+        );
+    }
+
+    #[test]
+    fn two_ports_of_one_gateway_and_tcp_and_udp_are_separate_flows() {
+        let mut table = FlowTable::new();
+        let https = dialled(Transport::Tcp, ERP, 443);
+        let ssh = dialled(Transport::Tcp, ERP, 22);
+        let quic = dialled(Transport::Udp, ERP, 443);
+        admit_dialled(
+            &mut table,
+            "n-1",
+            40100,
+            https,
+            "gw-erp",
+            "flow-https",
+            ERP_HOST,
+        );
+        admit_dialled(
+            &mut table, "n-1", 40100, ssh, "gw-erp", "flow-ssh", ERP_HOST,
+        );
+        admit_dialled(
+            &mut table,
+            "n-1",
+            40100,
+            quic,
+            "gw-erp",
+            "flow-quic",
+            ERP_HOST,
+        );
+        let https_port = source_port(&mut table, "n-1", 40100, https);
+        let ssh_port = source_port(&mut table, "n-1", 40100, ssh);
+        let quic_port = source_port(&mut table, "n-1", 40100, quic);
+
+        let https_reply = table
+            .dialled_reply(Transport::Tcp, ERP_HOST, 443, https_port)
+            .unwrap();
+        let ssh_reply = table
+            .dialled_reply(Transport::Tcp, ERP_HOST, 22, ssh_port)
+            .unwrap();
+        let quic_reply = table
+            .dialled_reply(Transport::Udp, ERP_HOST, 443, quic_port)
+            .unwrap();
+        assert_eq!(https_reply.destination_port, 443);
+        assert_eq!(ssh_reply.destination_port, 22);
+        assert_eq!(quic_reply.destination_port, 443);
+        assert_eq!(table.dialled_by_allocation.len(), 3);
+    }
+
+    /// Two nodes using the same translated port: each reply goes back to its own node, where
+    /// `node_for_port` had to drop both as ambiguous.
+    #[test]
+    fn replies_on_two_nodes_with_the_same_translated_port_go_to_their_own_node() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(&mut table, "n-1", 40100, erp, "gw-erp", "flow-1", ERP_HOST);
+        admit_dialled(&mut table, "n-2", 40100, erp, "gw-erp", "flow-2", ERP_HOST);
+        let port_1 = source_port(&mut table, "n-1", 40100, erp);
+        let port_2 = source_port(&mut table, "n-2", 40100, erp);
+
+        assert_ne!(
+            port_1, port_2,
+            "same internal service, so different source ports"
+        );
+        assert_eq!(
+            table
+                .dialled_reply(Transport::Tcp, ERP_HOST, 80, port_2)
+                .unwrap()
+                .node_id,
+            "n-2"
+        );
+        assert_eq!(
+            table.dialled_reply(Transport::Tcp, ERP_HOST, 80, port_1),
+            Some(DialledReply {
+                node_id: "n-1".to_string(),
+                gateway_address: ERP,
+                destination_port: 80,
+                translated_port: 40100,
+            })
+        );
+    }
+
+    /// Two gateways pointing to the same internal service: the allocated ports keep the two
+    /// connections apart there, and each reply finds its own gateway.
+    #[test]
+    fn two_gateways_to_the_same_internal_service_get_their_own_replies() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        let fin = dialled(Transport::Tcp, FIN, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-erp", ERP_HOST,
+        );
+        admit_dialled(
+            &mut table, "n-1", 40100, fin, "gw-fin", "flow-fin", ERP_HOST,
+        );
+        let erp_port = source_port(&mut table, "n-1", 40100, erp);
+        let fin_port = source_port(&mut table, "n-1", 40100, fin);
+
+        assert_ne!(erp_port, fin_port);
+        assert_eq!(
+            table
+                .dialled_reply(Transport::Tcp, ERP_HOST, 80, erp_port)
+                .map(|r| r.gateway_address),
+            Some(ERP)
+        );
+        assert_eq!(
+            table
+                .dialled_reply(Transport::Tcp, ERP_HOST, 80, fin_port)
+                .map(|r| r.gateway_address),
+            Some(FIN)
+        );
+    }
+
+    /// Ports are unique per internal host:port (the ticket's design): flows to different internal
+    /// services may use the same source port, since their replies come from different places.
+    #[test]
+    fn flows_to_different_internal_services_can_share_a_source_port() {
+        let mut table = FlowTable::with_source_port_range(2000..=2000);
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        let fin = dialled(Transport::Tcp, FIN, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-erp", ERP_HOST,
+        );
+        admit_dialled(
+            &mut table, "n-1", 40100, fin, "gw-fin", "flow-fin", FIN_HOST,
+        );
+
+        assert_eq!(source_port(&mut table, "n-1", 40100, erp), 2000);
+        assert_eq!(source_port(&mut table, "n-1", 40100, fin), 2000);
+        assert_eq!(
+            table
+                .dialled_reply(Transport::Tcp, ERP_HOST, 80, 2000)
+                .map(|r| r.gateway_address),
+            Some(ERP)
+        );
+        assert_eq!(
+            table
+                .dialled_reply(Transport::Tcp, FIN_HOST, 80, 2000)
+                .map(|r| r.gateway_address),
+            Some(FIN)
+        );
+    }
+
+    #[test]
+    fn a_reply_from_anywhere_but_the_flows_internal_service_is_not_matched() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-erp", ERP_HOST,
+        );
+        let port = source_port(&mut table, "n-1", 40100, erp);
+
+        assert_eq!(
+            table.dialled_reply(Transport::Tcp, FIN_HOST, 80, port),
+            None
+        );
+        assert_eq!(
+            table.dialled_reply(Transport::Tcp, ERP_HOST, 81, port),
+            None
+        );
+        assert_eq!(
+            table.dialled_reply(Transport::Udp, ERP_HOST, 80, port),
+            None
+        );
+        assert!(
+            table
+                .dialled_reply(Transport::Tcp, ERP_HOST, 80, port)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn no_reply_matches_before_the_first_packet_is_forwarded() {
+        let mut table = FlowTable::with_source_port_range(2000..=2000);
+        admit_dialled(
+            &mut table,
+            "n-1",
+            40100,
+            dialled(Transport::Tcp, ERP, 80),
+            "gw-erp",
+            "flow-erp",
+            ERP_HOST,
+        );
+
+        assert_eq!(
+            table.dialled_reply(Transport::Tcp, ERP_HOST, 80, 2000),
+            None
+        );
+    }
+
+    #[test]
+    fn release_frees_the_allocated_port_and_forgets_the_flow() {
+        let mut table = FlowTable::with_source_port_range(2000..=2000);
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-erp", ERP_HOST,
+        );
+        source_port(&mut table, "n-1", 40100, erp);
+
+        table.release("flow-erp");
+        admit_dialled(&mut table, "n-1", 40200, erp, "gw-erp", "flow-2", ERP_HOST);
+
+        assert_eq!(forward(&mut table, "n-1", 40100, erp), None);
+        assert_eq!(source_port(&mut table, "n-1", 40200, erp), 2000);
+    }
+
+    #[test]
+    fn with_no_free_source_port_to_that_service_the_packet_is_not_forwarded() {
+        let mut table = FlowTable::with_source_port_range(2000..=2000);
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(&mut table, "n-1", 40100, erp, "gw-erp", "flow-1", ERP_HOST);
+        admit_dialled(&mut table, "n-1", 40101, erp, "gw-erp", "flow-2", ERP_HOST);
+        source_port(&mut table, "n-1", 40100, erp);
+
+        assert_eq!(
+            forward(&mut table, "n-1", 40101, erp),
+            Some(DialledForward::Refused(ForwardOutcome::NoFreeSourcePort))
+        );
+
+        table.release("flow-1");
+        assert_eq!(
+            source_port(&mut table, "n-1", 40101, erp),
+            2000,
+            "gets a port once one is freed"
+        );
+    }
+
+    #[test]
+    fn a_freed_port_is_not_handed_out_again_at_once() {
+        let mut table = FlowTable::with_source_port_range(2000..=2002);
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(&mut table, "n-1", 40100, erp, "gw-erp", "flow-1", ERP_HOST);
+        let first = source_port(&mut table, "n-1", 40100, erp);
+        table.release("flow-1");
+        admit_dialled(&mut table, "n-1", 40101, erp, "gw-erp", "flow-2", ERP_HOST);
+
+        let second = source_port(&mut table, "n-1", 40101, erp);
+
+        assert_eq!(first, 2000);
+        assert_eq!(second, 2001);
+    }
+
+    #[test]
+    fn later_packets_of_a_flow_keep_its_source_port() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-erp", ERP_HOST,
+        );
+
+        let first = source_port(&mut table, "n-1", 40100, erp);
+
+        assert_eq!(source_port(&mut table, "n-1", 40100, erp), first);
+        assert_eq!(table.dialled_by_allocation.len(), 1);
+    }
+
+    #[test]
+    fn a_flow_whose_internal_address_changes_moves_its_port_there() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-erp", ERP_HOST,
+        );
+        let port = source_port(&mut table, "n-1", 40100, erp);
+
+        table.update_endpoints("gw-erp", &[endpoint("172.31.9.9", 80)]);
+        let moved = source_port(&mut table, "n-1", 40100, erp);
+
+        assert_eq!(
+            table.dialled_reply(Transport::Tcp, ERP_HOST, 80, port),
+            None,
+            "the old one is freed"
+        );
+        assert!(
+            table
+                .dialled_reply(Transport::Tcp, Ipv4Addr::new(172, 31, 9, 9), 80, moved)
+                .is_some()
+        );
+        assert_eq!(table.dialled_by_allocation.len(), 1);
+    }
+
+    #[test]
+    fn re_admitting_the_same_identity_replaces_the_flow_and_frees_its_old_port() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-old", ERP_HOST,
+        );
+        source_port(&mut table, "n-1", 40100, erp);
+
+        admit_dialled(
+            &mut table, "n-1", 40100, erp, "gw-erp", "flow-new", ERP_HOST,
+        );
+        table.release("flow-old");
+
+        assert!(table.dialled_by_allocation.is_empty());
+        assert!(
+            forward(&mut table, "n-1", 40100, erp).is_some(),
+            "flow-new is still admitted"
+        );
+    }
+
+    #[test]
+    fn evicting_a_node_or_a_device_frees_the_ports_of_its_dialled_flows() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 80);
+        let fin = dialled(Transport::Tcp, FIN, 80);
+        admit_dialled(&mut table, "n-1", 40100, erp, "gw-erp", "flow-1", ERP_HOST);
+        admit_dialled(&mut table, "n-2", 40100, erp, "gw-erp", "flow-2", ERP_HOST);
+        admit_dialled(&mut table, "n-3", 40100, fin, "gw-fin", "flow-3", FIN_HOST);
+        for node in ["n-1", "n-2"] {
+            source_port(&mut table, node, 40100, erp);
+        }
+        source_port(&mut table, "n-3", 40100, fin);
+
+        table.evict_node("n-1");
+        let evicted = table.evict_gateway_device("gw-erp", "dev-1");
+
+        assert_eq!(evicted, 1, "n-2's flow; n-1's was already gone");
+        assert_eq!(forward(&mut table, "n-1", 40100, erp), None);
+        assert_eq!(forward(&mut table, "n-2", 40100, erp), None);
+        assert_eq!(
+            table.dialled_by_allocation.len(),
+            1,
+            "only n-3's Finance flow holds a port"
+        );
+    }
+
+    #[test]
+    fn a_pending_packet_is_reclaimed_only_by_the_admission_of_exactly_its_flow() {
+        let mut table = FlowTable::new();
+        let now = Instant::now();
+        table.buffer_pending_dialled_packet(
+            "n-1",
+            40100,
+            dialled(Transport::Tcp, FIN, 80),
+            vec![1],
+            now,
+        );
+
+        assert_eq!(
+            table.take_pending_dialled_packet("n-1", 40100, dialled(Transport::Tcp, ERP, 80), now),
+            None
+        );
+        assert_eq!(
+            table.take_pending_dialled_packet("n-1", 40100, dialled(Transport::Tcp, FIN, 80), now),
+            Some(vec![1])
+        );
+    }
+
+    /// A node that predates the dialled identity: its admission (node and port only) still reclaims a
+    /// packet that was held under the identity read from the packet.
+    #[test]
+    fn an_older_nodes_admission_reclaims_a_packet_held_under_its_dialled_identity() {
+        let mut table = FlowTable::new();
+        let now = Instant::now();
+        table.buffer_pending_dialled_packet(
+            "n-1",
+            40100,
+            dialled(Transport::Tcp, ERP, 80),
+            vec![7],
+            now,
+        );
+
+        assert_eq!(table.take_pending_packet("n-1", 40100, now), Some(vec![7]));
+        assert_eq!(table.take_pending_packet("n-1", 40100, now), None);
+    }
+
+    #[test]
+    fn pending_packets_of_both_kinds_share_one_capacity() {
+        let mut table = FlowTable::new();
+        let now = Instant::now();
+        for port in 0..MAX_PENDING_PACKETS as u16 {
+            table.buffer_pending_packet("n-1", port, vec![0], now);
+        }
+
+        table.buffer_pending_dialled_packet(
+            "n-1",
+            60000,
+            dialled(Transport::Tcp, ERP, 80),
+            vec![1],
+            now,
+        );
+
+        assert_eq!(
+            table.take_pending_dialled_packet("n-1", 60000, dialled(Transport::Tcp, ERP, 80), now),
+            None
         );
     }
 }
