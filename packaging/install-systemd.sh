@@ -177,10 +177,15 @@ if [ "$DECOMMISSION" = true ]; then
 
   echo "Decommissioned $SERVICE_NAME: service, binary, identity key and $ENV_DIR removed, the"
   echo "forwarding sysctl file removed, and $REMOVED_NAT_RULES NAT rule(s) this script added removed."
-  if [ "$REMOVED_NAT_RULES" -eq 0 ]; then
-    echo "No tagged NAT rule was found. A Connector installed before its NAT rule was tagged leaves an"
-    echo "untagged 'POSTROUTING ... -j MASQUERADE' rule: remove it yourself if nothing else on this host"
-    echo "needs it (sudo iptables -t nat -S POSTROUTING lists them)."
+  # A host installed before the rule was tagged still has its untagged rule, even when a later update
+  # added (and this run removed) a tagged one - so look at what is left, not at how many were removed.
+  UNTAGGED_NAT_RULES="$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -- '-j MASQUERADE' | grep -vF -- "--comment $NAT_RULE_COMMENT" || true)"
+  if [ -n "$UNTAGGED_NAT_RULES" ]; then
+    echo "POSTROUTING still has untagged MASQUERADE rule(s) (sudo iptables -t nat -S POSTROUTING):"
+    echo "$UNTAGGED_NAT_RULES" | sed 's/^/  /'
+    echo "One may be this Connector's, added before its NAT rule was tagged. If nothing else on this host"
+    echo "needs it, remove it with:"
+    echo "$UNTAGGED_NAT_RULES" | sed 's/^-A /  sudo iptables -t nat -D /'
   fi
   echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
   echo "when it is no longer needed. This checkout and the Rust toolchain can be removed too."

@@ -184,9 +184,10 @@ It deregisters the Connector (`secure_connect_connector --deregister`, using the
 before the admin confirmed in Portal leaves a working Connector. Then it stops and removes the
 service, the binary, the identity key, `/etc/skipr/connector` and the pending gateway-end reports,
 and removes the IP-forwarding sysctl file and every NAT rule the install tagged as its own (an
-`iptables` comment, `skipr-connector-nat`), on whichever interface it was added. The local audit log is
-kept. It is safe to run again. If this host cannot reach an Agent, Portal shows the Connector as
-Unreachable and offers to remove it; after that, this command completes.
+`iptables` comment, `skipr-connector-nat`), on whichever interface it was added. It lists any
+untagged `MASQUERADE` rule still left (a host installed before the tag may have one) for you to
+check. The local audit log is kept. It is safe to run again. If this host cannot reach an Agent,
+Portal shows the Connector as Unreachable and offers to remove it; after that, this command completes.
 
 To remove the service without decommissioning, for a reinstall on the same host (`connector.env` is
 left in place):
