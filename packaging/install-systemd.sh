@@ -182,10 +182,10 @@ if [ "$DECOMMISSION" = true ]; then
   UNTAGGED_NAT_RULES="$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -- '-j MASQUERADE' | grep -vF -- "--comment $NAT_RULE_COMMENT" || true)"
   if [ -n "$UNTAGGED_NAT_RULES" ]; then
     echo "POSTROUTING still has untagged MASQUERADE rule(s) (sudo iptables -t nat -S POSTROUTING):"
-    echo "$UNTAGGED_NAT_RULES" | sed 's/^/  /'
+    while IFS= read -r rule; do echo "  $rule"; done <<< "$UNTAGGED_NAT_RULES"
     echo "One may be this Connector's, added before its NAT rule was tagged. If nothing else on this host"
     echo "needs it, remove it with:"
-    echo "$UNTAGGED_NAT_RULES" | sed 's/^-A /  sudo iptables -t nat -D /'
+    while IFS= read -r rule; do echo "  sudo iptables -t nat -D ${rule#-A }"; done <<< "$UNTAGGED_NAT_RULES"
   fi
   echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
   echo "when it is no longer needed. This checkout and the Rust toolchain can be removed too."
