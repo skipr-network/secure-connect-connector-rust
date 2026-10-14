@@ -52,6 +52,10 @@ ENV_DIR="/etc/skipr/connector"
 ENV_FILE="${ENV_DIR}/connector.env"
 INSTALLED_BINARY_PATH="/usr/local/bin/secure_connect_connector"
 DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
+# TT-2126: every MASQUERADE rule this script (or the unit's ExecStartPre) adds carries this iptables
+# comment, so --decommission removes exactly those - on whatever interface they were added - and never a
+# rule something else on the host owns. No spaces: it is also written into the unit's ExecStartPre.
+NAT_RULE_COMMENT="skipr-connector-nat"
 
 usage_error() {
   echo "error: $1" >&2
@@ -159,13 +163,25 @@ if [ "$DECOMMISSION" = true ]; then
   # follows the host's own configuration from the next reboot.
   sudo rm -f /etc/sysctl.d/99-skipr-connector.conf
   sudo sysctl --system > /dev/null 2>&1 || true
-  NAT_INTERFACE="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
-  if [ -n "$NAT_INTERFACE" ] && sudo iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE 2>/dev/null; then
-    sudo iptables -t nat -D POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE
-  fi
+  # Every rule tagged as ours, whatever interface it was added for (ExecStartPre adds one for the
+  # interface of the default route at each start, which can change); never an untagged one.
+  REMOVED_NAT_RULES=0
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    read -r -a rule_parts <<< "$rule"
+    # "-A POSTROUTING <match...>" -> "-D POSTROUTING <match...>"
+    if sudo iptables -t nat -D "${rule_parts[@]:1}"; then
+      REMOVED_NAT_RULES=$((REMOVED_NAT_RULES + 1))
+    fi
+  done <<< "$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -F -- "--comment $NAT_RULE_COMMENT" || true)"
 
-  echo "Decommissioned $SERVICE_NAME: service, binary, identity key and $ENV_DIR removed, and the"
-  echo "forwarding and NAT this script added reverted."
+  echo "Decommissioned $SERVICE_NAME: service, binary, identity key and $ENV_DIR removed, the"
+  echo "forwarding sysctl file removed, and $REMOVED_NAT_RULES NAT rule(s) this script added removed."
+  if [ "$REMOVED_NAT_RULES" -eq 0 ]; then
+    echo "No tagged NAT rule was found. A Connector installed before its NAT rule was tagged leaves an"
+    echo "untagged 'POSTROUTING ... -j MASQUERADE' rule: remove it yourself if nothing else on this host"
+    echo "needs it (sudo iptables -t nat -S POSTROUTING lists them)."
+  fi
   echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
   echo "when it is no longer needed. This checkout and the Rust toolchain can be removed too."
   exit 0
@@ -402,13 +418,13 @@ NAT_INTERFACE="$(ip route show default | awk '{print $5; exit}')"
 if [ -z "$NAT_INTERFACE" ]; then
   echo "warning: could not determine the default outbound interface (no default route yet?) -" >&2
   echo "         skipping NAT setup. Re-run this script once the box has one, or add the rule" >&2
-  echo "         yourself: sudo iptables -t nat -A POSTROUTING -o <interface> -j MASQUERADE" >&2
+  echo "         yourself: sudo iptables -t nat -A POSTROUTING -o <interface> -m comment --comment $NAT_RULE_COMMENT -j MASQUERADE" >&2
 else
   # Checked before added (`-C` ... `|| ... -A`), not appended unconditionally - this script is
   # documented as safe to re-run (after a rebuild, a config change), and an unconditional -A would
   # silently stack up a duplicate MASQUERADE rule on every re-run instead of staying a no-op.
-  if ! sudo iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE 2>/dev/null; then
-    sudo iptables -t nat -A POSTROUTING -o "$NAT_INTERFACE" -j MASQUERADE
+  if ! sudo iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -m comment --comment "$NAT_RULE_COMMENT" -j MASQUERADE 2>/dev/null; then
+    sudo iptables -t nat -A POSTROUTING -o "$NAT_INTERFACE" -m comment --comment "$NAT_RULE_COMMENT" -j MASQUERADE
   fi
   echo "NAT configured on interface $NAT_INTERFACE"
 fi
@@ -461,7 +477,7 @@ EnvironmentFile=${ENV_FILE}
 # in-double-quotes ambiguity. Verified live: an awk version here produced a real
 # "interface name ... must be shorter than 16 characters" iptables error on a test box; this
 # version doesn't.
-ExecStartPre=+/bin/sh -c 'set -- \$(ip route show default); IFACE=\$5; [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE; } || true'
+ExecStartPre=+/bin/sh -c 'set -- \$(ip route show default); IFACE=\$5; [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -m comment --comment ${NAT_RULE_COMMENT} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -m comment --comment ${NAT_RULE_COMMENT} -j MASQUERADE; } || true'
 ExecStart=${INSTALLED_BINARY_PATH}
 Restart=on-failure
 RestartSec=5

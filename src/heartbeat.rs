@@ -46,6 +46,9 @@ const NOT_REGISTERED_REASON: &str = "connectornotregistered";
 /// TT-2126: Portal's reason code for a deregistration of a Connector no admin has confirmed for decommissioning.
 const NOT_DECOMMISSIONING_REASON: &str = "connectornotdecommissioning";
 
+/// TT-2126: the only deregistration status the host acts on.
+const DEREGISTERED_STATUS: &str = "DEREGISTERED";
+
 /// Agent answered, and the answer is a refusal (HTTP 400): a decision, not an outage - the most
 /// common one being "not registered" for a key no admin has pasted into Portal yet. Kept distinct
 /// from every other failure so the caller doesn't fail over to a different Agent for it (any Agent
@@ -222,6 +225,14 @@ impl HeartbeatClient {
             bail!(
                 "verified deregistration response is for public key {:?}, not this Connector's - not trusting it",
                 parsed.connector_public_key
+            );
+        }
+        // The host removes its service, key and configuration on this answer: act only on the one status that
+        // means the Portal record is gone.
+        if parsed.status != DEREGISTERED_STATUS {
+            bail!(
+                "deregistration response has status {:?}, not {DEREGISTERED_STATUS} - not trusting it",
+                parsed.status
             );
         }
         let expires_at =
@@ -614,6 +625,31 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("expired"));
+    }
+
+    /// A signed, current answer for its own key with any other status removes nothing.
+    #[tokio::test]
+    async fn rejects_a_deregistration_with_another_status() {
+        let agent_identity = crypto::generate_keypair();
+        let body = confirmation("pk-1", "2099-01-01T00:00:00Z").replace("DEREGISTERED", "PENDING");
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+        let server = agent_deregistering(
+            ResponseTemplate::new(200)
+                .set_body_raw(body, "application/json")
+                .insert_header("X-Signature", signature.as_str()),
+        )
+        .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                &deregister_request(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("not DEREGISTERED"));
     }
 
     #[tokio::test]
