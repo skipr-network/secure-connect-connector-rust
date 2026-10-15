@@ -896,7 +896,24 @@ fn prepare_decrypted_packet_for_forwarding(
         return false;
     }
 
-    // A flow admitted without its dialled identity, from a node that predates it (TT-2639).
+    // A flow admitted without its dialled identity, from a node that predates it (TT-2639). If the
+    // node has since been updated, such a flow is used only by packets to the gateway it was first
+    // seen with: otherwise another gateway's packet on the same port would reach its internal
+    // service - the defect itself, in the upgrade window (`FlowTable::legacy_flow_accepts`). A
+    // refused packet is held under its own identity, so its own admission can still reclaim it.
+    if let Some(dialled) = dialled
+        && !flow_table.legacy_flow_accepts(node_id, source_port, dialled.gateway_address)
+    {
+        flow_table.buffer_pending_dialled_packet(
+            node_id,
+            source_port,
+            dialled,
+            packet.to_vec(),
+            Instant::now(),
+        );
+        warn!(%node_id, source_port, dst_port, gateway_address = %dialled.gateway_address, "decrypted packet does not match the gateway of the flow admitted on this node/port before its node was updated - not using that flow; holding the packet briefly in case its own admission is in flight");
+        return false;
+    }
     let real_dst = match flow_table.forward_target(node_id, source_port, dst_port, dns_cache) {
         ForwardOutcome::Forward(real_dst) => real_dst,
         // Four genuinely different situations (TT-2046 review finding #5), each its own message:
@@ -1497,6 +1514,84 @@ mod tests {
             prepare_reply_packet_for_forwarding(&mut reply, port, &flow_table),
             None
         );
+    }
+
+    // --- TT-2639 review: flows admitted before their node was updated ---
+
+    fn admit_legacy_erp(flow_table: &mut FlowTable) {
+        flow_table.admit(
+            "n-1".to_string(),
+            40100,
+            "gw-erp".to_string(),
+            "flow-legacy-erp".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: ERP_HOST.to_string(),
+                port: 80,
+            }],
+        );
+    }
+
+    /// n-1 has since been updated: it sent an admission with its dialled identity.
+    fn mark_n1_updated(flow_table: &mut FlowTable) {
+        admit_dialled_udp(
+            flow_table,
+            "n-1",
+            std::net::Ipv4Addr::new(10, 99, 0, 9),
+            "gw-other",
+            ERP_HOST,
+        );
+    }
+
+    #[test]
+    fn another_gateways_packet_does_not_use_a_flow_admitted_before_the_node_was_updated() {
+        let mut flow_table = FlowTable::new();
+        admit_legacy_erp(&mut flow_table);
+        flow_table.record_virtual_address("n-1", 40100, ERP);
+        mark_n1_updated(&mut flow_table);
+
+        assert!(
+            forward_from(&mut flow_table, "n-1", FIN).is_none(),
+            "Finance's packet must not reach ERP"
+        );
+        assert!(
+            forward_from(&mut flow_table, "n-1", ERP).is_some(),
+            "ERP's own packets still do"
+        );
+    }
+
+    #[test]
+    fn with_no_address_recorded_yet_an_updated_nodes_packet_is_refused_not_forwarded() {
+        let mut flow_table = FlowTable::new();
+        admit_legacy_erp(&mut flow_table);
+        mark_n1_updated(&mut flow_table);
+
+        assert!(forward_from(&mut flow_table, "n-1", FIN).is_none());
+        assert_eq!(
+            flow_table.virtual_address_for("n-1", 40100),
+            None,
+            "Finance's address must not be recorded on ERP's flow"
+        );
+        let fin = Dialled {
+            transport: flow_table::Transport::Udp,
+            gateway_address: FIN,
+            destination_port: 80,
+        };
+        assert!(
+            flow_table
+                .take_pending_dialled_packet("n-1", 40100, fin, Instant::now())
+                .is_some(),
+            "held for Finance's own admission"
+        );
+    }
+
+    #[test]
+    fn a_node_not_yet_updated_still_forwards_a_legacy_flows_first_packet() {
+        let mut flow_table = FlowTable::new();
+        admit_legacy_erp(&mut flow_table);
+
+        assert!(forward_from(&mut flow_table, "n-1", ERP).is_some());
+        assert_eq!(flow_table.virtual_address_for("n-1", 40100), Some(ERP));
     }
 
     #[test]

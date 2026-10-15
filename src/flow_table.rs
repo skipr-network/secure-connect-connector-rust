@@ -292,6 +292,10 @@ pub struct FlowTable {
     /// TT-2639: packets buffered for a pending admission under their dialled key, the counterpart
     /// of `pending_packets`, sharing its TTL and capacity.
     pending_dialled_packets: HashMap<DialledKey, (Vec<u8>, Instant)>,
+    /// TT-2639: nodes that have sent an admission with its dialled identity - updated nodes. On such a
+    /// node a flow admitted without the identity (before the update) is used only by packets to the
+    /// gateway address it was first seen with (`legacy_flow_accepts`).
+    dialled_nodes: HashSet<String>,
 }
 
 /// How many distinct control-channel connections' worth of routing state to remember at once
@@ -417,6 +421,7 @@ impl FlowTable {
         device_public_key: String,
         endpoints: Vec<PolicyBundleEndpoint>,
     ) {
+        self.dialled_nodes.insert(node_id.clone());
         let key = DialledKey {
             node_id,
             port,
@@ -547,6 +552,7 @@ impl FlowTable {
             self.deindex(node_id, port);
         }
         self.remove_dialled_where(|key, _| key.node_id == node_id);
+        self.dialled_nodes.remove(node_id);
         // TT-2297: a departed node's control-channel ports route to a tunnel that no longer
         // exists - left in place, a packet matching one is dropped instead of reaching the node
         // that now owns that port.
@@ -683,6 +689,24 @@ impl FlowTable {
             return ForwardOutcome::NotAdmitted;
         };
         resolve_endpoint(&flow.endpoints, packet_destination_port, dns_cache)
+    }
+
+    /// TT-2639: whether a packet to `destination` may use the flow admitted on `(node_id, port)`
+    /// without a dialled identity, once no flow matched its full identity. Such a flow, from before
+    /// its node was updated, says nothing about which gateway it is for except the address its first
+    /// packet carried: only a packet to that same address may use it. Before any address is known, a
+    /// packet from an updated node is refused - it may be another gateway's first packet, and using
+    /// the flow would also record that gateway's address on it - while one from a node not yet updated
+    /// is accepted and its address recorded, as before (spec §B.8, Compatibility). `true` when there is
+    /// no such flow: `forward_target` then reports it as not admitted.
+    pub fn legacy_flow_accepts(&self, node_id: &str, port: u16, destination: Ipv4Addr) -> bool {
+        match self.flows.get(&(node_id.to_string(), port)) {
+            None => true,
+            Some(flow) => match flow.virtual_address {
+                Some(address) => address == destination,
+                None => !self.dialled_nodes.contains(node_id),
+            },
+        }
     }
 
     /// TT-2639: the same decision as `forward_target`, for a flow admitted with its dialled
@@ -2531,5 +2555,75 @@ mod tests {
             table.take_pending_dialled_packet("n-1", 60000, dialled(Transport::Tcp, ERP, 80), now),
             None
         );
+    }
+
+    // --- TT-2639 review: flows admitted before their node was updated ---
+
+    fn admit_legacy(table: &mut FlowTable, node_id: &str, port: u16, gateway_id: &str) {
+        table.admit(
+            node_id.to_string(),
+            port,
+            gateway_id.to_string(),
+            format!("legacy-{gateway_id}"),
+            "dev-1".to_string(),
+            vec![endpoint(&ERP_HOST.to_string(), 80)],
+        );
+    }
+
+    /// The node has since been updated (it sent a dialled admission).
+    fn mark_node_updated(table: &mut FlowTable, node_id: &str) {
+        admit_dialled(
+            table,
+            node_id,
+            1,
+            dialled(Transport::Tcp, ERP, 1),
+            "gw-other",
+            "flow-marker",
+            ERP_HOST,
+        );
+    }
+
+    #[test]
+    fn a_legacy_flow_is_used_only_by_packets_to_the_gateway_it_was_first_seen_with() {
+        let mut table = FlowTable::new();
+        admit_legacy(&mut table, "n-1", 40100, "gw-erp");
+        table.record_virtual_address("n-1", 40100, ERP);
+        mark_node_updated(&mut table, "n-1");
+
+        assert!(table.legacy_flow_accepts("n-1", 40100, ERP));
+        assert!(
+            !table.legacy_flow_accepts("n-1", 40100, FIN),
+            "another gateway's packet must not use it"
+        );
+    }
+
+    #[test]
+    fn on_an_updated_node_a_legacy_flow_with_no_address_yet_is_not_used() {
+        let mut table = FlowTable::new();
+        admit_legacy(&mut table, "n-1", 40100, "gw-erp");
+        mark_node_updated(&mut table, "n-1");
+
+        assert!(!table.legacy_flow_accepts("n-1", 40100, FIN));
+        assert!(!table.legacy_flow_accepts("n-1", 40100, ERP));
+    }
+
+    /// A node not yet updated keeps today's behaviour: its flows' first packet records the address.
+    #[test]
+    fn on_a_node_not_yet_updated_a_legacy_flow_with_no_address_yet_is_used() {
+        let mut table = FlowTable::new();
+        admit_legacy(&mut table, "n-1", 40100, "gw-erp");
+        mark_node_updated(&mut table, "n-2");
+
+        assert!(table.legacy_flow_accepts("n-1", 40100, ERP));
+    }
+
+    #[test]
+    fn a_node_evicted_and_seen_again_is_not_assumed_updated() {
+        let mut table = FlowTable::new();
+        mark_node_updated(&mut table, "n-1");
+        table.evict_node("n-1");
+        admit_legacy(&mut table, "n-1", 40100, "gw-erp");
+
+        assert!(table.legacy_flow_accepts("n-1", 40100, ERP));
     }
 }
