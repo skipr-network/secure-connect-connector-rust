@@ -28,7 +28,7 @@ use boringtun::noise::Tunn;
 use config::Config;
 use dto::{HeartbeatNode, PolicyBundle};
 use flow_control::ControlPlaneState;
-use flow_table::{Dialled, DialledForward, FlowTable, ForwardOutcome};
+use flow_table::{Dialled, FlowTable, ForwardOutcome, Forwarding, ReplyMiss, ReplyRoute};
 use heartbeat::{AgentRejected, HeartbeatClient};
 use policy::PolicyStore;
 use registry_client::RegistryClient;
@@ -783,9 +783,9 @@ async fn dial_new_nodes(
 ///   forwarded regardless) - and, since TT-2046, rewritten to the entitled gateway's real
 ///   configured internal endpoint. The address this packet carries on arrival is never that
 ///   real endpoint: it's Gatekeeper's invented, unroutable per-gateway virtual address
-///   (DNS-resolution only - see `flow_table::forward_target`'s doc comment), so forwarding it
+///   (DNS-resolution only - see `FlowTable::forward`'s doc comment), so forwarding it
 ///   unchanged could never have reached anywhere real even before TT-2046's admission check
-///   existed. `forward_target` resolves the real address by matching the packet's destination
+///   existed. `FlowTable::forward` resolves the real address by matching the packet's destination
 ///   *port* (never translated by Gatekeeper, so it's the client's real intent) against the
 ///   entitled gateway's configured endpoints; `tunnel::rewrite_destination_ipv4` does the
 ///   actual byte-level rewrite, including the checksum fixups a raw address change requires.
@@ -871,98 +871,48 @@ fn prepare_decrypted_packet_for_forwarding(
         }),
         _ => None,
     };
-    if let Some(dialled) = dialled
-        && let Some(forward) =
-            flow_table.dialled_forward_target(node_id, source_port, dialled, dns_cache)
-    {
-        let (real_dst, allocated_port) = match forward {
-            DialledForward::Forward {
-                address,
+    let (real_dst, allocated_port) = match flow_table.forward(
+        node_id,
+        source_port,
+        dialled,
+        dst_port,
+        dns_cache,
+    ) {
+        Forwarding::Forward {
+            address,
+            source_port: allocated_port,
+        } => (address, allocated_port),
+        Forwarding::NotAdmitted => {
+            // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a
+            // new flow's raw packets independently of, and often slightly before, the
+            // admission relay that decides whether it's allowed - buffer this one briefly in
+            // case that decision is already in flight (see PENDING_PACKET_TTL's doc) instead of
+            // losing it outright. run_wireguard_receive_loop's admission-recovery arm is what
+            // reclaims it, not here. TT-2639: held under its dialled identity when readable, so
+            // only exactly that flow's admission reclaims it - including a packet the
+            // transition rule kept off a flow admitted before its node was updated.
+            flow_table.buffer_pending(
+                node_id,
                 source_port,
-            } => (address, source_port),
-            DialledForward::Refused(outcome) => {
-                warn_unforwardable(outcome, node_id, source_port, dst_port);
-                return false;
-            }
-        };
-        // The allocated source port keeps this flow apart from every other on the internal
-        // network, and is how its replies find it again (`prepare_reply_packet_for_forwarding`).
-        if tunnel::rewrite_destination_ipv4(packet, real_dst)
-            && tunnel::rewrite_source_port(packet, allocated_port)
-        {
-            return true;
-        }
-        warn!(%node_id, %real_dst, allocated_port, "failed to rewrite decrypted packet's destination address and source port - dropping");
-        return false;
-    }
-
-    // A flow admitted without its dialled identity, from a node that predates it (TT-2639). If the
-    // node has since been updated, such a flow is used only by packets to the gateway it was first
-    // seen with: otherwise another gateway's packet on the same port would reach its internal
-    // service - the defect itself, in the upgrade window (`FlowTable::legacy_flow_accepts`). A
-    // refused packet is held under its own identity, so its own admission can still reclaim it.
-    if let Some(dialled) = dialled
-        && !flow_table.legacy_flow_accepts(node_id, source_port, dialled.gateway_address)
-    {
-        flow_table.buffer_pending_dialled_packet(
-            node_id,
-            source_port,
-            dialled,
-            packet.to_vec(),
-            Instant::now(),
-        );
-        warn!(%node_id, source_port, dst_port, gateway_address = %dialled.gateway_address, "decrypted packet does not match the gateway of the flow admitted on this node/port before its node was updated - not using that flow; holding the packet briefly in case its own admission is in flight");
-        return false;
-    }
-    let real_dst = match flow_table.forward_target(node_id, source_port, dst_port, dns_cache) {
-        ForwardOutcome::Forward(real_dst) => real_dst,
-        // Four genuinely different situations (TT-2046 review finding #5), each its own message:
-        // an unadmitted flow is a security event, an admitted-but-unconfigured port is
-        // misconfiguration or probing, an ambiguous match is a Portal config mistake, and a host
-        // that hasn't resolved to an address yet (TT-2066) silently black-holes every packet for
-        // that gateway until it does - none of these should be indistinguishable to whoever's
-        // reading the log on-call.
-        ForwardOutcome::NotAdmitted => {
-            // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a new
-            // flow's raw packets independently of, and often slightly before, the admission relay
-            // that decides whether it's allowed - buffer this one briefly in case that decision is
-            // already in flight (see PENDING_PACKET_TTL's doc) instead of losing it outright.
-            // run_wireguard_receive_loop's admission-recovery arm is what reclaims it, not here.
-            // TT-2639: held under its dialled identity when readable, so only exactly that
-            // flow's admission reclaims it.
-            match dialled {
-                Some(dialled) => flow_table.buffer_pending_dialled_packet(
-                    node_id,
-                    source_port,
-                    dialled,
-                    packet.to_vec(),
-                    Instant::now(),
-                ),
-                None => flow_table.buffer_pending_packet(
-                    node_id,
-                    source_port,
-                    packet.to_vec(),
-                    Instant::now(),
-                ),
-            }
-            warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node/port yet - buffering briefly in case admission is already in flight");
+                dialled,
+                packet.to_vec(),
+                Instant::now(),
+            );
+            warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node, port and gateway yet - buffering briefly in case admission is already in flight");
             return false;
         }
-        outcome => {
+        // Genuinely different situations (TT-2046 review finding #5), each its own message.
+        Forwarding::Refused(outcome) => {
             warn_unforwardable(outcome, node_id, source_port, dst_port);
             return false;
         }
     };
 
-    // Recorded from the packet's own pre-rewrite destination - the fake/virtual address the
-    // client actually dialed - so the reverse path can restore it on a reply's source before
-    // sending it back out (TT-2046 review finding #1). Must happen before the rewrite below,
-    // which overwrites this same field.
-    if let Some(std::net::IpAddr::V4(virtual_address)) = Tunn::dst_address(packet) {
-        flow_table.record_virtual_address(node_id, source_port, virtual_address);
-    }
-
-    if tunnel::rewrite_destination_ipv4(packet, real_dst) {
+    // A flow with its dialled identity also gets its allocated source port, which keeps it apart
+    // from every other flow on the internal network and is how its replies find it again (TT-2639).
+    if tunnel::rewrite_destination_ipv4(packet, real_dst)
+        && allocated_port.is_none_or(|port| tunnel::rewrite_source_port(packet, port))
+    {
         return true;
     }
 
@@ -975,7 +925,7 @@ fn prepare_decrypted_packet_for_forwarding(
             "decrypted packet is IPv6 - endpoint rewriting only supports IPv4 in this version, dropping"
         );
     } else {
-        warn!(%node_id, %real_dst, "failed to rewrite decrypted packet's destination - dropping");
+        warn!(%node_id, %real_dst, ?allocated_port, "failed to rewrite decrypted packet's destination - dropping");
     }
     false
 }
@@ -989,7 +939,7 @@ fn prepare_decrypted_packet_for_forwarding(
 /// Also owns the other end of `recovered_packet_rx` (paired with the `Sender` half in
 /// `ControlPlaneState`) - the only task allowed to write to `tun_writer` (see `tun_device`'s
 /// module doc: "only one task ever writes"), so a packet the admission handler rescues from
-/// `FlowTable::take_pending_packet` has to be handed back here rather than written directly from
+/// `FlowTable::take_pending` has to be handed back here rather than written directly from
 /// that handler's own task. Re-run through the exact same `prepare_decrypted_packet_for_forwarding`
 /// gate as a freshly-arrived packet - by the time this arrives the flow really is admitted, so
 /// this resolves to `Forward` and gets the same address rewrite a first-try success would have
@@ -1114,88 +1064,57 @@ fn prepare_reply_packet_for_forwarding(
     destination_port: u16,
     flow_table: &FlowTable,
 ) -> Option<String> {
-    // TT-2639: a reply on a flow admitted with its dialled identity - matched on its transport, its
-    // destination port (the source port allocated to that flow) and its source, which must be
-    // exactly the internal address and port that flow was forwarded to. Checked first: it can only
-    // match the one flow it belongs to, never a control-channel connection (those come from this
-    // Connector's own address, never an internal service's). Restores what the client dialled as
-    // the source, and the translated port the node knows the flow by as the destination port.
-    if let (Some(transport), Some(source), Some(source_port)) = (
+    // The lookups and their order - a reply on a flow with its dialled identity (TT-2639), this
+    // Connector's own outbound control-channel connection (TT-2144, TT-2297), Gatekeeper's inbound
+    // one (TT-2102), then a flow without an identity (TT-1847) - live in `FlowTable::route_reply`.
+    let route = flow_table.route_reply(
         tunnel::parse_ipv4_transport(packet),
         tunnel::parse_source_ipv4(packet),
         tunnel::parse_source_port(packet),
-    ) && let Some(reply) =
-        flow_table.dialled_reply(transport, source, source_port, destination_port)
-    {
-        if tunnel::rewrite_source_ipv4(packet, reply.gateway_address)
-            && tunnel::rewrite_source_port(packet, reply.destination_port)
-            && tunnel::rewrite_destination_port(packet, reply.translated_port)
-        {
-            return Some(reply.node_id);
+        destination_port,
+    );
+    match route {
+        Ok(ReplyRoute::Unchanged { node_id }) => Some(node_id),
+        // Restores what the client dialled as the reply's source - the real internal endpoint's own
+        // address is never what the client contacted, so its network stack would discard the reply
+        // (TT-2046 review finding #1: kernel DNAT reverses this via conntrack; this userspace rewrite
+        // has no conntrack entry, so it is done explicitly) - and, for a flow with its dialled
+        // identity, the dialled port and the translated port the node knows the flow by (TT-2639).
+        Ok(ReplyRoute::Restore {
+            node_id,
+            source,
+            source_port,
+            destination_port: restored_destination_port,
+        }) => {
+            if tunnel::rewrite_source_ipv4(packet, source)
+                && source_port.is_none_or(|port| tunnel::rewrite_source_port(packet, port))
+                && restored_destination_port
+                    .is_none_or(|port| tunnel::rewrite_destination_port(packet, port))
+            {
+                Some(node_id)
+            } else {
+                warn!(
+                    %node_id, destination_port, %source,
+                    "failed to restore a reply's source and ports to what the client dialled - dropping"
+                );
+                None
+            }
         }
-        warn!(node_id = %reply.node_id, destination_port, "failed to restore a reply's source and destination port - dropping");
-        return None;
-    }
-
-    // TT-2144: this Connector's OWN outbound connection to Gatekeeper's tunnel address (the
-    // admission poller's poll/admission-result calls) - matched on this packet's own *source*
-    // port, never its destination (Gatekeeper's fixed HTTP port, identical across every node, and
-    // so carrying no information at all about which node a connection is for - see
-    // `FlowTable::outbound_control_channel_ports`'s doc). Needs no address rewrite: these packets
-    // already carry this Connector's real (connector_virtual_ip) source address.
-    //
-    // TT-2297: checked FIRST. The source port was registered before the connection's first packet
-    // and belongs to exactly one connection, so it is the one lookup here that can't be wrong. The
-    // destination-port lookup below was checked first before, and once any Gatekeeper reply had
-    // recorded its source port (4000) there, every node's polls went to whichever node answered
-    // last - and to nowhere at all once that node left the node_list.
-    if let Some(source_port) = tunnel::parse_source_port(packet)
-        && let Some(node_id) = flow_table.node_for_outbound_control_channel_source_port(source_port)
-    {
-        return Some(node_id.to_string());
-    }
-
-    // TT-2102: a reply on a connection Gatekeeper opened to this Connector's own control-plane
-    // address needs no address rewrite at all - it was forwarded unchanged on the way in (see
-    // prepare_decrypted_packet_for_forwarding's connector_virtual_ip branch). node_for_port below
-    // has no entry for this port (control-channel connections are never admitted flows), so
-    // falling through would only ever drop it.
-    if let Some(node_id) = flow_table.node_for_control_channel_port(destination_port) {
-        return Some(node_id.to_string());
-    }
-
-    let node_id = match flow_table.node_for_port(destination_port) {
-        Some(node_id) => node_id.to_string(),
-        None => {
+        Err(ReplyMiss::NoFlow) => {
             warn!(
                 destination_port,
                 "no unambiguous admitted node for outbound packet's port - dropping"
             );
-            return None;
+            None
         }
-    };
-    // Restores the source address a reply packet must carry to reach the client at all - the real
-    // internal endpoint's own address (what this packet arrived from) is never what the client
-    // dialed, so sending it back unchanged means the client's own network stack discards a
-    // response from an address it never contacted (TT-2046 review finding #1: real kernel DNAT
-    // reverses this automatically via conntrack; this userspace rewrite has no conntrack entry to
-    // reverse it with, so it has to be done explicitly, symmetrically to the forward-direction
-    // rewrite in `prepare_decrypted_packet_for_forwarding`).
-    let Some(virtual_address) = flow_table.virtual_address_for(&node_id, destination_port) else {
-        warn!(
-            %node_id, destination_port,
-            "no virtual address recorded for this flow yet - the client would never accept this reply anyway, dropping"
-        );
-        return None;
-    };
-    if !tunnel::rewrite_source_ipv4(packet, virtual_address) {
-        warn!(
-            %node_id, destination_port, %virtual_address,
-            "failed to rewrite outbound packet's source address back to the virtual address - dropping"
-        );
-        return None;
+        Err(ReplyMiss::NoAddressYet { node_id }) => {
+            warn!(
+                %node_id, destination_port,
+                "no virtual address recorded for this flow yet - the client would never accept this reply anyway, dropping"
+            );
+            None
+        }
     }
-    Some(node_id)
 }
 
 /// Reads outbound IP packets the OS routed to the TUN device (e.g. return

@@ -128,7 +128,7 @@ pub struct ControlPlaneState {
     pub policy_store: Arc<PolicyStore>,
     pub audit_log: Arc<AuditLog>,
     pub flow_table: Arc<Mutex<FlowTable>>,
-    /// Hands a packet `admission_poller` reclaimed via `FlowTable::take_pending_packet` back to
+    /// Hands a packet `admission_poller` reclaimed via `FlowTable::take_pending` back to
     /// `main::run_wireguard_receive_loop` - the only task allowed to write to the TUN device (see
     /// its own doc comment) - for forwarding, instead of that poller task needing TUN write access
     /// it was never given. `(node_id, packet_bytes)`. Tests that don't exercise this path construct
@@ -303,8 +303,8 @@ pub(crate) async fn handle_flow_admission(
                 let mut table = flow_table.lock().expect("flow table lock poisoned");
                 if table.was_recently_released(&request.flow_id) {
                     Recorded::AlreadyReleased
-                } else if let Some(dialled) = dialled {
-                    table.admit_dialled(
+                } else {
+                    table.admit_flow(
                         request.node_id.clone(),
                         request.port,
                         dialled,
@@ -313,17 +313,10 @@ pub(crate) async fn handle_flow_admission(
                         device_public_key,
                         endpoints,
                     );
-                    Recorded::Admitted
-                } else {
-                    table.admit(
-                        request.node_id.clone(),
-                        request.port,
-                        request.gateway_id.clone(),
-                        request.flow_id.clone(),
-                        device_public_key,
-                        endpoints,
-                    );
-                    Recorded::AdmittedWithoutDialledIdentity
+                    match dialled {
+                        Some(_) => Recorded::Admitted,
+                        None => Recorded::AdmittedWithoutDialledIdentity,
+                    }
                 }
             };
             match recorded {

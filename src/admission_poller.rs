@@ -534,10 +534,7 @@ async fn handle_admission(
         && let Some(packet) = {
             let mut table = state.flow_table.lock().expect("flow table lock poisoned");
             let now = std::time::Instant::now();
-            match dialled {
-                Some(dialled) => table.take_pending_dialled_packet(node_id, port, dialled, now),
-                None => table.take_pending_packet(node_id, port, now),
-            }
+            table.take_pending(node_id, port, dialled, now)
         }
         && let Err(error) = state
             .recovered_packet_tx
