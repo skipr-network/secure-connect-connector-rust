@@ -28,7 +28,7 @@ use boringtun::noise::Tunn;
 use config::Config;
 use dto::{HeartbeatNode, PolicyBundle};
 use flow_control::ControlPlaneState;
-use flow_table::{FlowTable, ForwardOutcome};
+use flow_table::{Dialled, FlowTable, ForwardOutcome, Forwarding, ReplyMiss, ReplyRoute};
 use heartbeat::{AgentRejected, HeartbeatClient};
 use policy::PolicyStore;
 use registry_client::RegistryClient;
@@ -783,9 +783,9 @@ async fn dial_new_nodes(
 ///   forwarded regardless) - and, since TT-2046, rewritten to the entitled gateway's real
 ///   configured internal endpoint. The address this packet carries on arrival is never that
 ///   real endpoint: it's Gatekeeper's invented, unroutable per-gateway virtual address
-///   (DNS-resolution only - see `flow_table::forward_target`'s doc comment), so forwarding it
+///   (DNS-resolution only - see `FlowTable::forward`'s doc comment), so forwarding it
 ///   unchanged could never have reached anywhere real even before TT-2046's admission check
-///   existed. `forward_target` resolves the real address by matching the packet's destination
+///   existed. `FlowTable::forward` resolves the real address by matching the packet's destination
 ///   *port* (never translated by Gatekeeper, so it's the client's real intent) against the
 ///   entitled gateway's configured endpoints; `tunnel::rewrite_destination_ipv4` does the
 ///   actual byte-level rewrite, including the checksum fixups a raw address change requires.
@@ -794,6 +794,28 @@ async fn dial_new_nodes(
 /// as-is) or `false` (packet must not be forwarded - left completely untouched: every check here
 /// and in `tunnel::rewrite_destination_ipv4` runs before either one writes a single byte, so
 /// there's no partial-rewrite state to worry about).
+/// Logs why an admitted flow's packet can't be forwarded - shared by the dialled (TT-2639) and the
+/// node/port paths of `prepare_decrypted_packet_for_forwarding`.
+fn warn_unforwardable(outcome: ForwardOutcome, node_id: &str, source_port: u16, dst_port: u16) {
+    match outcome {
+        ForwardOutcome::PortNotConfigured => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no endpoint configured on this port - dropping");
+        }
+        ForwardOutcome::AmbiguousEndpoint => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one configured endpoint shares this port - refusing to guess, dropping");
+        }
+        ForwardOutcome::HostUnresolved => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and the port matches, but its configured endpoint host hasn't resolved to an address yet - dropping");
+        }
+        ForwardOutcome::NoFreeSourcePort => {
+            error!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but every source port toward its internal host:port is in use - dropping until one is freed (TT-2639)");
+        }
+        ForwardOutcome::NotAdmitted | ForwardOutcome::Forward(_) => {
+            warn!(%node_id, source_port, dst_port, ?outcome, "decrypted packet can't be forwarded - dropping");
+        }
+    }
+}
+
 fn prepare_decrypted_packet_for_forwarding(
     packet: &mut [u8],
     node_id: &str,
@@ -836,47 +858,61 @@ fn prepare_decrypted_packet_for_forwarding(
         return false;
     };
 
-    let real_dst = match flow_table.forward_target(node_id, source_port, dst_port, dns_cache) {
-        ForwardOutcome::Forward(real_dst) => real_dst,
-        // Four genuinely different situations (TT-2046 review finding #5), each its own message:
-        // an unadmitted flow is a security event, an admitted-but-unconfigured port is
-        // misconfiguration or probing, an ambiguous match is a Portal config mistake, and a host
-        // that hasn't resolved to an address yet (TT-2066) silently black-holes every packet for
-        // that gateway until it does - none of these should be indistinguishable to whoever's
-        // reading the log on-call.
-        ForwardOutcome::NotAdmitted => {
-            // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a new
-            // flow's raw packets independently of, and often slightly before, the admission relay
-            // that decides whether it's allowed - buffer this one briefly in case that decision is
-            // already in flight (see PENDING_PACKET_TTL's doc) instead of losing it outright.
-            // run_wireguard_receive_loop's admission-recovery arm is what reclaims it, not here.
-            flow_table.buffer_pending_packet(node_id, source_port, packet.to_vec(), Instant::now());
-            warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node/port yet - buffering briefly in case admission is already in flight");
+    // TT-2639 (spec §B.8): a flow is identified by what the user dialled too, read from the packet
+    // itself - so a packet addressed to one gateway can never match a flow admitted for another.
+    let dialled = match (
+        tunnel::parse_ipv4_transport(packet),
+        tunnel::parse_destination_ipv4(packet),
+    ) {
+        (Some(transport), Some(gateway_address)) => Some(Dialled {
+            transport,
+            gateway_address,
+            destination_port: dst_port,
+        }),
+        _ => None,
+    };
+    let (real_dst, allocated_port) = match flow_table.forward(
+        node_id,
+        source_port,
+        dialled,
+        dst_port,
+        dns_cache,
+    ) {
+        Forwarding::Forward {
+            address,
+            source_port: allocated_port,
+        } => (address, allocated_port),
+        Forwarding::NotAdmitted => {
+            // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a
+            // new flow's raw packets independently of, and often slightly before, the
+            // admission relay that decides whether it's allowed - buffer this one briefly in
+            // case that decision is already in flight (see PENDING_PACKET_TTL's doc) instead of
+            // losing it outright. run_wireguard_receive_loop's admission-recovery arm is what
+            // reclaims it, not here. TT-2639: held under its dialled identity when readable, so
+            // only exactly that flow's admission reclaims it - including a packet the
+            // transition rule kept off a flow admitted before its node was updated.
+            flow_table.buffer_pending(
+                node_id,
+                source_port,
+                dialled,
+                packet.to_vec(),
+                Instant::now(),
+            );
+            warn!(%node_id, source_port, dst_port, "decrypted packet has no admitted flow for this node, port and gateway yet - buffering briefly in case admission is already in flight");
             return false;
         }
-        ForwardOutcome::PortNotConfigured => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no endpoint configured on this port - dropping");
-            return false;
-        }
-        ForwardOutcome::AmbiguousEndpoint => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one configured endpoint shares this port - refusing to guess, dropping");
-            return false;
-        }
-        ForwardOutcome::HostUnresolved => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and the port matches, but its configured endpoint host hasn't resolved to an address yet - dropping");
+        // Genuinely different situations (TT-2046 review finding #5), each its own message.
+        Forwarding::Refused(outcome) => {
+            warn_unforwardable(outcome, node_id, source_port, dst_port);
             return false;
         }
     };
 
-    // Recorded from the packet's own pre-rewrite destination - the fake/virtual address the
-    // client actually dialed - so the reverse path can restore it on a reply's source before
-    // sending it back out (TT-2046 review finding #1). Must happen before the rewrite below,
-    // which overwrites this same field.
-    if let Some(std::net::IpAddr::V4(virtual_address)) = Tunn::dst_address(packet) {
-        flow_table.record_virtual_address(node_id, source_port, virtual_address);
-    }
-
-    if tunnel::rewrite_destination_ipv4(packet, real_dst) {
+    // A flow with its dialled identity also gets its allocated source port, which keeps it apart
+    // from every other flow on the internal network and is how its replies find it again (TT-2639).
+    if tunnel::rewrite_destination_ipv4(packet, real_dst)
+        && allocated_port.is_none_or(|port| tunnel::rewrite_source_port(packet, port))
+    {
         return true;
     }
 
@@ -889,7 +925,7 @@ fn prepare_decrypted_packet_for_forwarding(
             "decrypted packet is IPv6 - endpoint rewriting only supports IPv4 in this version, dropping"
         );
     } else {
-        warn!(%node_id, %real_dst, "failed to rewrite decrypted packet's destination - dropping");
+        warn!(%node_id, %real_dst, ?allocated_port, "failed to rewrite decrypted packet's destination - dropping");
     }
     false
 }
@@ -903,7 +939,7 @@ fn prepare_decrypted_packet_for_forwarding(
 /// Also owns the other end of `recovered_packet_rx` (paired with the `Sender` half in
 /// `ControlPlaneState`) - the only task allowed to write to `tun_writer` (see `tun_device`'s
 /// module doc: "only one task ever writes"), so a packet the admission handler rescues from
-/// `FlowTable::take_pending_packet` has to be handed back here rather than written directly from
+/// `FlowTable::take_pending` has to be handed back here rather than written directly from
 /// that handler's own task. Re-run through the exact same `prepare_decrypted_packet_for_forwarding`
 /// gate as a freshly-arrived packet - by the time this arrives the flow really is admitted, so
 /// this resolves to `Forward` and gets the same address rewrite a first-try success would have
@@ -1028,77 +1064,70 @@ fn prepare_reply_packet_for_forwarding(
     destination_port: u16,
     flow_table: &FlowTable,
 ) -> Option<String> {
-    // TT-2144: this Connector's OWN outbound connection to Gatekeeper's tunnel address (the
-    // admission poller's poll/admission-result calls) - matched on this packet's own *source*
-    // port, never its destination (Gatekeeper's fixed HTTP port, identical across every node, and
-    // so carrying no information at all about which node a connection is for - see
-    // `FlowTable::outbound_control_channel_ports`'s doc). Needs no address rewrite: these packets
-    // already carry this Connector's real (connector_virtual_ip) source address.
-    //
-    // TT-2297: checked FIRST. The source port was registered before the connection's first packet
-    // and belongs to exactly one connection, so it is the one lookup here that can't be wrong. The
-    // destination-port lookup below was checked first before, and once any Gatekeeper reply had
-    // recorded its source port (4000) there, every node's polls went to whichever node answered
-    // last - and to nowhere at all once that node left the node_list.
-    if let Some(source_port) = tunnel::parse_source_port(packet)
-        && let Some(node_id) = flow_table.node_for_outbound_control_channel_source_port(source_port)
-    {
-        return Some(node_id.to_string());
-    }
-
-    // TT-2102: a reply on a connection Gatekeeper opened to this Connector's own control-plane
-    // address needs no address rewrite at all - it was forwarded unchanged on the way in (see
-    // prepare_decrypted_packet_for_forwarding's connector_virtual_ip branch). node_for_port below
-    // has no entry for this port (control-channel connections are never admitted flows), so
-    // falling through would only ever drop it.
-    if let Some(node_id) = flow_table.node_for_control_channel_port(destination_port) {
-        return Some(node_id.to_string());
-    }
-
-    let node_id = match flow_table.node_for_port(destination_port) {
-        Some(node_id) => node_id.to_string(),
-        None => {
+    // The lookups and their order - a reply on a flow with its dialled identity (TT-2639), this
+    // Connector's own outbound control-channel connection (TT-2144, TT-2297), Gatekeeper's inbound
+    // one (TT-2102), then a flow without an identity (TT-1847) - live in `FlowTable::route_reply`.
+    let route = flow_table.route_reply(
+        tunnel::parse_ipv4_transport(packet),
+        tunnel::parse_source_ipv4(packet),
+        tunnel::parse_source_port(packet),
+        destination_port,
+    );
+    match route {
+        Ok(ReplyRoute::Unchanged { node_id }) => Some(node_id),
+        // Restores what the client dialled as the reply's source - the real internal endpoint's own
+        // address is never what the client contacted, so its network stack would discard the reply
+        // (TT-2046 review finding #1: kernel DNAT reverses this via conntrack; this userspace rewrite
+        // has no conntrack entry, so it is done explicitly) - and, for a flow with its dialled
+        // identity, the dialled port and the translated port the node knows the flow by (TT-2639).
+        Ok(ReplyRoute::Restore {
+            node_id,
+            source,
+            source_port,
+            destination_port: restored_destination_port,
+        }) => {
+            if tunnel::rewrite_source_ipv4(packet, source)
+                && source_port.is_none_or(|port| tunnel::rewrite_source_port(packet, port))
+                && restored_destination_port
+                    .is_none_or(|port| tunnel::rewrite_destination_port(packet, port))
+            {
+                Some(node_id)
+            } else {
+                warn!(
+                    %node_id, destination_port, %source,
+                    "failed to restore a reply's source and ports to what the client dialled - dropping"
+                );
+                None
+            }
+        }
+        Err(ReplyMiss::NoFlow) => {
             warn!(
                 destination_port,
                 "no unambiguous admitted node for outbound packet's port - dropping"
             );
-            return None;
+            None
         }
-    };
-    // Restores the source address a reply packet must carry to reach the client at all - the real
-    // internal endpoint's own address (what this packet arrived from) is never what the client
-    // dialed, so sending it back unchanged means the client's own network stack discards a
-    // response from an address it never contacted (TT-2046 review finding #1: real kernel DNAT
-    // reverses this automatically via conntrack; this userspace rewrite has no conntrack entry to
-    // reverse it with, so it has to be done explicitly, symmetrically to the forward-direction
-    // rewrite in `prepare_decrypted_packet_for_forwarding`).
-    let Some(virtual_address) = flow_table.virtual_address_for(&node_id, destination_port) else {
-        warn!(
-            %node_id, destination_port,
-            "no virtual address recorded for this flow yet - the client would never accept this reply anyway, dropping"
-        );
-        return None;
-    };
-    if !tunnel::rewrite_source_ipv4(packet, virtual_address) {
-        warn!(
-            %node_id, destination_port, %virtual_address,
-            "failed to rewrite outbound packet's source address back to the virtual address - dropping"
-        );
-        return None;
+        Err(ReplyMiss::NoAddressYet { node_id }) => {
+            warn!(
+                %node_id, destination_port,
+                "no virtual address recorded for this flow yet - the client would never accept this reply anyway, dropping"
+            );
+            None
+        }
     }
-    Some(node_id)
 }
 
 /// Reads outbound IP packets the OS routed to the TUN device (e.g. return
 /// traffic from an internal endpoint) and encrypts+sends each one to the
 /// right node's tunnel (TT-1847). The destination *address* on this leg is
 /// a masqueraded wg0 address identical across the whole fleet (`flow_table`'s
-/// module doc) and carries no node identity - the destination *port* is the
-/// only reliable signal left, resolved back to a node through `flow_table`'s
-/// own admission state (told explicitly by Gatekeeper, never inferred from
-/// traffic). A port with no unambiguous admitted node - never admitted, or
-/// currently admitted on two different nodes at once - is dropped: there's
-/// genuinely nowhere defensible to send it, not a bug to work around.
+/// module doc) and carries no node identity. A reply on a flow admitted with its
+/// dialled identity is matched by its allocated port and its source (TT-2639);
+/// otherwise the destination *port* is resolved back to a node through
+/// `flow_table`'s own admission state (told explicitly by Gatekeeper, never
+/// inferred from traffic). A reply with no unambiguous flow - never admitted, or
+/// a port admitted on two different nodes at once from older nodes - is dropped:
+/// there's genuinely nowhere defensible to send it.
 async fn run_tun_send_loop(
     mut tun_reader: tun_device::TunReader,
     wg_socket: Arc<UdpSocket>,
@@ -1273,6 +1302,215 @@ mod tests {
         packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
         packet[24..26].copy_from_slice(&8u16.to_be_bytes());
         packet
+    }
+
+    // --- TT-2639: the TT-2651 reproduction, through the real forward and reply paths ---
+
+    const ERP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 99, 0, 3);
+    const FIN: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 99, 0, 2);
+    const ERP_HOST: std::net::Ipv4Addr = std::net::Ipv4Addr::new(172, 31, 4, 176);
+    const FIN_HOST: std::net::Ipv4Addr = std::net::Ipv4Addr::new(172, 31, 11, 207);
+    const NODE_WG: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 66, 66, 1);
+
+    fn admit_dialled_udp(
+        flow_table: &mut FlowTable,
+        node_id: &str,
+        gateway_address: std::net::Ipv4Addr,
+        gateway_id: &str,
+        host: std::net::Ipv4Addr,
+    ) {
+        flow_table.admit_dialled(
+            node_id.to_string(),
+            40100,
+            Dialled {
+                transport: flow_table::Transport::Udp,
+                gateway_address,
+                destination_port: 80,
+            },
+            gateway_id.to_string(),
+            format!("flow-{gateway_id}-{node_id}"),
+            "dev-1".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: host.to_string(),
+                port: 80,
+            }],
+        );
+    }
+
+    fn forward_from(
+        flow_table: &mut FlowTable,
+        node_id: &str,
+        gateway_address: std::net::Ipv4Addr,
+    ) -> Option<Vec<u8>> {
+        let mut packet = udp_packet(NODE_WG, gateway_address, 40100, 80);
+        prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            node_id,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1)),
+            flow_table,
+            &dns_cache::DnsCache::new(),
+        )
+        .then_some(packet)
+    }
+
+    #[test]
+    fn packets_sharing_a_translated_port_reach_their_own_gateways_service() {
+        let mut flow_table = FlowTable::new();
+        admit_dialled_udp(&mut flow_table, "n-1", ERP, "gw-erp", ERP_HOST);
+        admit_dialled_udp(&mut flow_table, "n-1", FIN, "gw-fin", FIN_HOST);
+
+        let to_erp = forward_from(&mut flow_table, "n-1", ERP).expect("forwarded");
+        let to_fin = forward_from(&mut flow_table, "n-1", FIN).expect("forwarded");
+
+        assert_eq!(&to_erp[16..20], &ERP_HOST.octets());
+        assert_eq!(&to_fin[16..20], &FIN_HOST.octets());
+        // The allocated source port, not the translated one, toward the internal network.
+        assert_ne!(tunnel::parse_source_port(&to_erp), Some(40100));
+        assert_ne!(tunnel::parse_source_port(&to_fin), Some(40100));
+    }
+
+    #[test]
+    fn a_packet_for_a_gateway_without_a_flow_is_held_under_its_dialled_identity_not_forwarded() {
+        let mut flow_table = FlowTable::new();
+        admit_dialled_udp(&mut flow_table, "n-1", ERP, "gw-erp", ERP_HOST);
+
+        assert!(forward_from(&mut flow_table, "n-1", FIN).is_none());
+
+        let fin = Dialled {
+            transport: flow_table::Transport::Udp,
+            gateway_address: FIN,
+            destination_port: 80,
+        };
+        assert!(
+            flow_table
+                .take_pending_dialled_packet("n-1", 40100, fin, Instant::now())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_reply_goes_back_to_its_own_node_with_what_the_client_dialled_restored() {
+        let mut flow_table = FlowTable::new();
+        admit_dialled_udp(&mut flow_table, "n-1", ERP, "gw-erp", ERP_HOST);
+        admit_dialled_udp(&mut flow_table, "n-2", ERP, "gw-erp", ERP_HOST);
+        let sent_1 = forward_from(&mut flow_table, "n-1", ERP).expect("forwarded");
+        let sent_2 = forward_from(&mut flow_table, "n-2", ERP).expect("forwarded");
+        let port_1 = tunnel::parse_source_port(&sent_1).unwrap();
+        let port_2 = tunnel::parse_source_port(&sent_2).unwrap();
+        let mut reply_1 = udp_packet(ERP_HOST, NODE_WG, 80, port_1);
+        let mut reply_2 = udp_packet(ERP_HOST, NODE_WG, 80, port_2);
+
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut reply_1, port_1, &flow_table).as_deref(),
+            Some("n-1")
+        );
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut reply_2, port_2, &flow_table).as_deref(),
+            Some("n-2")
+        );
+        assert_eq!(
+            &reply_1[12..16],
+            &ERP.octets(),
+            "the gateway address the client dialled"
+        );
+        assert_eq!(tunnel::parse_source_port(&reply_1), Some(80));
+        assert_eq!(
+            tunnel::parse_destination_port(&reply_1),
+            Some(40100),
+            "the translated port"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_another_service_on_the_allocated_port_is_not_routed() {
+        let mut flow_table = FlowTable::new();
+        admit_dialled_udp(&mut flow_table, "n-1", ERP, "gw-erp", ERP_HOST);
+        let sent = forward_from(&mut flow_table, "n-1", ERP).expect("forwarded");
+        let port = tunnel::parse_source_port(&sent).unwrap();
+        let mut reply = udp_packet(FIN_HOST, NODE_WG, 80, port);
+
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut reply, port, &flow_table),
+            None
+        );
+    }
+
+    // --- TT-2639 review: flows admitted before their node was updated ---
+
+    fn admit_legacy_erp(flow_table: &mut FlowTable) {
+        flow_table.admit(
+            "n-1".to_string(),
+            40100,
+            "gw-erp".to_string(),
+            "flow-legacy-erp".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: ERP_HOST.to_string(),
+                port: 80,
+            }],
+        );
+    }
+
+    /// n-1 has since been updated: it sent an admission with its dialled identity.
+    fn mark_n1_updated(flow_table: &mut FlowTable) {
+        admit_dialled_udp(
+            flow_table,
+            "n-1",
+            std::net::Ipv4Addr::new(10, 99, 0, 9),
+            "gw-other",
+            ERP_HOST,
+        );
+    }
+
+    #[test]
+    fn another_gateways_packet_does_not_use_a_flow_admitted_before_the_node_was_updated() {
+        let mut flow_table = FlowTable::new();
+        admit_legacy_erp(&mut flow_table);
+        flow_table.record_virtual_address("n-1", 40100, ERP);
+        mark_n1_updated(&mut flow_table);
+
+        assert!(
+            forward_from(&mut flow_table, "n-1", FIN).is_none(),
+            "Finance's packet must not reach ERP"
+        );
+        assert!(
+            forward_from(&mut flow_table, "n-1", ERP).is_some(),
+            "ERP's own packets still do"
+        );
+    }
+
+    #[test]
+    fn with_no_address_recorded_yet_an_updated_nodes_packet_is_refused_not_forwarded() {
+        let mut flow_table = FlowTable::new();
+        admit_legacy_erp(&mut flow_table);
+        mark_n1_updated(&mut flow_table);
+
+        assert!(forward_from(&mut flow_table, "n-1", FIN).is_none());
+        assert_eq!(
+            flow_table.virtual_address_for("n-1", 40100),
+            None,
+            "Finance's address must not be recorded on ERP's flow"
+        );
+        let fin = Dialled {
+            transport: flow_table::Transport::Udp,
+            gateway_address: FIN,
+            destination_port: 80,
+        };
+        assert!(
+            flow_table
+                .take_pending_dialled_packet("n-1", 40100, fin, Instant::now())
+                .is_some(),
+            "held for Finance's own admission"
+        );
+    }
+
+    #[test]
+    fn a_node_not_yet_updated_still_forwards_a_legacy_flows_first_packet() {
+        let mut flow_table = FlowTable::new();
+        admit_legacy_erp(&mut flow_table);
+
+        assert!(forward_from(&mut flow_table, "n-1", ERP).is_some());
+        assert_eq!(flow_table.virtual_address_for("n-1", 40100), Some(ERP));
     }
 
     #[test]

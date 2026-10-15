@@ -28,6 +28,7 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 
 use crate::dto::HeartbeatNode;
+use crate::flow_table::Transport;
 
 /// WireGuard's IANA-assigned default port. Not specified anywhere in the
 /// spec or the agreed Connector<->Gatekeeper contract - every node in this
@@ -196,20 +197,19 @@ fn parse_l4_port(packet: &[u8], field_offset: usize) -> Option<u16> {
     Some(u16::from_be_bytes(port_bytes))
 }
 
-/// Parses the source TCP/UDP port from a raw IPv4/IPv6 packet - the field
-/// that identifies which admitted flow a decrypted packet belongs to (spec
-/// §B.8: "distinguished by translated source port", `flow_table`).
+/// Parses the source TCP/UDP port from a raw IPv4/IPv6 packet - for a decrypted packet, the
+/// translated source port: with the node and what the user dialled, it identifies the admitted flow
+/// the packet belongs to (spec §B.8, TT-2639, `flow_table`).
 pub fn parse_source_port(packet: &[u8]) -> Option<u16> {
     parse_l4_port(packet, 0)
 }
 
-/// Parses the destination TCP/UDP port from a raw IPv4/IPv6 packet - for a
-/// reply packet arriving from the TUN side, this is the same translated port
-/// the original flow was admitted on, and (TT-1847) the only reliable key
-/// left for routing it back to the right node's tunnel: the packet's
-/// destination *address* is a node's masqueraded wg0 address, which is
-/// identical across the whole fleet (`FlowTable`'s own module doc) and so
-/// carries no node identity at all.
+/// Parses the destination TCP/UDP port from a raw IPv4/IPv6 packet - for a reply packet arriving
+/// from the TUN side, the port its flow is known by on the internal network: the source port this
+/// Connector allocated for it (TT-2639), or for a flow from an older node the translated port it was
+/// admitted on (TT-1847). Either is what routes the reply back to the right node's tunnel: the
+/// packet's destination *address* is a node's masqueraded wg0 address, identical across the whole
+/// fleet (`FlowTable`'s own module doc), so it carries no node identity at all.
 pub fn parse_destination_port(packet: &[u8]) -> Option<u16> {
     parse_l4_port(packet, 2)
 }
@@ -341,6 +341,88 @@ pub fn rewrite_destination_ipv4(packet: &mut [u8], new_dst: Ipv4Addr) -> bool {
 /// contract.
 pub fn rewrite_source_ipv4(packet: &mut [u8], new_src: Ipv4Addr) -> bool {
     rewrite_ipv4_address(packet, 12, new_src)
+}
+
+/// The protocol byte and header length of an IPv4 first-fragment TCP/UDP packet long enough to hold
+/// its L4 checksum - the packets the TT-2639 helpers below read and rewrite. `None` for anything
+/// else (IPv6, another protocol, a later fragment, a truncated packet), which callers treat as
+/// "can't identify or rewrite this flow", never as "no flow".
+fn ipv4_tcp_or_udp(packet: &[u8]) -> Option<(u8, usize)> {
+    let first_byte = *packet.first()?;
+    if first_byte >> 4 != 4 {
+        return None;
+    }
+    let ihl = usize::from(first_byte & 0x0F) * 4;
+    if ihl < 20 || packet.len() < ihl || is_non_first_ipv4_fragment(packet) {
+        return None;
+    }
+    let protocol = *packet.get(9)?;
+    let checksum_offset = match protocol {
+        6 => ihl + 16,
+        17 => ihl + 6,
+        _ => return None,
+    };
+    (packet.len() >= checksum_offset + 2).then_some((protocol, ihl))
+}
+
+/// The transport of an IPv4 TCP/UDP packet (TT-2639): part of the flow identity (spec §B.8).
+pub fn parse_ipv4_transport(packet: &[u8]) -> Option<Transport> {
+    let (protocol, _) = ipv4_tcp_or_udp(packet)?;
+    Transport::from_ip_protocol(protocol)
+}
+
+/// The IPv4 destination address of a TCP/UDP packet: for a packet from a node, the gateway virtual
+/// address the user dialled (TT-2639, spec §B.8).
+pub fn parse_destination_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
+    ipv4_tcp_or_udp(packet)?;
+    let octets: [u8; 4] = packet.get(16..20)?.try_into().ok()?;
+    Some(Ipv4Addr::from(octets))
+}
+
+/// The IPv4 source address of a TCP/UDP packet: for a reply read from the TUN device, the internal
+/// service it came from (TT-2639).
+pub fn parse_source_ipv4(packet: &[u8]) -> Option<Ipv4Addr> {
+    ipv4_tcp_or_udp(packet)?;
+    let octets: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
+    Some(Ipv4Addr::from(octets))
+}
+
+/// Rewrites a TCP/UDP port in place (`field_offset` 0 = source, 2 = destination), updating the L4
+/// checksum incrementally: the ports are covered by the TCP/UDP checksum, not the IPv4 header one.
+/// Same UDP rules as `rewrite_ipv4_address`: a `0` checksum (none computed) is left alone, and an
+/// updated checksum of `0` is written as `0xFFFF`. IPv4 only; `false` (packet untouched) for
+/// anything `ipv4_tcp_or_udp` rejects.
+fn rewrite_l4_port(packet: &mut [u8], field_offset: usize, new_port: u16) -> bool {
+    let Some((protocol, ihl)) = ipv4_tcp_or_udp(packet) else {
+        return false;
+    };
+    let port_offset = ihl + field_offset;
+    let checksum_offset = if protocol == 6 { ihl + 16 } else { ihl + 6 };
+    let old_port = read_u16(packet, port_offset);
+    let checksum = read_u16(packet, checksum_offset);
+    if protocol == 6 || checksum != 0 {
+        let checksum = checksum_adjust(checksum, old_port, new_port);
+        let checksum = if protocol == 17 && checksum == 0 {
+            0xFFFF
+        } else {
+            checksum
+        };
+        write_u16(packet, checksum_offset, checksum);
+    }
+    write_u16(packet, port_offset, new_port);
+    true
+}
+
+/// Rewrites a forwarded packet's source port to the one the Connector allocated for its flow
+/// (TT-2639, spec §B.8), so two flows stay apart on the internal network too.
+pub fn rewrite_source_port(packet: &mut [u8], new_port: u16) -> bool {
+    rewrite_l4_port(packet, 0, new_port)
+}
+
+/// Rewrites a reply's destination port back to its flow's translated port (TT-2639), the port the
+/// node's connection tracking knows the flow by.
+pub fn rewrite_destination_port(packet: &mut [u8], new_port: u16) -> bool {
+    rewrite_l4_port(packet, 2, new_port)
 }
 
 /// Builds and maintains one `NodeTunnel` per node currently reachable in the
@@ -1382,5 +1464,108 @@ mod tests {
         // (bytes 12..16) round-tripped intact through real encryption and
         // decryption - no separate field-level assertion needed.
         assert_eq!(decrypted, fake_ip_packet);
+    }
+
+    /// Sums a TCP/UDP segment with its pseudo-header: 0xFFFF when the L4 checksum is valid.
+    fn l4_checksum_sum(packet: &[u8]) -> u16 {
+        let mut pseudo_and_segment = Vec::new();
+        pseudo_and_segment.extend_from_slice(&packet[12..20]);
+        pseudo_and_segment.push(0);
+        pseudo_and_segment.push(packet[9]);
+        pseudo_and_segment.extend_from_slice(&((packet.len() - 20) as u16).to_be_bytes());
+        pseudo_and_segment.extend_from_slice(&packet[20..]);
+        reference_ones_complement_sum(&pseudo_and_segment)
+    }
+
+    #[test]
+    fn rewrite_source_port_writes_the_port_and_keeps_the_tcp_checksum_valid() {
+        let mut packet = valid_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 3),
+            40100,
+            80,
+        );
+
+        assert!(rewrite_source_port(&mut packet, 1024));
+
+        assert_eq!(parse_source_port(&packet), Some(1024));
+        assert_eq!(parse_destination_port(&packet), Some(80));
+        assert_eq!(l4_checksum_sum(&packet), 0xFFFF);
+        assert_eq!(reference_ones_complement_sum(&packet[0..20]), 0xFFFF);
+    }
+
+    #[test]
+    fn rewrite_destination_port_writes_the_port_and_keeps_the_udp_checksum_valid() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(172, 31, 4, 176),
+            Ipv4Addr::new(10, 66, 66, 1),
+            53,
+            1024,
+        );
+
+        assert!(rewrite_destination_port(&mut packet, 40100));
+
+        assert_eq!(parse_destination_port(&packet), Some(40100));
+        assert_eq!(l4_checksum_sum(&packet), 0xFFFF);
+    }
+
+    #[test]
+    fn rewrite_source_port_leaves_an_absent_udp_checksum_absent() {
+        let mut packet = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 2),
+            40100,
+            53,
+        );
+        packet[26..28].copy_from_slice(&[0, 0]);
+
+        assert!(rewrite_source_port(&mut packet, 2000));
+
+        assert_eq!(parse_source_port(&packet), Some(2000));
+        assert_eq!(&packet[26..28], &[0, 0]);
+    }
+
+    #[test]
+    fn port_rewrites_refuse_a_non_ipv4_packet_and_leave_it_untouched() {
+        let mut packet = vec![0x60; 60];
+        let before = packet.clone();
+
+        assert!(!rewrite_source_port(&mut packet, 2000));
+        assert!(!rewrite_destination_port(&mut packet, 2000));
+
+        assert_eq!(packet, before);
+    }
+
+    #[test]
+    fn the_dialled_identity_is_read_from_an_ipv4_packet() {
+        let tcp = valid_ipv4_tcp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 3),
+            40100,
+            80,
+        );
+        let udp = valid_ipv4_udp_packet(
+            Ipv4Addr::new(10, 66, 66, 1),
+            Ipv4Addr::new(10, 99, 0, 2),
+            40100,
+            53,
+        );
+
+        assert_eq!(parse_ipv4_transport(&tcp), Some(Transport::Tcp));
+        assert_eq!(parse_ipv4_transport(&udp), Some(Transport::Udp));
+        assert_eq!(
+            parse_destination_ipv4(&tcp),
+            Some(Ipv4Addr::new(10, 99, 0, 3))
+        );
+        assert_eq!(parse_source_ipv4(&udp), Some(Ipv4Addr::new(10, 66, 66, 1)));
+    }
+
+    #[test]
+    fn no_dialled_identity_is_read_from_a_non_ipv4_packet() {
+        let packet = vec![0x60; 60];
+
+        assert_eq!(parse_ipv4_transport(&packet), None);
+        assert_eq!(parse_destination_ipv4(&packet), None);
+        assert_eq!(parse_source_ipv4(&packet), None);
     }
 }

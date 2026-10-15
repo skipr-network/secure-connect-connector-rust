@@ -22,7 +22,7 @@ use crate::access::{AccessDecision, decide_access_and_audit};
 use crate::audit::{AuditEvent, AuditLog};
 use crate::crypto;
 use crate::dto::PolicyBundleEndpoint;
-use crate::flow_table::FlowTable;
+use crate::flow_table::{Dialled, FlowTable, Transport};
 use crate::policy::PolicyStore;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,9 +34,9 @@ pub struct FlowAdmissionRequest {
     /// (`flow_table`, TT-1732 review, Tasneem finding #1).
     pub node_id: String,
     /// The translated source port Gatekeeper's NAT assigned this flow (spec
-    /// §B.8) - `flow_table`'s real key alongside `node_id`, both for gating
-    /// forwarded traffic and, since TT-1847, for routing reply traffic back
-    /// to the right node.
+    /// §B.8) - with `node_id` and the dialled identity below, the flow's key in
+    /// `flow_table`; without that identity (an older node), its key alongside
+    /// `node_id` alone, as before TT-2639.
     pub port: u16,
     /// All three nullable together (TT-2145): Gatekeeper legitimately sends
     /// `null` for these when a flow's device isn't resolvable yet (spec
@@ -49,6 +49,34 @@ pub struct FlowAdmissionRequest {
     pub user_public_key: Option<String>,
     pub signature: Option<String>,
     pub signed_data: Option<String>,
+    /// TT-2639 (spec §B.8): what the user dialled - with `node_id` and `port`, the flow's identity.
+    /// Read leniently (`dialled`), never as required or typed fields: a node that predates them
+    /// sends none, and one bad value must not reject the whole admission (the TT-2145 lesson above).
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub gateway_address: Option<String>,
+    #[serde(default)]
+    pub destination_port: Option<u16>,
+}
+
+impl FlowAdmissionRequest {
+    /// The dialled identity, if the admission carries all of it in a usable form; `None` for a node
+    /// that predates it (or sent something unusable), whose flow is then handled as before.
+    pub fn dialled(&self) -> Option<Dialled> {
+        Some(Dialled {
+            transport: Transport::from_wire(self.transport.as_deref()?)?,
+            gateway_address: self.gateway_address.as_deref()?.parse().ok()?,
+            destination_port: self.destination_port?,
+        })
+    }
+}
+
+/// What recording an allowed flow in the flow table came to (`handle_flow_admission`).
+enum Recorded {
+    Admitted,
+    AdmittedWithoutDialledIdentity,
+    AlreadyReleased,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -100,7 +128,7 @@ pub struct ControlPlaneState {
     pub policy_store: Arc<PolicyStore>,
     pub audit_log: Arc<AuditLog>,
     pub flow_table: Arc<Mutex<FlowTable>>,
-    /// Hands a packet `admission_poller` reclaimed via `FlowTable::take_pending_packet` back to
+    /// Hands a packet `admission_poller` reclaimed via `FlowTable::take_pending` back to
     /// `main::run_wireguard_receive_loop` - the only task allowed to write to the TUN device (see
     /// its own doc comment) - for forwarding, instead of that poller task needing TUN write access
     /// it was never given. `(node_id, packet_bytes)`. Tests that don't exercise this path construct
@@ -239,6 +267,7 @@ pub(crate) async fn handle_flow_admission(
     flow_table: &Mutex<FlowTable>,
     request: FlowAdmissionRequest,
 ) -> FlowAdmissionResponse {
+    let dialled = request.dialled();
     let outcome = authenticate_and_decide(
         policy_store,
         audit_log,
@@ -265,28 +294,47 @@ pub(crate) async fn handle_flow_admission(
             // admitted (TT-2046) - being entitled to a gateway says nothing
             // about which address that gateway is actually configured to
             // expose.
-            let mut table = flow_table.lock().expect("flow table lock poisoned");
             // TT-2298: admissions run concurrently with the poll loop, so this flow's release may
             // already have been handled. Checked under the same lock as the admit below, so a
             // release cannot slip in between; admitting it now would leave a closed flow admitted.
-            if table.was_recently_released(&request.flow_id) {
-                drop(table);
-                tracing::warn!(flow_id = %request.flow_id, "flow was released before its admission finished - not admitting it");
-                return FlowAdmissionResponse {
-                    flow_id: request.flow_id,
-                    decision: "refuse".to_string(),
-                    reason: Some("flow_already_released".to_string()),
-                };
+            // TT-2639: identified by what the user dialled too, when the node sends it (spec §B.8).
+            // The lock is scoped to this block: its guard must not be held across an await.
+            let recorded = {
+                let mut table = flow_table.lock().expect("flow table lock poisoned");
+                if table.was_recently_released(&request.flow_id) {
+                    Recorded::AlreadyReleased
+                } else {
+                    table.admit_flow(
+                        request.node_id.clone(),
+                        request.port,
+                        dialled,
+                        request.gateway_id.clone(),
+                        request.flow_id.clone(),
+                        device_public_key,
+                        endpoints,
+                    );
+                    match dialled {
+                        Some(_) => Recorded::Admitted,
+                        None => Recorded::AdmittedWithoutDialledIdentity,
+                    }
+                }
+            };
+            match recorded {
+                Recorded::AlreadyReleased => {
+                    tracing::warn!(flow_id = %request.flow_id, "flow was released before its admission finished - not admitting it");
+                    return FlowAdmissionResponse {
+                        flow_id: request.flow_id,
+                        decision: "refuse".to_string(),
+                        reason: Some("flow_already_released".to_string()),
+                    };
+                }
+                Recorded::AdmittedWithoutDialledIdentity => tracing::warn!(
+                    flow_id = %request.flow_id,
+                    node_id = %request.node_id,
+                    "admission carries no usable transport/gateway_address/destination_port - identifying this flow by node and translated port only; the node's Gatekeeper should be updated (TT-2639)"
+                ),
+                Recorded::Admitted => {}
             }
-            table.admit(
-                request.node_id.clone(),
-                request.port,
-                request.gateway_id.clone(),
-                request.flow_id.clone(),
-                device_public_key,
-                endpoints,
-            );
-            drop(table);
             FlowAdmissionResponse {
                 flow_id: request.flow_id,
                 decision: "admit".to_string(),
@@ -417,6 +465,9 @@ mod tests {
             user_public_key: Some(public_key_hex.to_string()),
             signature: Some(crypto::sign_to_base64(signing_key, message.as_bytes())),
             signed_data: Some(BASE64.encode(message)),
+            transport: None,
+            gateway_address: None,
+            destination_port: None,
         }
     }
 
@@ -535,6 +586,9 @@ mod tests {
             user_public_key: Some("047fc7980b4735d2efa3492cb4312e0d1cdf4e23174d8bf8ade7e6a964a705211cf283eff432a12fabdb227d4529ef1fb3f0c6828181a54b9d1ad3194c6a9f490d".to_string()),
             signature: Some("MEUCIHrp5diOwIHlLi8EFX4oE51tBN6361tP0BViMlKW0gdYAiEAo27/MSQpQNeodLixoaJ77dHP+mK8WatNXmAs+uwggOA=".to_string()),
             signed_data: Some("eyJkZXZpY2VfaWQiOiI1ODVjYjU0MjYzZWU5YzNmYjM1MjYwZWYxMzM1NGE2NWIzZGNkYjk4IiwicHVibGljX2tleSI6IjA0N2ZjNzk4MGI0NzM1ZDJlZmEzNDkyY2I0MzEyZTBkMWNkZjRlMjMxNzRkOGJmOGFkZTdlNmE5NjRhNzA1MjExY2YyODNlZmY0MzJhMTJmYWJkYjIyN2Q0NTI5ZWYxZmIzZjBjNjgyODE4MWE1NGI5ZDFhZDMxOTRjNmE5ZjQ5MGQiLCJzZXJ2aWNlX3R5cGUiOiJpbnN0YW50IiwicmVnaW9uIjoiYXAtc291dGgtMSIsImlwX2FkZHJlc3MiOiI0NS4xMTMuMTA4LjEyNyIsImlzX2lwX2FkZHJlc3Nfc3RhdGljIjpmYWxzZSwicHJvdG9jb2wiOiJvcGVudnBuIiwic2Vzc2lvbl9pZCI6bnVsbCwicHJvdmlzaW9uX3Rva2VuIjoiX2l3VzlKQVZtNUQtSHYwdFpfMVdwOUIydGs1bzRwZERTbUo4TTA0MFYzUSIsImdhdGV3YXlfaWQiOiIxMzJmNjJhYS1hYzI5LTQ5YWUtYjUyNy1jMDQ4NTMwYmU5MzUifQ==".to_string()),
+            transport: None,
+            gateway_address: None,
+            destination_port: None,
         };
 
         let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
@@ -801,6 +855,9 @@ mod tests {
             user_public_key: None,
             signature: None,
             signed_data: None,
+            transport: None,
+            gateway_address: None,
+            destination_port: None,
         };
 
         let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
@@ -929,6 +986,120 @@ mod tests {
         // not_entitled (see RefusalReason::as_wire_str).
         assert_eq!(response.decision, "refuse");
         assert_eq!(response.reason, Some("not_entitled".to_string()));
+    }
+
+    // --- TT-2639: the dialled flow identity ---
+
+    fn with_dialled(
+        mut request: FlowAdmissionRequest,
+        transport: &str,
+        gateway_address: &str,
+        destination_port: u16,
+    ) -> FlowAdmissionRequest {
+        request.transport = Some(transport.to_string());
+        request.gateway_address = Some(gateway_address.to_string());
+        request.destination_port = Some(destination_port);
+        request
+    }
+
+    fn unsigned_request() -> FlowAdmissionRequest {
+        FlowAdmissionRequest {
+            flow_id: "flow-1".to_string(),
+            gateway_id: "gw-1".to_string(),
+            node_id: "n-1".to_string(),
+            port: 40100,
+            user_public_key: None,
+            signature: None,
+            signed_data: None,
+            transport: None,
+            gateway_address: None,
+            destination_port: None,
+        }
+    }
+
+    #[test]
+    fn the_dialled_identity_is_read_when_all_three_fields_are_usable() {
+        let request = with_dialled(unsigned_request(), "udp", "10.99.0.2", 53);
+
+        assert_eq!(
+            request.dialled(),
+            Some(Dialled {
+                transport: Transport::Udp,
+                gateway_address: "10.99.0.2".parse().unwrap(),
+                destination_port: 53,
+            })
+        );
+    }
+
+    #[test]
+    fn no_dialled_identity_without_all_three_fields_usable() {
+        let mut missing_port = with_dialled(unsigned_request(), "tcp", "10.99.0.3", 80);
+        missing_port.destination_port = None;
+
+        assert_eq!(unsigned_request().dialled(), None);
+        assert_eq!(missing_port.dialled(), None);
+        assert_eq!(
+            with_dialled(unsigned_request(), "sctp", "10.99.0.3", 80).dialled(),
+            None
+        );
+        assert_eq!(
+            with_dialled(unsigned_request(), "tcp", "not-an-address", 80).dialled(),
+            None
+        );
+    }
+
+    /// The TT-2145 lesson: an admission from an older node (no fields), or one with an unusable value,
+    /// must still be read, never rejected as a whole before any admission logic runs.
+    #[test]
+    fn an_admission_without_or_with_unusable_dialled_fields_is_still_read() {
+        let older: FlowAdmissionRequest = serde_json::from_str(
+            r#"{"flow_id":"f","gateway_id":"g","node_id":"n","port":40100,"user_public_key":null,"signature":null,"signed_data":null}"#,
+        )
+        .unwrap();
+        let unusable: FlowAdmissionRequest = serde_json::from_str(
+            r#"{"flow_id":"f","gateway_id":"g","node_id":"n","port":40100,"transport":"tcp","gateway_address":"nonsense","destination_port":80,"user_public_key":null,"signature":null,"signed_data":null}"#,
+        )
+        .unwrap();
+
+        assert_eq!(older.dialled(), None);
+        assert_eq!(unusable.dialled(), None);
+    }
+
+    #[tokio::test]
+    async fn an_admission_with_its_dialled_identity_is_recorded_under_it() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        let request = with_dialled(
+            admission_request(
+                "gw-1",
+                &device.signing_key,
+                &device.public_key_hex,
+                "session-nonce-1",
+            ),
+            "tcp",
+            "10.99.0.1",
+            443,
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &table, request).await;
+
+        assert_eq!(response.decision, "admit");
+        let dialled = Dialled {
+            transport: Transport::Tcp,
+            gateway_address: "10.99.0.1".parse().unwrap(),
+            destination_port: 443,
+        };
+        let mut table = table.lock().unwrap();
+        assert!(matches!(
+            table.dialled_forward_target("n-1", 51820, dialled, &crate::dns_cache::DnsCache::new()),
+            Some(crate::flow_table::DialledForward::Forward { address, .. }) if address == "10.0.0.5".parse::<std::net::Ipv4Addr>().unwrap()
+        ));
+        assert!(
+            table.gateway_for("n-1", 51820).is_none(),
+            "not also recorded by node and port alone"
+        );
     }
 
     #[tokio::test]
