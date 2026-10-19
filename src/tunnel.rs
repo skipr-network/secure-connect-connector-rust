@@ -419,8 +419,9 @@ pub fn rewrite_source_port(packet: &mut [u8], new_port: u16) -> bool {
     rewrite_l4_port(packet, 0, new_port)
 }
 
-/// Rewrites a reply's destination port back to its flow's translated port (TT-2639), the port the
-/// node's connection tracking knows the flow by.
+/// Rewrites a packet's destination port: a reply's back to its flow's translated port (TT-2639),
+/// the port the node's connection tracking knows the flow by, and a forwarded packet's to its port
+/// rule's internal port (TT-2514).
 pub fn rewrite_destination_port(packet: &mut [u8], new_port: u16) -> bool {
     rewrite_l4_port(packet, 2, new_port)
 }
@@ -1475,6 +1476,42 @@ mod tests {
         pseudo_and_segment.extend_from_slice(&((packet.len() - 20) as u16).to_be_bytes());
         pseudo_and_segment.extend_from_slice(&packet[20..]);
         reference_ones_complement_sum(&pseudo_and_segment)
+    }
+
+    /// TT-2514: the whole forward-path rewrite of a translated port rule - gateway address to the
+    /// internal host, dialled port to the internal port, translated port to the allocated one -
+    /// leaves the TCP and the UDP checksum valid.
+    #[test]
+    fn a_translated_port_rules_full_forward_rewrite_keeps_tcp_and_udp_checksums_valid() {
+        for mut packet in [
+            valid_ipv4_tcp_packet(
+                Ipv4Addr::new(10, 66, 66, 1),
+                Ipv4Addr::new(10, 99, 0, 3),
+                40100,
+                443,
+            ),
+            valid_ipv4_udp_packet(
+                Ipv4Addr::new(10, 66, 66, 1),
+                Ipv4Addr::new(10, 99, 0, 3),
+                40100,
+                443,
+            ),
+        ] {
+            assert!(rewrite_destination_ipv4(
+                &mut packet,
+                Ipv4Addr::new(10, 0, 0, 5)
+            ));
+            assert!(rewrite_destination_port(&mut packet, 8443));
+            assert!(rewrite_source_port(&mut packet, 1024));
+
+            assert_eq!(
+                parse_destination_ipv4(&packet),
+                Some(Ipv4Addr::new(10, 0, 0, 5))
+            );
+            assert_eq!(parse_destination_port(&packet), Some(8443));
+            assert_eq!(parse_source_port(&packet), Some(1024));
+            assert_eq!(l4_checksum_sum(&packet), 0xFFFF, "protocol {}", packet[9]);
+        }
     }
 
     #[test]

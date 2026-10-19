@@ -44,6 +44,18 @@ pub enum AuditEvent {
         flow_id: String,
         gateway_id: String,
     },
+    /// TT-2519 (spec §B.10): an admitted flow and the port rule that serves it, e.g.
+    /// `TCP 443 -> 10.0.0.5:8443`. Without a single serving rule, `port_rule` is absent and
+    /// `warning` says why.
+    FlowAdmitted {
+        flow_id: String,
+        gateway_id: String,
+        device_public_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port_rule: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
     /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
     /// to this gateway, and a gateway-end report was queued for it.
     FlowsEnded {
@@ -62,6 +74,9 @@ struct AuditRecord<'a> {
     event: &'a AuditEvent,
 }
 
+/// Cheap to clone: a clone writes to the same file under the same lock, so it can be moved into a
+/// task that records an entry in the background.
+#[derive(Clone)]
 pub struct AuditLog {
     path: PathBuf,
     // One log line is one write(); this only prevents this process's own

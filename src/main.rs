@@ -579,8 +579,8 @@ async fn run_heartbeat(
 fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
     bundles
         .iter()
-        .flat_map(|bundle| bundle.endpoints.iter())
-        .map(|endpoint| endpoint.host.clone())
+        .flat_map(|bundle| bundle.rules())
+        .map(|rule| rule.internal_host)
         .collect()
 }
 
@@ -692,20 +692,25 @@ async fn queue_gateway_end_reports(
     }
 }
 
-/// Refreshes already-admitted flows' remembered endpoint config to this heartbeat's freshly-applied
-/// bundles (TT-2046 review finding #4): unlike entitlements, endpoints were only ever snapshotted
+/// Refreshes already-admitted flows' remembered port rules (endpoints before TT-2514) to this
+/// heartbeat's freshly-applied bundles (TT-2046 review finding #4): unlike entitlements, they were only ever snapshotted
 /// once at admission and never revisited, so an admin repointing or removing a gateway's endpoint
 /// kept every flow admitted before the change forwarding to the old address until the flow ended on
 /// its own. Runs every heartbeat, independent of `old_bundles` (there's no diffing to do - this
-/// just always brings `flow_table` up to date with the latest configured endpoints, a no-op for any
-/// gateway with nothing currently admitted). See `FlowTable::update_endpoints`.
+/// just always brings `flow_table` up to date with the latest configured rules, a no-op for any
+/// gateway with nothing currently admitted). See `FlowTable::update_rules`.
 fn reconcile_endpoint_changes(
     flow_table: &std::sync::Mutex<FlowTable>,
     new_bundles: &[PolicyBundle],
 ) {
     let mut table = flow_table.lock().expect("flow table lock poisoned");
+    table.retain_gateway_rules(|gateway_id| {
+        new_bundles
+            .iter()
+            .any(|bundle| bundle.gateway_id == gateway_id)
+    });
     for bundle in new_bundles {
-        table.update_endpoints(&bundle.gateway_id, &bundle.endpoints);
+        table.update_rules(&bundle.gateway_id, &bundle.rules());
     }
 }
 
@@ -785,10 +790,11 @@ async fn dial_new_nodes(
 ///   real endpoint: it's Gatekeeper's invented, unroutable per-gateway virtual address
 ///   (DNS-resolution only - see `FlowTable::forward`'s doc comment), so forwarding it
 ///   unchanged could never have reached anywhere real even before TT-2046's admission check
-///   existed. `FlowTable::forward` resolves the real address by matching the packet's destination
-///   *port* (never translated by Gatekeeper, so it's the client's real intent) against the
-///   entitled gateway's configured endpoints; `tunnel::rewrite_destination_ipv4` does the
-///   actual byte-level rewrite, including the checksum fixups a raw address change requires.
+///   existed. `FlowTable::forward` resolves the real address and port by matching the packet's
+///   transport and destination *port* (never translated by Gatekeeper, so it's the client's real
+///   intent) against the entitled gateway's port rules (TT-2514); `tunnel::rewrite_destination_ipv4`
+///   and `tunnel::rewrite_destination_port` do the actual byte-level rewrite, including the checksum
+///   fixups.
 ///
 /// Returns `true` (packet mutated in place if a rewrite was needed, ready to write to TUN
 /// as-is) or `false` (packet must not be forwarded - left completely untouched: every check here
@@ -799,13 +805,16 @@ async fn dial_new_nodes(
 fn warn_unforwardable(outcome: ForwardOutcome, node_id: &str, source_port: u16, dst_port: u16) {
     match outcome {
         ForwardOutcome::PortNotConfigured => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no endpoint configured on this port - dropping");
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no port rule for this transport and port - dropping");
         }
         ForwardOutcome::AmbiguousEndpoint => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one configured endpoint shares this port - refusing to guess, dropping");
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one port rule matches this transport and port - refusing to guess, dropping");
         }
         ForwardOutcome::HostUnresolved => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and the port matches, but its configured endpoint host hasn't resolved to an address yet - dropping");
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and a port rule matches, but its internal host hasn't resolved to an address yet - dropping");
+        }
+        ForwardOutcome::PortTranslationNeedsUpdatedNode => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its port rule translates the port and the flow came from a node that predates the dialled identity, whose replies could not get the port back - dropping until the node is updated (TT-2514)");
         }
         ForwardOutcome::NoFreeSourcePort => {
             error!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but every source port toward its internal host:port is in use - dropping until one is freed (TT-2639)");
@@ -871,7 +880,7 @@ fn prepare_decrypted_packet_for_forwarding(
         }),
         _ => None,
     };
-    let (real_dst, allocated_port) = match flow_table.forward(
+    let (real_dst, internal_port, allocated_port) = match flow_table.forward(
         node_id,
         source_port,
         dialled,
@@ -880,8 +889,9 @@ fn prepare_decrypted_packet_for_forwarding(
     ) {
         Forwarding::Forward {
             address,
+            destination_port: internal_port,
             source_port: allocated_port,
-        } => (address, allocated_port),
+        } => (address, internal_port, allocated_port),
         Forwarding::NotAdmitted => {
             // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a
             // new flow's raw packets independently of, and often slightly before, the
@@ -909,8 +919,11 @@ fn prepare_decrypted_packet_for_forwarding(
     };
 
     // A flow with its dialled identity also gets its allocated source port, which keeps it apart
-    // from every other flow on the internal network and is how its replies find it again (TT-2639).
+    // from every other flow on the internal network and is how its replies find it again (TT-2639),
+    // and the rule's internal port when it differs from the dialled one (TT-2514) - its replies get
+    // the dialled port back in `route_reply`.
     if tunnel::rewrite_destination_ipv4(packet, real_dst)
+        && internal_port.is_none_or(|port| tunnel::rewrite_destination_port(packet, port))
         && allocated_port.is_none_or(|port| tunnel::rewrite_source_port(packet, port))
     {
         return true;
@@ -925,7 +938,7 @@ fn prepare_decrypted_packet_for_forwarding(
             "decrypted packet is IPv6 - endpoint rewriting only supports IPv4 in this version, dropping"
         );
     } else {
-        warn!(%node_id, %real_dst, ?allocated_port, "failed to rewrite decrypted packet's destination - dropping");
+        warn!(%node_id, %real_dst, ?internal_port, ?allocated_port, "failed to rewrite decrypted packet's destination - dropping");
     }
     false
 }
@@ -1419,6 +1432,56 @@ mod tests {
             Some(40100),
             "the translated port"
         );
+    }
+
+    /// TT-2514 through the real forward and reply paths: a TCP 443 rule to an internal :8443 reaches
+    /// the internal port, and the reply goes back from the port the user dialled.
+    #[test]
+    fn a_translated_port_rule_rewrites_the_port_both_ways() {
+        let mut flow_table = FlowTable::new();
+        flow_table.admit_flow(
+            "n-1".to_string(),
+            40100,
+            Some(Dialled {
+                transport: flow_table::Transport::Udp,
+                gateway_address: ERP,
+                destination_port: 443,
+            }),
+            "gw-erp".to_string(),
+            "flow-erp".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PortRule {
+                transport: dto::RuleTransport::TcpUdp,
+                external_port: 443,
+                internal_host: ERP_HOST.to_string(),
+                internal_port: 8443,
+            }],
+        );
+        let mut packet = udp_packet(NODE_WG, ERP, 40100, 443);
+
+        assert!(prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            "n-1",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1)),
+            &mut flow_table,
+            &dns_cache::DnsCache::new(),
+        ));
+        assert_eq!(tunnel::parse_destination_ipv4(&packet), Some(ERP_HOST));
+        assert_eq!(tunnel::parse_destination_port(&packet), Some(8443));
+        let allocated = tunnel::parse_source_port(&packet).unwrap();
+
+        let mut reply = udp_packet(ERP_HOST, NODE_WG, 8443, allocated);
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut reply, allocated, &flow_table).as_deref(),
+            Some("n-1")
+        );
+        assert_eq!(&reply[12..16], &ERP.octets());
+        assert_eq!(
+            tunnel::parse_source_port(&reply),
+            Some(443),
+            "the port the user dialled"
+        );
+        assert_eq!(tunnel::parse_destination_port(&reply), Some(40100));
     }
 
     #[test]
@@ -2525,6 +2588,7 @@ mod tests {
                         port: 8443,
                     },
                 ],
+                port_rules: None,
                 entitlement_list: vec![],
             },
             PolicyBundle {
@@ -2536,6 +2600,7 @@ mod tests {
                     host: "files.internal.example.com".to_string(),
                     port: 445,
                 }],
+                port_rules: None,
                 entitlement_list: vec![],
             },
         ];
@@ -2548,6 +2613,35 @@ mod tests {
                 "10.0.0.5".to_string(),
                 "erp.internal.example.com".to_string(),
                 "files.internal.example.com".to_string(),
+            ]
+        );
+    }
+
+    /// TT-2514: with port rules, the hosts the DNS cache refreshes and the heartbeat reports as
+    /// unresolved are the rules' internal hosts, not the transitional endpoints'.
+    #[test]
+    fn collect_endpoint_hosts_reads_the_port_rules_when_a_bundle_has_them() {
+        let mut bundle = bundle_with_endpoints("gw-1", &["10.0.0.5"]);
+        bundle.port_rules = Some(vec![
+            dto::PortRule {
+                transport: dto::RuleTransport::Tcp,
+                external_port: 443,
+                internal_host: "erp.internal.example.com".to_string(),
+                internal_port: 8443,
+            },
+            dto::PortRule {
+                transport: dto::RuleTransport::Udp,
+                external_port: 514,
+                internal_host: "syslog.internal.example.com".to_string(),
+                internal_port: 514,
+            },
+        ]);
+
+        assert_eq!(
+            collect_endpoint_hosts(&[bundle]),
+            vec![
+                "erp.internal.example.com".to_string(),
+                "syslog.internal.example.com".to_string(),
             ]
         );
     }
@@ -2565,6 +2659,7 @@ mod tests {
                     port: 443,
                 })
                 .collect(),
+            port_rules: None,
             entitlement_list: vec![],
         }
     }
@@ -3106,6 +3201,7 @@ mod tests {
             hostname: "crm.internal.example.com".to_string(),
             access_mode: "SELECTED_USERS".to_string(),
             endpoints: vec![],
+            port_rules: None,
             entitlement_list: entitled_device_keys
                 .iter()
                 .map(|key| Entitlement {

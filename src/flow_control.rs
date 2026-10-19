@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::access::{AccessDecision, decide_access_and_audit};
 use crate::audit::{AuditEvent, AuditLog};
 use crate::crypto;
-use crate::dto::PolicyBundleEndpoint;
+use crate::dto::PortRule;
 use crate::flow_table::{Dialled, FlowTable, Transport};
 use crate::policy::PolicyStore;
 
@@ -144,7 +144,7 @@ pub struct ControlPlaneState {
 enum AdmissionOutcome {
     Allowed {
         device_public_key: String,
-        endpoints: Vec<PolicyBundleEndpoint>,
+        rules: Vec<PortRule>,
     },
     Refused(&'static str),
 }
@@ -249,9 +249,9 @@ async fn authenticate_and_decide(
     // this only removes a same-Connector restriction the spec never called
     // for.
     match decide_access_and_audit(policy_store, audit_log, gateway_id, &user_public_key).await {
-        AccessDecision::Allowed { endpoints, .. } => AdmissionOutcome::Allowed {
+        AccessDecision::Allowed { rules, .. } => AdmissionOutcome::Allowed {
             device_public_key: user_public_key,
-            endpoints,
+            rules,
         },
         AccessDecision::Refused(reason) => AdmissionOutcome::Refused(reason.as_wire_str()),
     }
@@ -281,7 +281,7 @@ pub(crate) async fn handle_flow_admission(
     match outcome {
         AdmissionOutcome::Allowed {
             device_public_key,
-            endpoints,
+            rules,
         } => {
             // The real forwarding loops (`main`) only forward traffic for a
             // (node_id, port) pair present here, in both directions
@@ -289,19 +289,35 @@ pub(crate) async fn handle_flow_admission(
             // checked, device's traffic could still be forwarded once its
             // IP was learned"; reverse/reply routing: TT-1847) - nothing is
             // forwardable or routable until it's recorded as admitted right
-            // here. `endpoints` rides along so the forwarding loop can also
-            // check *where* traffic is headed, not just that the flow is
-            // admitted (TT-2046) - being entitled to a gateway says nothing
-            // about which address that gateway is actually configured to
-            // expose.
+            // here. The gateway's port rules ride along so the forwarding loop
+            // can also check *where* traffic is headed, not just that the flow
+            // is admitted (TT-2046, TT-2514) - being entitled to a gateway says
+            // nothing about which ports it opens or where they lead.
             // TT-2298: admissions run concurrently with the poll loop, so this flow's release may
             // already have been handled. Checked under the same lock as the admit below, so a
             // release cannot slip in between; admitting it now would leave a closed flow admitted.
             // TT-2639: identified by what the user dialled too, when the node sends it (spec §B.8).
             // The lock is scoped to this block: its guard must not be held across an await.
-            let recorded = {
+            // TT-2514: the rule this flow's packets will be forwarded by, named in the log below.
+            let admitted_device_key = device_public_key.clone();
+            let (recorded, rule) = {
                 let mut table = flow_table.lock().expect("flow table lock poisoned");
-                if table.was_recently_released(&request.flow_id) {
+                // TT-2514 review: a heartbeat may have changed the gateway's rules since they were
+                // read above. Those it applied are taken here, under the lock `update_rules` holds,
+                // so this flow is never admitted by a rule that heartbeat removed.
+                let rules = table
+                    .current_rules(&request.gateway_id)
+                    .map(<[PortRule]>::to_vec)
+                    .unwrap_or(rules);
+                let rule = dialled.map(|dialled| {
+                    crate::flow_table::matching_rule(
+                        &rules,
+                        Some(dialled.transport),
+                        dialled.destination_port,
+                    )
+                    .map(ToString::to_string)
+                });
+                let recorded = if table.was_recently_released(&request.flow_id) {
                     Recorded::AlreadyReleased
                 } else {
                     table.admit_flow(
@@ -311,14 +327,48 @@ pub(crate) async fn handle_flow_admission(
                         request.gateway_id.clone(),
                         request.flow_id.clone(),
                         device_public_key,
-                        endpoints,
+                        rules,
                     );
                     match dialled {
                         Some(_) => Recorded::Admitted,
                         None => Recorded::AdmittedWithoutDialledIdentity,
                     }
-                }
+                };
+                (recorded, rule)
             };
+            // TT-2519 (spec §B.10): the rule serving the flow goes to the local audit log too.
+            let (port_rule, warning) = match (&recorded, rule.clone().flatten()) {
+                (Recorded::Admitted, Some(rule)) => (Some(rule), None),
+                (Recorded::Admitted, None) => (
+                    None,
+                    Some("no single port rule serves the flow's transport and port".to_string()),
+                ),
+                (Recorded::AdmittedWithoutDialledIdentity, _) => (
+                    None,
+                    Some(
+                        "the node sent no dialled port; only rules with equal ports serve the flow"
+                            .to_string(),
+                    ),
+                ),
+                (Recorded::AlreadyReleased, _) => (None, None),
+            };
+            if !matches!(recorded, Recorded::AlreadyReleased) {
+                // In the background (TT-2514 review): the admission's reply must not wait for a
+                // second disk write - the access decision above is already recorded.
+                let audit_log = audit_log.clone();
+                let event = AuditEvent::FlowAdmitted {
+                    flow_id: request.flow_id.clone(),
+                    gateway_id: request.gateway_id.clone(),
+                    device_public_key: admitted_device_key,
+                    port_rule,
+                    warning,
+                };
+                tokio::spawn(async move {
+                    if let Err(error) = audit_log.record(event).await {
+                        tracing::error!(%error, "failed to write flow-admitted audit entry");
+                    }
+                });
+            }
             match recorded {
                 Recorded::AlreadyReleased => {
                     tracing::warn!(flow_id = %request.flow_id, "flow was released before its admission finished - not admitting it");
@@ -333,7 +383,19 @@ pub(crate) async fn handle_flow_admission(
                     node_id = %request.node_id,
                     "admission carries no usable transport/gateway_address/destination_port - identifying this flow by node and translated port only; the node's Gatekeeper should be updated (TT-2639)"
                 ),
-                Recorded::Admitted => {}
+                Recorded::Admitted => match rule.flatten() {
+                    Some(rule) => tracing::info!(
+                        flow_id = %request.flow_id,
+                        gateway_id = %request.gateway_id,
+                        %rule,
+                        "flow admitted"
+                    ),
+                    None => tracing::warn!(
+                        flow_id = %request.flow_id,
+                        gateway_id = %request.gateway_id,
+                        "flow admitted, but no single port rule of its gateway serves its transport and port - its packets will be dropped"
+                    ),
+                },
             }
             FlowAdmissionResponse {
                 flow_id: request.flow_id,
@@ -434,6 +496,7 @@ mod tests {
                         host: "10.0.0.5".to_string(),
                         port: 443,
                     }],
+                    port_rules: None,
                     entitlement_list: vec![Entitlement {
                         user_id: user_id.to_string(),
                         device_public_key: Some(device_public_key.to_string()),
@@ -797,6 +860,7 @@ mod tests {
                             host: "10.0.0.5".to_string(),
                             port: 443,
                         }],
+                        port_rules: None,
                         entitlement_list: vec![Entitlement {
                             user_id: "u-1".to_string(),
                             device_public_key: Some(device.public_key_hex.clone()),
@@ -811,6 +875,7 @@ mod tests {
                             host: "10.0.0.6".to_string(),
                             port: 443,
                         }],
+                        port_rules: None,
                         entitlement_list: vec![Entitlement {
                             user_id: "u-1".to_string(),
                             device_public_key: Some(device.public_key_hex.clone()),
@@ -881,6 +946,116 @@ mod tests {
         assert_eq!(entry["event"], "access_refused");
         assert_eq!(entry["reason"], "no_signature_presented");
         assert_eq!(entry["device_public_key"], "");
+    }
+
+    /// The flow's `flow_admitted` entry, written in the background - waits for it briefly.
+    async fn flow_admitted_entry(dir: &std::path::Path) -> serde_json::Value {
+        for _ in 0..200 {
+            if let Some(entry) = std::fs::read_to_string(dir.join("audit.log"))
+                .ok()
+                .and_then(|log| {
+                    log.lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                        .find(|entry| entry["event"] == "flow_admitted")
+                })
+            {
+                return entry;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no flow_admitted entry");
+    }
+
+    /// TT-2519 (spec §B.10): an admitted flow's local audit entry names the rule that serves it.
+    #[tokio::test]
+    async fn an_admitted_flow_records_the_port_rule_that_serves_it() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let mut request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+        request.transport = Some("tcp".to_string());
+        request.gateway_address = Some("10.99.0.3".to_string());
+        request.destination_port = Some(443);
+
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        assert_eq!(response.decision, "admit");
+        let admitted = flow_admitted_entry(dir.path()).await;
+        assert_eq!(admitted["flow_id"], "flow-1");
+        assert_eq!(admitted["port_rule"], "TCP+UDP 443 -> 10.0.0.5:443");
+        assert!(admitted.get("warning").is_none());
+    }
+
+    /// TT-2514 review: an admission decided against rules a heartbeat has since changed takes the
+    /// rules that heartbeat applied - it is never admitted by a rule the heartbeat removed.
+    #[tokio::test]
+    async fn an_admission_overlapping_a_heartbeat_takes_the_rules_it_applied() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let table = flow_table();
+        // The heartbeat removed port 443 after the store was read (simulated: store still has it).
+        table.lock().unwrap().update_rules(
+            "gw-1",
+            &[PortRule {
+                transport: crate::dto::RuleTransport::Tcp,
+                external_port: 22,
+                internal_host: "10.0.0.5".to_string(),
+                internal_port: 22,
+            }],
+        );
+        let mut request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+        request.transport = Some("tcp".to_string());
+        request.gateway_address = Some("10.99.0.3".to_string());
+        request.destination_port = Some(443);
+
+        handle_flow_admission(&store, &audit_log, &table, request).await;
+
+        let admitted = flow_admitted_entry(dir.path()).await;
+        assert!(admitted.get("port_rule").is_none());
+        assert_eq!(
+            admitted["warning"],
+            "no single port rule serves the flow's transport and port"
+        );
+    }
+
+    /// Without a single serving rule there is no rule to name, so the entry says why.
+    #[tokio::test]
+    async fn an_admitted_flow_on_a_port_with_no_rule_records_a_warning() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let mut request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+        request.transport = Some("tcp".to_string());
+        request.gateway_address = Some("10.99.0.3".to_string());
+        request.destination_port = Some(8080);
+
+        handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        let admitted = flow_admitted_entry(dir.path()).await;
+        assert!(admitted.get("port_rule").is_none());
+        assert_eq!(
+            admitted["warning"],
+            "no single port rule serves the flow's transport and port"
+        );
     }
 
     #[tokio::test]

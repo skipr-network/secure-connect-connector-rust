@@ -34,7 +34,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use crate::dto::PolicyBundleEndpoint;
+use crate::dto::{PortRule, RuleTransport};
 
 /// How long a decrypted packet dropped for `ForwardOutcome::NotAdmitted` stays buffered, waiting
 /// for its own flow's admission decision to arrive (see `pending_packets`'s doc). Gatekeeper
@@ -138,10 +140,12 @@ struct Allocation {
 /// How to forward one decrypted packet (`FlowTable::forward`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Forwarding {
-    /// Rewrite the destination to `address` (the dialled port is unchanged) and, for a flow with its
-    /// dialled identity, the source port to `source_port` (TT-2639).
+    /// Rewrite the destination to `address`, its port to `destination_port` when the matched rule
+    /// translates it (TT-2514), and, for a flow with its dialled identity, the source port to
+    /// `source_port` (TT-2639).
     Forward {
         address: Ipv4Addr,
+        destination_port: Option<u16>,
         source_port: Option<u16>,
     },
     /// No admitted flow may carry it: hold it briefly in case its own admission is in flight
@@ -206,15 +210,14 @@ struct AdmittedFlow {
     /// flows on this gateway" without anything Gatekeeper's release contract
     /// already carries (`flow_id`/`port` alone can't answer "which user").
     device_public_key: String,
-    /// The entitled gateway's configured internal endpoints, from the same
-    /// `PolicyBundle.endpoints` `AccessDecision::Allowed` already resolved at
-    /// admission time (TT-2046). Being admitted only proves the device is
+    /// The entitled gateway's port rules (TT-2514; its endpoints before that, TT-2046), from the
+    /// same `PolicyBundle::rules` `AccessDecision::Allowed` already resolved at admission time. Being admitted only proves the device is
     /// entitled to this *gateway* - it says nothing about which internal
     /// address the gateway is actually configured to expose. `forward` uses this
     /// both to refuse a packet outright and to know what address to rewrite an
     /// allowed one to - the address the packet already carries on arrival is
     /// never the real endpoint, so nothing downstream can work at all without this.
-    endpoints: Vec<PolicyBundleEndpoint>,
+    rules: Vec<PortRule>,
     /// The fake/virtual destination address this flow's packets actually arrive addressed to
     /// (Gatekeeper's invented per-gateway address). A flow admitted with its dialled identity has it
     /// from admission (TT-2639); for a flow from a node that predates the identity it is learned
@@ -237,7 +240,9 @@ struct AdmittedFlow {
 /// makes them indistinguishable on-call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardOutcome {
-    /// Resolved to a real address - rewrite the packet's destination to this and forward it.
+    /// Resolved to a real address - only `forward_target`, kept for the tests, still returns it;
+    /// production code gets `Forwarding::Forward`.
+    #[cfg_attr(not(test), allow(dead_code))]
     Forward(Ipv4Addr),
     /// No admitted flow at all for `(node_id, port)` - a security event: decrypting successfully
     /// proves the packet came from a genuine node tunnel, but says nothing about whether
@@ -246,16 +251,20 @@ pub enum ForwardOutcome {
     /// the tests, still returns it.
     #[cfg_attr(not(test), allow(dead_code))]
     NotAdmitted,
-    /// Admitted, but none of the gateway's configured endpoints exposes the packet's destination
-    /// port - misconfiguration or probing, not a security event.
+    /// Admitted, but no port rule of the gateway opens the packet's transport and destination port
+    /// (TT-2514; its endpoints before that) - misconfiguration or probing, not a security event.
     PortNotConfigured,
-    /// Admitted and the port matches, but more than one of the gateway's configured endpoints
-    /// shares that port - genuinely ambiguous which one the client meant, not something to guess
+    /// Admitted, but more than one port rule opens the packet's transport and port (Portal allows
+    /// only one; endpoints sharing a port did before TT-2514) - genuinely ambiguous which one the client meant, not something to guess
     /// at (matches `node_for_port`'s own precedent for the same shape of ambiguity: refuse, don't
     /// silently pick one).
     AmbiguousEndpoint,
-    /// Admitted, the port matches exactly one endpoint, but `dns_cache` has no resolved address
-    /// for its host (TT-2066) - a literal IPv4 always resolves, so this only happens for a
+    /// TT-2514: admitted, but the matching rule forwards to a different internal port and the flow
+    /// came from a node that predates the dialled identity (TT-2639) - its replies could not get the
+    /// dialled port back, so it is only served by rules with equal ports.
+    PortTranslationNeedsUpdatedNode,
+    /// Admitted, exactly one port rule matches, but `dns_cache` has no resolved address for its
+    /// internal host (TT-2066) - a literal IPv4 always resolves, so this only happens for a
     /// hostname that hasn't been looked up yet, has failed every refresh so far, or was evicted
     /// after too many consecutive failures (`dns_cache::MAX_CONSECUTIVE_FAILURES`). Silently
     /// black-holes every packet for that gateway until it resolves, so this needs its own loud,
@@ -341,6 +350,11 @@ pub struct FlowTable {
     /// node a flow admitted without the identity (before the update) is used only by packets to the
     /// gateway address it was first seen with (`legacy_flow_accepts`).
     dialled_nodes: HashSet<String>,
+    /// TT-2514 review: each gateway's port rules as the latest heartbeat applied them
+    /// (`update_rules`). An admission decided against the policy store just before a heartbeat
+    /// changed them takes these instead (`current_rules`), under the same lock, so it never admits
+    /// a flow by a rule that heartbeat removed.
+    gateway_rules: HashMap<String, Vec<PortRule>>,
 }
 
 /// How many distinct control-channel connections' worth of routing state to remember at once
@@ -439,7 +453,7 @@ impl FlowTable {
         gateway_id: String,
         flow_id: String,
         device_public_key: String,
-        endpoints: Vec<PolicyBundleEndpoint>,
+        rules: Vec<PortRule>,
     ) {
         let key = FlowKey {
             node_id,
@@ -464,7 +478,7 @@ impl FlowTable {
                 gateway_id,
                 flow_id,
                 device_public_key,
-                endpoints,
+                rules,
                 virtual_address: dialled.map(|dialled| dialled.gateway_address),
                 allocation: None,
             },
@@ -566,8 +580,9 @@ impl FlowTable {
         })
     }
 
-    /// Refreshes every currently-admitted flow's remembered endpoint list for one gateway to this
-    /// heartbeat's freshly-applied configuration (TT-2046 review finding #4): endpoints are
+    /// Refreshes every currently-admitted flow's remembered port rules (its endpoints before TT-2514)
+    /// for one gateway to this heartbeat's freshly-applied configuration (TT-2046 review finding
+    /// #4): they are
     /// otherwise only ever snapshotted once, at `admit` time, so an admin repointing or removing an
     /// endpoint on a gateway with an open flow was silently ignored - `forward_target` kept using
     /// the stale list - for as long as that flow stayed open. Mirrors `main::
@@ -576,12 +591,25 @@ impl FlowTable {
     /// gateway is configured to expose *now*, not what it exposed when the flow was admitted. A
     /// no-op for a gateway with no currently-admitted flow, or one whose endpoint list didn't
     /// change - both normal, expected cases, not something to log.
-    pub fn update_endpoints(&mut self, gateway_id: &str, endpoints: &[PolicyBundleEndpoint]) {
+    pub fn update_rules(&mut self, gateway_id: &str, rules: &[PortRule]) {
+        self.gateway_rules
+            .insert(gateway_id.to_string(), rules.to_vec());
         for flow in self.flows.values_mut() {
             if flow.gateway_id == gateway_id {
-                flow.endpoints = endpoints.to_vec();
+                flow.rules = rules.to_vec();
             }
         }
+    }
+
+    /// The gateway's port rules as the latest heartbeat applied them, if one has - see
+    /// `gateway_rules`.
+    pub fn current_rules(&self, gateway_id: &str) -> Option<&[PortRule]> {
+        self.gateway_rules.get(gateway_id).map(Vec::as_slice)
+    }
+
+    /// Forgets the rules of gateways the latest heartbeat no longer lists.
+    pub fn retain_gateway_rules(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.gateway_rules.retain(|gateway_id, _| keep(gateway_id));
     }
 
     fn deindex(&mut self, node_id: &str, port: u16) {
@@ -614,17 +642,19 @@ impl FlowTable {
     /// #1; TT-2046; TT-2639): `dialled` is the packet's own identity when it can be read - its
     /// transport, its destination address (the gateway it was addressed to) and `destination_port`.
     ///
-    /// 1. A flow admitted with exactly that identity: forwarded to its internal endpoint with its
+    /// 1. A flow admitted with exactly that identity: forwarded to its rule's internal address and
+    ///    port with its
     ///    allocated source port (allocated on the first packet, or moved if the internal address
     ///    changed), so a packet addressed to one gateway can never match another gateway's flow.
     /// 2. Otherwise a flow admitted on `(node_id, port)` without an identity - only if the
     ///    transition rule allows it (`legacy_flow_accepts`): on an updated node it must have been
     ///    first seen with this packet's gateway address. Forwarded with the source port unchanged,
-    ///    and the gateway address recorded for its replies.
+    ///    and the gateway address recorded for its replies - by a rule with equal ports only, since
+    ///    its replies never get a port back (TT-2514).
     /// 3. Otherwise `NotAdmitted`: the caller holds the packet briefly for its own admission.
     ///
-    /// The endpoint is matched by `destination_port` alone and resolved via `dns_cache` - see
-    /// `resolve_endpoint`.
+    /// The rule is matched by transport and `destination_port` and resolved via `dns_cache` - see
+    /// `resolve_rule`.
     pub fn forward(
         &mut self,
         node_id: &str,
@@ -645,25 +675,31 @@ impl FlowTable {
         let Some(flow) = self.flows.get_mut(&FlowKey::new(node_id, port, None)) else {
             return Forwarding::NotAdmitted;
         };
-        match resolve_endpoint(&flow.endpoints, destination_port, dns_cache) {
-            ForwardOutcome::Forward(address) => {
+        let transport = dialled.map(|packet_dialled| packet_dialled.transport);
+        match resolve_rule(&flow.rules, transport, destination_port, dns_cache) {
+            // Its replies are only given the gateway address back, never a port (TT-2639), so a
+            // rule that translates the port can't serve it (TT-2514).
+            Ok((_, internal_port)) if internal_port != destination_port => {
+                Forwarding::Refused(ForwardOutcome::PortTranslationNeedsUpdatedNode)
+            }
+            Ok((address, _)) => {
                 if let Some(packet_dialled) = dialled {
                     flow.virtual_address = Some(packet_dialled.gateway_address);
                 }
                 Forwarding::Forward {
                     address,
+                    destination_port: None,
                     source_port: None,
                 }
             }
-            ForwardOutcome::NotAdmitted => Forwarding::NotAdmitted,
-            refused => Forwarding::Refused(refused),
+            Err(refused) => Forwarding::Refused(refused),
         }
     }
 
-    /// `forward` for a flow admitted with its dialled identity: resolves its internal endpoint and
-    /// returns the source port its packets carry there, allocating one - unique among this
-    /// Connector's flows to that internal host:port on that transport - on the first packet or once
-    /// the internal address has changed (an endpoint update or a new DNS answer), freeing any
+    /// `forward` for a flow admitted with its dialled identity: resolves its rule's internal address
+    /// and port and returns the source port its packets carry there, allocating one - unique among
+    /// this Connector's flows to that internal host:port on that transport - on the first packet or
+    /// once the internal address or port has changed (a rule update or a new DNS answer), freeing any
     /// previous one.
     fn forward_with_identity(
         &mut self,
@@ -674,16 +710,25 @@ impl FlowTable {
         let Some(flow) = self.flows.get_mut(&key) else {
             return Forwarding::NotAdmitted;
         };
-        let address = match resolve_endpoint(&flow.endpoints, dialled.destination_port, dns_cache) {
-            ForwardOutcome::Forward(address) => address,
-            refused => return Forwarding::Refused(refused),
+        let (address, internal_port) = match resolve_rule(
+            &flow.rules,
+            Some(dialled.transport),
+            dialled.destination_port,
+            dns_cache,
+        ) {
+            Ok(resolved) => resolved,
+            Err(refused) => return Forwarding::Refused(refused),
         };
-        let target = (address, dialled.destination_port);
+        // The source port is unique per internal host:port (TT-2639) - the rule's internal port,
+        // which a reply comes from, not the dialled one (TT-2514).
+        let target = (address, internal_port);
+        let destination_port = (internal_port != dialled.destination_port).then_some(internal_port);
         if let Some(allocation) = flow.allocation
             && allocation.target == target
         {
             return Forwarding::Forward {
                 address,
+                destination_port,
                 source_port: Some(allocation.port),
             };
         }
@@ -714,6 +759,7 @@ impl FlowTable {
             .insert((transport, target.0, target.1, source_port), key);
         Forwarding::Forward {
             address,
+            destination_port,
             source_port: Some(source_port),
         }
     }
@@ -930,6 +976,11 @@ impl FlowTable {
 /// wrappers over the single mechanism above, so the same tests keep checking unchanged behaviour.
 #[cfg(test)]
 impl FlowTable {
+    pub fn update_endpoints(&mut self, gateway_id: &str, endpoints: &[PolicyBundleEndpoint]) {
+        let rules: Vec<PortRule> = endpoints.iter().map(PortRule::from).collect();
+        self.update_rules(gateway_id, &rules);
+    }
+
     pub fn admit(
         &mut self,
         node_id: String,
@@ -946,7 +997,7 @@ impl FlowTable {
             gateway_id,
             flow_id,
             device_public_key,
-            endpoints,
+            endpoints.iter().map(PortRule::from).collect(),
         );
     }
 
@@ -968,7 +1019,7 @@ impl FlowTable {
             gateway_id,
             flow_id,
             device_public_key,
-            endpoints,
+            endpoints.iter().map(PortRule::from).collect(),
         );
     }
 
@@ -1012,7 +1063,10 @@ impl FlowTable {
         let Some(flow) = self.flows.get(&FlowKey::new(node_id, port, None)) else {
             return ForwardOutcome::NotAdmitted;
         };
-        resolve_endpoint(&flow.endpoints, packet_destination_port, dns_cache)
+        match resolve_rule(&flow.rules, None, packet_destination_port, dns_cache) {
+            Ok((address, _)) => ForwardOutcome::Forward(address),
+            Err(refused) => refused,
+        }
     }
 
     /// `forward` for exactly a flow admitted with this dialled identity; `None` if there is none.
@@ -1031,6 +1085,7 @@ impl FlowTable {
             Forwarding::Forward {
                 address,
                 source_port: Some(source_port),
+                ..
             } => DialledForward::Forward {
                 address,
                 source_port,
@@ -1116,24 +1171,61 @@ impl FlowTable {
     }
 }
 
-/// Which configured endpoint a packet to `destination_port` goes to, resolved to an address -
-/// shared by `forward_target` and `dialled_forward_target`; see `forward_target`'s doc.
-fn resolve_endpoint(
-    endpoints: &[PolicyBundleEndpoint],
+/// Whether a rule opens `transport`; an unknown transport - a packet whose transport could not be
+/// read - is only covered by a rule opening both.
+fn rule_opens(rule: &RuleTransport, transport: Option<Transport>) -> bool {
+    matches!(
+        (rule, transport),
+        (RuleTransport::TcpUdp, _)
+            | (RuleTransport::Tcp, Some(Transport::Tcp))
+            | (RuleTransport::Udp, Some(Transport::Udp))
+    )
+}
+
+/// The one rule serving `transport` to `destination_port`, or `None` when no rule or more than one
+/// matches - what `resolve_rule` forwards by, before resolving its host. Used to name a flow's rule
+/// in the logs at admission (TT-2514).
+pub fn matching_rule(
+    rules: &[PortRule],
+    transport: Option<Transport>,
+    destination_port: u16,
+) -> Option<&PortRule> {
+    let mut matching = rules.iter().filter(|rule| {
+        rule.external_port == destination_port && rule_opens(&rule.transport, transport)
+    });
+    match (matching.next(), matching.next()) {
+        (Some(rule), None) => Some(rule),
+        _ => None,
+    }
+}
+
+/// The rule a packet on `transport` to `destination_port` is served by, resolved to its internal
+/// address and port (TT-2514; endpoints matched by port alone before that, TT-2046). Matched by
+/// transport and the dialled port, never by the packet's destination address, which on arrival is
+/// the gateway address, not anything internal. Portal allows one rule per transport and external
+/// port; if a bundle still carries two that both match, that's `AmbiguousEndpoint` - refused, never
+/// guessed (TT-2046 review finding #3). The internal host is resolved via `dns_cache` (TT-2066) -
+/// a literal IPv4 resolves to itself, a hostname to its last successful lookup, otherwise
+/// `HostUnresolved`.
+fn resolve_rule(
+    rules: &[PortRule],
+    transport: Option<Transport>,
     destination_port: u16,
     dns_cache: &crate::dns_cache::DnsCache,
-) -> ForwardOutcome {
-    let matching: Vec<&PolicyBundleEndpoint> = endpoints
+) -> Result<(Ipv4Addr, u16), ForwardOutcome> {
+    let matching: Vec<&PortRule> = rules
         .iter()
-        .filter(|endpoint| endpoint.port == destination_port)
+        .filter(|rule| {
+            rule.external_port == destination_port && rule_opens(&rule.transport, transport)
+        })
         .collect();
     match matching.as_slice() {
-        [] => ForwardOutcome::PortNotConfigured,
-        [endpoint] => match dns_cache.resolve(&endpoint.host) {
-            Some(ip) => ForwardOutcome::Forward(ip),
-            None => ForwardOutcome::HostUnresolved,
-        },
-        _ => ForwardOutcome::AmbiguousEndpoint,
+        [] => Err(ForwardOutcome::PortNotConfigured),
+        [rule] => dns_cache
+            .resolve(&rule.internal_host)
+            .map(|address| (address, rule.internal_port))
+            .ok_or(ForwardOutcome::HostUnresolved),
+        _ => Err(ForwardOutcome::AmbiguousEndpoint),
     }
 }
 
@@ -2791,5 +2883,420 @@ mod tests {
         admit_legacy(&mut table, "n-1", 40100, "gw-erp");
 
         assert!(table.legacy_flow_accepts("n-1", 40100, ERP));
+    }
+
+    // --- TT-2514: port rules - selected by transport and dialled port, port rewritten ---
+
+    fn rule(
+        transport: RuleTransport,
+        external_port: u16,
+        host: Ipv4Addr,
+        internal_port: u16,
+    ) -> PortRule {
+        PortRule {
+            transport,
+            external_port,
+            internal_host: host.to_string(),
+            internal_port,
+        }
+    }
+
+    fn admit_with_rules(
+        table: &mut FlowTable,
+        port: u16,
+        dialled: Option<Dialled>,
+        rules: Vec<PortRule>,
+    ) {
+        table.admit_flow(
+            "n-1".to_string(),
+            port,
+            dialled,
+            "gw-erp".to_string(),
+            format!("flow-{port}"),
+            "dev-1".to_string(),
+            rules,
+        );
+    }
+
+    fn forward_packet(table: &mut FlowTable, port: u16, dialled: Dialled) -> Forwarding {
+        table.forward(
+            "n-1",
+            port,
+            Some(dialled),
+            dialled.destination_port,
+            &crate::dns_cache::DnsCache::new(),
+        )
+    }
+
+    #[test]
+    fn a_translated_rule_forwards_to_its_internal_port_and_a_reply_gets_the_dialled_port_back() {
+        let mut table = FlowTable::new();
+        let https = dialled(Transport::Tcp, ERP, 443);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(https),
+            vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 8443)],
+        );
+
+        let Forwarding::Forward {
+            address,
+            destination_port,
+            source_port: Some(source_port),
+        } = forward_packet(&mut table, 40100, https)
+        else {
+            panic!("expected a forward");
+        };
+
+        assert_eq!(address, ERP_HOST);
+        assert_eq!(destination_port, Some(8443));
+        // The reply comes from the internal port, and goes back as the dialled one.
+        assert_eq!(
+            table.route_reply(
+                Some(Transport::Tcp),
+                Some(ERP_HOST),
+                Some(8443),
+                source_port
+            ),
+            Ok(ReplyRoute::Restore {
+                node_id: "n-1".to_string(),
+                source: ERP,
+                source_port: Some(443),
+                destination_port: Some(40100),
+            })
+        );
+        assert_eq!(
+            table.route_reply(Some(Transport::Tcp), Some(ERP_HOST), Some(443), source_port),
+            Err(ReplyMiss::NoFlow),
+            "a reply from the dialled port is not from the rule's service"
+        );
+    }
+
+    #[test]
+    fn a_rule_with_equal_ports_does_not_rewrite_the_port() {
+        let mut table = FlowTable::new();
+        let to = dialled(Transport::Udp, ERP, 514);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(to),
+            vec![rule(RuleTransport::TcpUdp, 514, ERP_HOST, 514)],
+        );
+
+        assert!(matches!(
+            forward_packet(&mut table, 40100, to),
+            Forwarding::Forward {
+                address: ERP_HOST,
+                destination_port: None,
+                source_port: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_rule_only_serves_the_transports_it_opens() {
+        let rules = vec![
+            rule(RuleTransport::Tcp, 22, ERP_HOST, 22),
+            rule(RuleTransport::Udp, 514, FIN_HOST, 514),
+        ];
+        let cases = [
+            (Transport::Tcp, 22, true),
+            (Transport::Udp, 22, false),
+            (Transport::Udp, 514, true),
+            (Transport::Tcp, 514, false),
+        ];
+        for (index, (transport, port, forwarded)) in cases.into_iter().enumerate() {
+            let mut table = FlowTable::new();
+            let to = dialled(transport, ERP, port);
+            admit_with_rules(&mut table, 40100 + index as u16, Some(to), rules.clone());
+
+            let outcome = forward_packet(&mut table, 40100 + index as u16, to);
+
+            if forwarded {
+                assert!(
+                    matches!(outcome, Forwarding::Forward { .. }),
+                    "{transport:?} {port}: {outcome:?}"
+                );
+            } else {
+                assert_eq!(
+                    outcome,
+                    Forwarding::Refused(ForwardOutcome::PortNotConfigured),
+                    "{transport:?} {port}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_rules_of_one_gateway_lead_to_their_own_hosts_and_ports() {
+        let mut table = FlowTable::new();
+        let rules = vec![
+            rule(RuleTransport::Tcp, 443, ERP_HOST, 8443),
+            rule(RuleTransport::Tcp, 2222, FIN_HOST, 22),
+        ];
+        let web = dialled(Transport::Tcp, ERP, 443);
+        let ssh = dialled(Transport::Tcp, ERP, 2222);
+        admit_with_rules(&mut table, 40100, Some(web), rules.clone());
+        admit_with_rules(&mut table, 40101, Some(ssh), rules);
+
+        assert!(matches!(
+            forward_packet(&mut table, 40100, web),
+            Forwarding::Forward {
+                address: ERP_HOST,
+                destination_port: Some(8443),
+                ..
+            }
+        ));
+        assert!(matches!(
+            forward_packet(&mut table, 40101, ssh),
+            Forwarding::Forward {
+                address: FIN_HOST,
+                destination_port: Some(22),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rules_that_both_match_are_refused_rather_than_guessed() {
+        let mut table = FlowTable::new();
+        let rules = vec![
+            rule(RuleTransport::Tcp, 443, ERP_HOST, 443),
+            rule(RuleTransport::TcpUdp, 443, FIN_HOST, 443),
+        ];
+        let tcp = dialled(Transport::Tcp, ERP, 443);
+        let udp = dialled(Transport::Udp, ERP, 443);
+        admit_with_rules(&mut table, 40100, Some(tcp), rules.clone());
+        admit_with_rules(&mut table, 40101, Some(udp), rules);
+
+        assert_eq!(
+            forward_packet(&mut table, 40100, tcp),
+            Forwarding::Refused(ForwardOutcome::AmbiguousEndpoint)
+        );
+        // Only the TCP + UDP rule opens UDP, so that one is not ambiguous.
+        assert!(matches!(
+            forward_packet(&mut table, 40101, udp),
+            Forwarding::Forward {
+                address: FIN_HOST,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_rule_with_a_transport_this_connector_does_not_know_matches_nothing() {
+        let mut table = FlowTable::new();
+        let to = dialled(Transport::Tcp, ERP, 443);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(to),
+            vec![rule(
+                RuleTransport::Unknown("SCTP".to_string()),
+                443,
+                ERP_HOST,
+                443,
+            )],
+        );
+
+        assert_eq!(
+            forward_packet(&mut table, 40100, to),
+            Forwarding::Refused(ForwardOutcome::PortNotConfigured)
+        );
+    }
+
+    /// A flow from a node that predates the dialled identity gets only the gateway address back on
+    /// its replies, never a port - so it is served by rules with equal ports only.
+    #[test]
+    fn a_flow_without_a_dialled_identity_is_served_only_by_rules_with_equal_ports() {
+        let mut table = FlowTable::new();
+        admit_with_rules(
+            &mut table,
+            40100,
+            None,
+            vec![
+                rule(RuleTransport::Tcp, 443, ERP_HOST, 8443),
+                rule(RuleTransport::Tcp, 22, ERP_HOST, 22),
+            ],
+        );
+
+        assert_eq!(
+            forward_packet(&mut table, 40100, dialled(Transport::Tcp, ERP, 443)),
+            Forwarding::Refused(ForwardOutcome::PortTranslationNeedsUpdatedNode)
+        );
+        assert_eq!(
+            forward_packet(&mut table, 40100, dialled(Transport::Tcp, ERP, 22)),
+            Forwarding::Forward {
+                address: ERP_HOST,
+                destination_port: None,
+                source_port: None,
+            }
+        );
+    }
+
+    /// A rule change on the next heartbeat reaches an already admitted flow: its packets go to the
+    /// new internal port, with a source port allocated toward that port, and replies follow.
+    #[test]
+    fn a_rule_change_moves_an_admitted_flow_to_the_new_internal_port() {
+        let mut table = FlowTable::new();
+        let https = dialled(Transport::Tcp, ERP, 443);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(https),
+            vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 8443)],
+        );
+        let Forwarding::Forward {
+            source_port: Some(before),
+            ..
+        } = forward_packet(&mut table, 40100, https)
+        else {
+            panic!("expected a forward");
+        };
+
+        table.update_rules("gw-erp", &[rule(RuleTransport::Tcp, 443, ERP_HOST, 9443)]);
+        let Forwarding::Forward {
+            destination_port: Some(9443),
+            source_port: Some(after),
+            ..
+        } = forward_packet(&mut table, 40100, https)
+        else {
+            panic!("expected a forward to 9443");
+        };
+
+        assert!(
+            table
+                .route_reply(Some(Transport::Tcp), Some(ERP_HOST), Some(9443), after)
+                .is_ok()
+        );
+        assert_eq!(
+            table.route_reply(Some(Transport::Tcp), Some(ERP_HOST), Some(8443), before),
+            Err(ReplyMiss::NoFlow),
+            "the old allocation toward 8443 is freed"
+        );
+
+        table.update_rules("gw-erp", &[]);
+        assert_eq!(
+            forward_packet(&mut table, 40100, https),
+            Forwarding::Refused(ForwardOutcome::PortNotConfigured)
+        );
+    }
+
+    /// GW-INV-8 with translated ports: two gateways on one Connector, both with a TCP 443 rule to
+    /// different internal services, dialled from the same node and translated port, stay apart.
+    #[test]
+    fn two_gateways_with_translated_rules_on_one_port_stay_apart() {
+        let mut table = FlowTable::new();
+        let erp = dialled(Transport::Tcp, ERP, 443);
+        let fin = dialled(Transport::Tcp, FIN, 443);
+        table.admit_flow(
+            "n-1".to_string(),
+            40100,
+            Some(erp),
+            "gw-erp".to_string(),
+            "flow-erp".to_string(),
+            "dev-1".to_string(),
+            vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 8443)],
+        );
+        table.admit_flow(
+            "n-1".to_string(),
+            40100,
+            Some(fin),
+            "gw-fin".to_string(),
+            "flow-fin".to_string(),
+            "dev-2".to_string(),
+            vec![rule(RuleTransport::Tcp, 443, FIN_HOST, 9443)],
+        );
+
+        let Forwarding::Forward {
+            address: erp_host,
+            destination_port: Some(8443),
+            source_port: Some(erp_port),
+        } = forward_packet(&mut table, 40100, erp)
+        else {
+            panic!("expected ERP forward");
+        };
+        let Forwarding::Forward {
+            address: fin_host,
+            destination_port: Some(9443),
+            source_port: Some(fin_port),
+        } = forward_packet(&mut table, 40100, fin)
+        else {
+            panic!("expected FIN forward");
+        };
+
+        assert_eq!((erp_host, fin_host), (ERP_HOST, FIN_HOST));
+        assert!(matches!(
+            table.route_reply(Some(Transport::Tcp), Some(ERP_HOST), Some(8443), erp_port),
+            Ok(ReplyRoute::Restore {
+                source: ERP,
+                source_port: Some(443),
+                ..
+            })
+        ));
+        assert!(matches!(
+            table.route_reply(Some(Transport::Tcp), Some(FIN_HOST), Some(9443), fin_port),
+            Ok(ReplyRoute::Restore {
+                source: FIN,
+                source_port: Some(443),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn matching_rule_names_the_one_rule_a_flow_uses_and_nothing_when_none_or_two_match() {
+        let rules = vec![
+            rule(RuleTransport::Tcp, 443, ERP_HOST, 8443),
+            rule(RuleTransport::TcpUdp, 53, ERP_HOST, 53),
+            rule(RuleTransport::Udp, 53, FIN_HOST, 53),
+        ];
+
+        assert_eq!(
+            matching_rule(&rules, Some(Transport::Tcp), 443).map(ToString::to_string),
+            Some("TCP 443 -> 172.31.4.176:8443".to_string())
+        );
+        assert_eq!(matching_rule(&rules, Some(Transport::Udp), 443), None);
+        assert_eq!(
+            matching_rule(&rules, Some(Transport::Udp), 53),
+            None,
+            "two rules open UDP 53"
+        );
+        assert_eq!(
+            matching_rule(&rules, Some(Transport::Tcp), 53).map(ToString::to_string),
+            Some("TCP+UDP 53 -> 172.31.4.176:53".to_string())
+        );
+    }
+
+    /// A gateway's address may be the internal service's own address (TT-2529 lets Portal assign
+    /// one): forwarding and the reply still work, with only the port translated.
+    #[test]
+    fn a_gateway_whose_address_is_the_internal_host_is_relayed_both_ways() {
+        let mut table = FlowTable::new();
+        let to = dialled(Transport::Tcp, ERP_HOST, 443);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(to),
+            vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 8443)],
+        );
+
+        let Forwarding::Forward {
+            address: ERP_HOST,
+            destination_port: Some(8443),
+            source_port: Some(allocated),
+        } = forward_packet(&mut table, 40100, to)
+        else {
+            panic!("expected a forward to the same address on the internal port");
+        };
+        assert_eq!(
+            table.route_reply(Some(Transport::Tcp), Some(ERP_HOST), Some(8443), allocated),
+            Ok(ReplyRoute::Restore {
+                node_id: "n-1".to_string(),
+                source: ERP_HOST,
+                source_port: Some(443),
+                destination_port: Some(40100),
+            })
+        );
     }
 }
