@@ -24,6 +24,27 @@ pub enum AuditEvent {
     PolicyRejected {
         reason: String,
     },
+    /// TT-2520 (spec §B.10): the effective configuration one gateway's policy bundle carried took
+    /// effect - written when it is first applied or changes, so the entry's timestamp is when that
+    /// configuration came into force: its location, hostname and the port rules the Connector
+    /// forwards by (TT-2514) - for a bundle that predates them, its endpoints as TCP + UDP rules
+    /// with equal ports (`PolicyBundle::rules`).
+    PolicyBundleApplied {
+        gateway_id: String,
+        location: String,
+        hostname: String,
+        /// Each as transport, external port, internal host and internal port.
+        port_rules: Vec<crate::dto::PortRule>,
+    },
+    /// TT-2520 (spec §B.10): one gateway's entitlement list as received on an accepted heartbeat -
+    /// written on every heartbeat, not only on change. Recorded as its entry count and a SHA-256
+    /// of the list (the spec allows a hash) rather than the list itself, which at the default 60 s
+    /// heartbeat would grow the log by the full list every minute.
+    EntitlementListReceived {
+        gateway_id: String,
+        entitlement_count: usize,
+        entitlement_list_sha256: String,
+    },
     AccessAllowed {
         gateway_id: String,
         /// From the matched Entitlement row, never a caller-supplied value -

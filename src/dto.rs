@@ -162,7 +162,7 @@ fn deserialize_port_rules<'de, D: serde::Deserializer<'de>>(
 
 /// One port a gateway opens and where it leads (TT-2514): a flow on `transport` to the gateway's
 /// `external_port` is forwarded to `internal_host:internal_port`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PortRule {
     pub transport: RuleTransport,
     pub external_port: u16,
