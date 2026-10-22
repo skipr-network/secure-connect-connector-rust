@@ -77,6 +77,15 @@ pub enum AuditEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
     },
+    /// TT-3449 (spec §B.8, §B.10): a heartbeat's rule refresh ended these flows of one gateway because
+    /// no port rule serves them any more. A configuration change, not a withdrawal of access, so no
+    /// gateway-end report is queued for them (spec §B.18).
+    FlowsEndedByRuleChange {
+        gateway_id: String,
+        flows_ended: usize,
+        /// Each as flow id and device key.
+        flows: Vec<EndedFlow>,
+    },
     /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
     /// to this gateway, and a gateway-end report was queued for it.
     FlowsEnded {
@@ -86,6 +95,13 @@ pub enum AuditEvent {
         flows_ended: usize,
         report_id: String,
     },
+}
+
+/// One flow in a `FlowsEndedByRuleChange` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EndedFlow {
+    pub flow_id: String,
+    pub device_public_key: String,
 }
 
 #[derive(Debug, Serialize)]

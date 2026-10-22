@@ -34,7 +34,7 @@ use policy::PolicyStore;
 use registry_client::RegistryClient;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tunnel::{TunnelEvent, TunnelManager};
 
 /// Explicit CLI modes - checked before tracing init or `Config::from_env` (TT-1886). Matches argv
@@ -564,7 +564,11 @@ async fn run_heartbeat(
         );
         queue_gateway_end_reports(reports, audit_log, gateway_end_queue).await;
     }
-    reconcile_endpoint_changes(flow_table, &new_bundles);
+    for event in reconcile_endpoint_changes(flow_table, &new_bundles) {
+        if let Err(error) = audit_log.record(event).await {
+            error!(%error, "failed to write rule-change flows-ended audit entry");
+        }
+    }
 
     // TT-2066: re-resolve every currently-configured endpoint hostname off this same heartbeat
     // cycle - new_bundles is the full, current set of every attached gateway's endpoints, so this
@@ -758,19 +762,43 @@ fn entitlement_list_sha256(entitlements: &[dto::Entitlement]) -> String {
 /// its own. Runs every heartbeat, independent of `old_bundles` (there's no diffing to do - this
 /// just always brings `flow_table` up to date with the latest configured rules, a no-op for any
 /// gateway with nothing currently admitted). See `FlowTable::update_rules`.
+///
+/// TT-3449: returns one audit entry per gateway whose refreshed rules ended open flows (spec §B.10);
+/// no gateway-end report is queued for them (§B.18).
 fn reconcile_endpoint_changes(
     flow_table: &std::sync::Mutex<FlowTable>,
     new_bundles: &[PolicyBundle],
-) {
+) -> Vec<AuditEvent> {
     let mut table = flow_table.lock().expect("flow table lock poisoned");
     table.retain_gateway_rules(|gateway_id| {
         new_bundles
             .iter()
             .any(|bundle| bundle.gateway_id == gateway_id)
     });
+    let mut events = Vec::new();
     for bundle in new_bundles {
-        table.update_rules(&bundle.gateway_id, &bundle.rules());
+        let ended = table.update_rules(&bundle.gateway_id, &bundle.rules());
+        if ended.is_empty() {
+            continue;
+        }
+        info!(
+            gateway_id = %bundle.gateway_id,
+            flows_ended = ended.len(),
+            "port rule removed: ended the open flow(s) it served"
+        );
+        events.push(AuditEvent::FlowsEndedByRuleChange {
+            gateway_id: bundle.gateway_id.clone(),
+            flows_ended: ended.len(),
+            flows: ended
+                .into_iter()
+                .map(|flow| audit::EndedFlow {
+                    flow_id: flow.flow_id,
+                    device_public_key: flow.device_public_key,
+                })
+                .collect(),
+        });
     }
+    events
 }
 
 /// Syncs the tunnel set to this heartbeat's node list, then kicks off a
@@ -951,6 +979,14 @@ fn prepare_decrypted_packet_for_forwarding(
             destination_port: internal_port,
             source_port: allocated_port,
         } => (address, internal_port, allocated_port),
+        Forwarding::NotAdmitted
+            if flow_table.is_rule_ended(node_id, source_port, dialled, Instant::now()) =>
+        {
+            // TT-3449: its rule was removed and the flow ended; the user's side keeps sending until it
+            // gives up. Dropped quietly - no admission is coming, so nothing to buffer or warn about.
+            debug!(%node_id, source_port, dst_port, "dropped a packet of a flow its removed port rule ended");
+            return false;
+        }
         Forwarding::NotAdmitted => {
             // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a
             // new flow's raw packets independently of, and often slightly before, the
@@ -3797,6 +3833,53 @@ mod tests {
                 .unwrap()
                 .forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.1".parse().unwrap())
+        );
+    }
+
+    /// TT-3449: a heartbeat whose rules no longer serve an open flow ends it and returns the local
+    /// audit entry naming it; it is a configuration change, so it is not a gateway-end report.
+    #[test]
+    fn reconcile_endpoint_changes_ends_a_flow_whose_rule_was_removed_and_audits_it() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.1".to_string(),
+                port: 443,
+            }],
+        );
+        let dns_cache = dns_cache::DnsCache::new();
+        flow_table
+            .lock()
+            .unwrap()
+            .forward("n-1", 40001, None, 443, &dns_cache);
+
+        let events = reconcile_endpoint_changes(
+            &flow_table,
+            &[bundle_with_endpoint("gw-1", "10.0.0.1", 8443)],
+        );
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AuditEvent::FlowsEndedByRuleChange { gateway_id, flows_ended: 1, flows }
+                if gateway_id == "gw-1"
+                    && flows == &vec![audit::EndedFlow {
+                        flow_id: "flow-1".to_string(),
+                        device_public_key: "dev-A".to_string(),
+                    }]
+        ));
+        assert!(
+            flow_table
+                .lock()
+                .unwrap()
+                .gateway_for("n-1", 40001)
+                .is_none(),
+            "the flow is gone"
         );
     }
 

@@ -61,6 +61,16 @@ const PENDING_PACKET_TTL: Duration = Duration::from_secs(2);
 /// no late admission can still be in flight.
 const RELEASED_FLOW_MEMORY: Duration = Duration::from_secs(30);
 
+/// TT-3449 review: how long a flow ended by a rule change is remembered after its last packet, so the
+/// packets its user's side keeps sending are dropped quietly instead of each one being buffered and
+/// warned about as a new flow awaiting admission. Refreshed by every such packet, so a stream that
+/// keeps sending stays quiet; forgotten once the user's side gives up, or when the flow is admitted again.
+const RULE_ENDED_FLOW_MEMORY: Duration = Duration::from_secs(300);
+
+/// At most this many ended flows are remembered; past it the oldest is forgotten (its packets then
+/// warn again, which is harmless).
+const MAX_RULE_ENDED_FLOWS: usize = 4096;
+
 /// TT-2298: most packets held for a pending admission at once. A longer `PENDING_PACKET_TTL` would
 /// otherwise let a client firing many connections that are never admitted (a port scan, say) keep
 /// that many more packets in memory. When full, a new packet is simply not held - the pre-buffering
@@ -232,6 +242,18 @@ struct AdmittedFlow {
     /// address is only known then (a configured host can be a name still being resolved) - and
     /// replaced if that address changes.
     allocation: Option<Allocation>,
+    /// TT-3449, a flow without a dialled identity only: the transport (when the packet carried it)
+    /// and destination port its first forwarded packet used, so a rule removal can tell whether a
+    /// rule still serves it. `None` until a packet has been forwarded.
+    served: Option<(Option<Transport>, u16)>,
+}
+
+/// A flow `FlowTable::update_rules` ended because its gateway's port rules no longer serve it
+/// (TT-3449).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleEndedFlow {
+    pub flow_id: String,
+    pub device_public_key: String,
 }
 
 /// Why a decrypted packet can or can't be forwarded, returned by `forward_target` instead of a
@@ -355,6 +377,9 @@ pub struct FlowTable {
     /// changed them takes these instead (`current_rules`), under the same lock, so it never admits
     /// a flow by a rule that heartbeat removed.
     gateway_rules: HashMap<String, Vec<PortRule>>,
+    /// TT-3449 review: flows `update_rules` ended, with when a packet of theirs was last seen - see
+    /// `RULE_ENDED_FLOW_MEMORY`.
+    rule_ended_flows: HashMap<FlowKey, Instant>,
 }
 
 /// How many distinct control-channel connections' worth of routing state to remember at once
@@ -461,6 +486,8 @@ impl FlowTable {
             dialled,
         };
         self.remove_flow(&key);
+        // Admitted again (the rule is back, or a new connection reused the ports): no longer ended.
+        self.rule_ended_flows.remove(&key);
         match dialled {
             Some(_) => {
                 self.dialled_nodes.insert(key.node_id.clone());
@@ -481,6 +508,7 @@ impl FlowTable {
                 rules,
                 virtual_address: dialled.map(|dialled| dialled.gateway_address),
                 allocation: None,
+                served: None,
             },
         );
     }
@@ -591,7 +619,16 @@ impl FlowTable {
     /// gateway is configured to expose *now*, not what it exposed when the flow was admitted. A
     /// no-op for a gateway with no currently-admitted flow, or one whose endpoint list didn't
     /// change - both normal, expected cases, not something to log.
-    pub fn update_rules(&mut self, gateway_id: &str, rules: &[PortRule]) {
+    ///
+    /// TT-3449 (spec §B.8): a flow whose rule was removed is ended here and returned, its source port
+    /// freed. Removing a port is a configuration change, not a withdrawal of the user's access, so
+    /// the caller writes the local audit entry and queues no gateway-end report. A flow is still
+    /// served while exactly one rule opens its transport and dialled port; a changed rule (same
+    /// transport and external port, new internal host or port) keeps it, and its allocation moves on
+    /// the next packet. A flow from a node that predates the dialled identity is served only by a
+    /// rule with equal ports, judged by the port its packets used; one that has not forwarded a
+    /// packet yet is left alone.
+    pub fn update_rules(&mut self, gateway_id: &str, rules: &[PortRule]) -> Vec<RuleEndedFlow> {
         self.gateway_rules
             .insert(gateway_id.to_string(), rules.to_vec());
         for flow in self.flows.values_mut() {
@@ -599,6 +636,74 @@ impl FlowTable {
                 flow.rules = rules.to_vec();
             }
         }
+        let ended: Vec<RuleEndedFlow> = self
+            .flows
+            .iter()
+            .filter(|(key, flow)| flow.gateway_id == gateway_id && !still_served(key, flow, rules))
+            .map(|(_, flow)| RuleEndedFlow {
+                flow_id: flow.flow_id.clone(),
+                device_public_key: flow.device_public_key.clone(),
+            })
+            .collect();
+        if !ended.is_empty() {
+            let ended_keys: Vec<FlowKey> = self
+                .flows
+                .iter()
+                .filter(|(key, flow)| {
+                    flow.gateway_id == gateway_id && !still_served(key, flow, rules)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            self.remove_flows_where(|key, flow| {
+                flow.gateway_id == gateway_id && !still_served(key, flow, rules)
+            });
+            let now = Instant::now();
+            for key in ended_keys {
+                self.remember_rule_ended(key, now);
+            }
+        }
+        ended
+    }
+
+    fn remember_rule_ended(&mut self, key: FlowKey, now: Instant) {
+        self.rule_ended_flows
+            .retain(|_, seen| now.duration_since(*seen) <= RULE_ENDED_FLOW_MEMORY);
+        if self.rule_ended_flows.len() >= MAX_RULE_ENDED_FLOWS
+            && let Some(oldest) = self
+                .rule_ended_flows
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(key, _)| key.clone())
+        {
+            self.rule_ended_flows.remove(&oldest);
+        }
+        self.rule_ended_flows.insert(key, now);
+    }
+
+    /// Whether a packet with no admitted flow belongs to a flow a rule change ended (TT-3449 review) -
+    /// such a packet is dropped quietly rather than buffered as a flow awaiting admission. A hit keeps
+    /// the memory alive for another `RULE_ENDED_FLOW_MEMORY`.
+    pub fn is_rule_ended(
+        &mut self,
+        node_id: &str,
+        port: u16,
+        dialled: Option<Dialled>,
+        now: Instant,
+    ) -> bool {
+        let candidates = [
+            FlowKey::new(node_id, port, dialled),
+            FlowKey::new(node_id, port, None),
+        ];
+        for key in candidates {
+            if let Some(seen) = self.rule_ended_flows.get_mut(&key) {
+                if now.duration_since(*seen) <= RULE_ENDED_FLOW_MEMORY {
+                    *seen = now;
+                    return true;
+                }
+                self.rule_ended_flows.remove(&key);
+            }
+        }
+        false
     }
 
     /// The gateway's port rules as the latest heartbeat applied them, if one has - see
@@ -685,6 +790,9 @@ impl FlowTable {
             Ok((address, _)) => {
                 if let Some(packet_dialled) = dialled {
                     flow.virtual_address = Some(packet_dialled.gateway_address);
+                }
+                if flow.served.is_none() {
+                    flow.served = Some((transport, destination_port));
                 }
                 Forwarding::Forward {
                     address,
@@ -1196,6 +1304,19 @@ pub fn matching_rule(
     match (matching.next(), matching.next()) {
         (Some(rule), None) => Some(rule),
         _ => None,
+    }
+}
+
+/// TT-3449: whether `rules` still serve an admitted flow - see `FlowTable::update_rules`.
+fn still_served(key: &FlowKey, flow: &AdmittedFlow, rules: &[PortRule]) -> bool {
+    match (key.dialled, flow.served) {
+        (Some(dialled), _) => {
+            matching_rule(rules, Some(dialled.transport), dialled.destination_port).is_some()
+        }
+        (None, Some((transport, port))) => {
+            matching_rule(rules, transport, port).is_some_and(|rule| rule.internal_port == port)
+        }
+        (None, None) => true,
     }
 }
 
@@ -3175,10 +3296,201 @@ mod tests {
             "the old allocation toward 8443 is freed"
         );
 
-        table.update_rules("gw-erp", &[]);
+        // TT-3449: removing the rule ends the flow, rather than refusing its packets until it times out.
+        assert_eq!(table.update_rules("gw-erp", &[]).len(), 1);
         assert_eq!(
             forward_packet(&mut table, 40100, https),
-            Forwarding::Refused(ForwardOutcome::PortNotConfigured)
+            Forwarding::NotAdmitted
+        );
+    }
+
+    // --- TT-3449: a removed port rule ends the flows it served (spec §B.8) ---
+
+    #[test]
+    fn removing_a_rule_ends_its_flow_frees_its_source_port_and_names_it() {
+        let mut table = FlowTable::new();
+        let https = dialled(Transport::Tcp, ERP, 443);
+        let ssh = dialled(Transport::Tcp, ERP, 22);
+        let rules = vec![
+            rule(RuleTransport::Tcp, 443, ERP_HOST, 8443),
+            rule(RuleTransport::Tcp, 22, ERP_HOST, 22),
+        ];
+        admit_with_rules(&mut table, 40100, Some(https), rules.clone());
+        admit_with_rules(&mut table, 40101, Some(ssh), rules);
+        let Forwarding::Forward {
+            source_port: Some(allocated),
+            ..
+        } = forward_packet(&mut table, 40100, https)
+        else {
+            panic!("expected a forward");
+        };
+
+        let ended = table.update_rules("gw-erp", &[rule(RuleTransport::Tcp, 22, ERP_HOST, 22)]);
+
+        assert_eq!(
+            ended,
+            vec![RuleEndedFlow {
+                flow_id: "flow-40100".to_string(),
+                device_public_key: "dev-1".to_string(),
+            }]
+        );
+        assert_eq!(
+            forward_packet(&mut table, 40100, https),
+            Forwarding::NotAdmitted
+        );
+        assert_eq!(
+            table.route_reply(Some(Transport::Tcp), Some(ERP_HOST), Some(8443), allocated),
+            Err(ReplyMiss::NoFlow),
+            "its source port is freed"
+        );
+        assert!(
+            matches!(
+                forward_packet(&mut table, 40101, ssh),
+                Forwarding::Forward { .. }
+            ),
+            "the flow whose rule stayed is untouched"
+        );
+    }
+
+    /// TT-3449 review: packets the user's side keeps sending after its flow was ended are recognised, so
+    /// they are dropped quietly instead of buffered and warned about as a flow awaiting admission.
+    #[test]
+    fn a_flow_ended_by_a_rule_change_is_remembered_until_idle_or_admitted_again() {
+        let mut table = FlowTable::new();
+        let https = dialled(Transport::Tcp, ERP, 443);
+        let rules = vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 8443)];
+        admit_with_rules(&mut table, 40100, Some(https), rules.clone());
+        let ended_at = Instant::now();
+        table.update_rules("gw-erp", &[]);
+
+        assert!(table.is_rule_ended("n-1", 40100, Some(https), ended_at));
+        assert!(
+            !table.is_rule_ended("n-1", 40101, Some(https), ended_at),
+            "another flow is not one the change ended"
+        );
+        // Every packet keeps the memory alive, so a stream that keeps sending stays quiet.
+        let later = ended_at + RULE_ENDED_FLOW_MEMORY - Duration::from_secs(1);
+        assert!(table.is_rule_ended("n-1", 40100, Some(https), later));
+        assert!(table.is_rule_ended(
+            "n-1",
+            40100,
+            Some(https),
+            later + RULE_ENDED_FLOW_MEMORY - Duration::from_secs(1)
+        ));
+        // Idle past the memory: forgotten.
+        assert!(!table.is_rule_ended(
+            "n-1",
+            40100,
+            Some(https),
+            later + RULE_ENDED_FLOW_MEMORY * 3
+        ));
+
+        // Admitted again: no longer ended.
+        table.update_rules("gw-erp", &rules);
+        admit_with_rules(&mut table, 40100, Some(https), rules.clone());
+        table.update_rules("gw-erp", &[]);
+        admit_with_rules(&mut table, 40100, Some(https), rules);
+        assert!(!table.is_rule_ended("n-1", 40100, Some(https), Instant::now()));
+    }
+
+    /// A changed rule (same transport and external port, new internal address) is not a removal.
+    #[test]
+    fn changing_a_rules_internal_address_keeps_its_flow() {
+        let mut table = FlowTable::new();
+        let https = dialled(Transport::Tcp, ERP, 443);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(https),
+            vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 8443)],
+        );
+
+        let ended = table.update_rules(
+            "gw-erp",
+            &[rule(
+                RuleTransport::Tcp,
+                443,
+                Ipv4Addr::new(172, 31, 4, 177),
+                9443,
+            )],
+        );
+
+        assert!(ended.is_empty());
+        assert!(matches!(
+            forward_packet(&mut table, 40100, https),
+            Forwarding::Forward {
+                destination_port: Some(9443),
+                ..
+            }
+        ));
+    }
+
+    /// A rule that no longer opens the flow's transport no longer serves it.
+    #[test]
+    fn narrowing_a_rule_to_the_other_transport_ends_the_flow() {
+        let mut table = FlowTable::new();
+        let dns_tcp = dialled(Transport::Tcp, ERP, 53);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(dns_tcp),
+            vec![rule(RuleTransport::TcpUdp, 53, ERP_HOST, 53)],
+        );
+
+        let ended = table.update_rules("gw-erp", &[rule(RuleTransport::Udp, 53, ERP_HOST, 53)]);
+
+        assert_eq!(ended.len(), 1);
+    }
+
+    #[test]
+    fn a_rule_removal_on_one_gateway_leaves_another_gateways_flows_alone() {
+        let mut table = FlowTable::new();
+        let https = dialled(Transport::Tcp, ERP, 443);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(https),
+            vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 443)],
+        );
+
+        assert!(table.update_rules("gw-other", &[]).is_empty());
+        assert!(matches!(
+            forward_packet(&mut table, 40100, https),
+            Forwarding::Forward { .. }
+        ));
+    }
+
+    /// A flow from a node that predates the dialled identity is judged by the port its packets
+    /// used, and only rules with equal ports serve it; before its first packet it is left alone.
+    #[test]
+    fn a_flow_without_identity_ends_once_no_equal_port_rule_serves_the_port_it_used() {
+        let mut table = FlowTable::new();
+        let rules = vec![rule(RuleTransport::TcpUdp, 443, ERP_HOST, 443)];
+        admit_with_rules(&mut table, 40100, None, rules.clone());
+        admit_with_rules(&mut table, 40101, None, rules);
+        let dns = crate::dns_cache::DnsCache::new();
+        assert!(matches!(
+            table.forward("n-1", 40100, None, 443, &dns),
+            Forwarding::Forward { .. }
+        ));
+
+        // The same port now translated to another internal port: an older node can't be served by it.
+        let ended = table.update_rules(
+            "gw-erp",
+            &[rule(RuleTransport::TcpUdp, 443, ERP_HOST, 8443)],
+        );
+
+        assert_eq!(
+            ended
+                .iter()
+                .map(|flow| flow.flow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["flow-40100"],
+            "the flow that never forwarded a packet is left alone"
+        );
+        assert_eq!(
+            table.forward("n-1", 40100, None, 443, &dns),
+            Forwarding::NotAdmitted
         );
     }
 
