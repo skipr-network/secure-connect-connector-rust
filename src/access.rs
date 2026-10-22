@@ -13,7 +13,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::audit::{AuditEvent, AuditLog};
-use crate::dto::PolicyBundleEndpoint;
+use crate::dto::PortRule;
+#[cfg(test)]
+use crate::dto::{PolicyBundleEndpoint, RuleTransport};
 use crate::policy::PolicyStore;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +24,8 @@ pub enum AccessDecision {
         /// From the matched `Entitlement` row, never from a caller-supplied
         /// value - see `decide_access`'s doc comment for why.
         user_id: String,
-        endpoints: Vec<PolicyBundleEndpoint>,
+        /// The gateway's port rules (TT-2514) - `PolicyBundle::rules`.
+        rules: Vec<PortRule>,
     },
     Refused(RefusalReason),
 }
@@ -149,7 +152,7 @@ fn decide_access_at(
     match matched {
         Some(entitlement) => AccessDecision::Allowed {
             user_id: entitlement.user_id.clone(),
-            endpoints: bundle.endpoints.clone(),
+            rules: bundle.rules(),
         },
         None => AccessDecision::Refused(RefusalReason::NotEntitled),
     }
@@ -171,6 +174,7 @@ mod tests {
                 host: "10.0.0.5".to_string(),
                 port: 443,
             }],
+            port_rules: None,
             entitlement_list: entitlements,
         }
     }
@@ -226,9 +230,11 @@ mod tests {
             decision,
             AccessDecision::Allowed {
                 user_id: "u-1".to_string(),
-                endpoints: vec![PolicyBundleEndpoint {
-                    host: "10.0.0.5".to_string(),
-                    port: 443
+                rules: vec![PortRule {
+                    transport: RuleTransport::TcpUdp,
+                    external_port: 443,
+                    internal_host: "10.0.0.5".to_string(),
+                    internal_port: 443,
                 }]
             }
         );
@@ -431,9 +437,11 @@ mod tests {
             decision,
             AccessDecision::Allowed {
                 user_id: "u-1".to_string(),
-                endpoints: vec![PolicyBundleEndpoint {
-                    host: "10.0.0.5".to_string(),
-                    port: 443
+                rules: vec![PortRule {
+                    transport: RuleTransport::TcpUdp,
+                    external_port: 443,
+                    internal_host: "10.0.0.5".to_string(),
+                    internal_port: 443,
                 }]
             }
         );

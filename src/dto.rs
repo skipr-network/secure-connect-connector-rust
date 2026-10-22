@@ -71,14 +71,132 @@ pub struct PolicyBundle {
     pub location: String,
     pub hostname: String,
     pub access_mode: String,
+    /// Transitional (TT-2514): Portal fills it with only the port rules a Connector that predates
+    /// rules serves exactly - TCP + UDP with equal ports. Used only when `port_rules` is absent.
     pub endpoints: Vec<PolicyBundleEndpoint>,
+    /// TT-2514: the gateway's port rules. `None` from a Portal or Agent that predates them, which
+    /// relays no such field - see `PolicyBundle::rules`. A rule that doesn't parse is skipped with a
+    /// warning rather than failing the whole heartbeat, which would stop every gateway here.
+    #[serde(default, deserialize_with = "deserialize_port_rules")]
+    pub port_rules: Option<Vec<PortRule>>,
     pub entitlement_list: Vec<Entitlement>,
+}
+
+impl PolicyBundle {
+    /// The rules this gateway is served by: its `port_rules`, or - from a Portal or Agent that
+    /// predates them - each endpoint as a TCP + UDP rule with equal external and internal port,
+    /// which is exactly what an endpoint meant (TT-2514).
+    pub fn rules(&self) -> Vec<PortRule> {
+        match &self.port_rules {
+            Some(rules) => rules.clone(),
+            None => self.endpoints.iter().map(PortRule::from).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PolicyBundleEndpoint {
     pub host: String,
     pub port: u16,
+}
+
+/// Which transports a port rule opens (TT-2514). A value this Connector doesn't know is kept as
+/// `Unknown` with the value as sent, rather than failing the whole heartbeat: such a rule never
+/// matches a flow, and the audit log records what was actually sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleTransport {
+    Tcp,
+    Udp,
+    TcpUdp,
+    Unknown(String),
+}
+
+impl RuleTransport {
+    pub fn as_wire(&self) -> &str {
+        match self {
+            RuleTransport::Tcp => "TCP",
+            RuleTransport::Udp => "UDP",
+            RuleTransport::TcpUdp => "TCP_UDP",
+            RuleTransport::Unknown(value) => value,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RuleTransport {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "TCP" => RuleTransport::Tcp,
+            "UDP" => RuleTransport::Udp,
+            "TCP_UDP" => RuleTransport::TcpUdp,
+            _ => RuleTransport::Unknown(value),
+        })
+    }
+}
+
+impl Serialize for RuleTransport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_wire())
+    }
+}
+
+/// Parses each port rule on its own, so one a newer or faulty sender got wrong (a null field, a
+/// port above 65535) is dropped with a warning and the gateway's other rules still apply.
+fn deserialize_port_rules<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<PortRule>>, D::Error> {
+    let raw: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    Ok(raw.map(|values| {
+        values
+            .into_iter()
+            .filter_map(|value| match PortRule::deserialize(&value) {
+                Ok(rule) => Some(rule),
+                Err(error) => {
+                    tracing::warn!(rule = %value, %error, "Skipped a port rule that doesn't parse");
+                    None
+                }
+            })
+            .collect()
+    }))
+}
+
+/// One port a gateway opens and where it leads (TT-2514): a flow on `transport` to the gateway's
+/// `external_port` is forwarded to `internal_host:internal_port`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct PortRule {
+    pub transport: RuleTransport,
+    pub external_port: u16,
+    pub internal_host: String,
+    pub internal_port: u16,
+}
+
+/// How a rule is named in the Connector's logs, as Portal's Audit Trail names it:
+/// `TCP 443 -> 10.0.0.5:8443`.
+impl std::fmt::Display for PortRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let transport = match &self.transport {
+            RuleTransport::Tcp => "TCP",
+            RuleTransport::Udp => "UDP",
+            RuleTransport::TcpUdp => "TCP+UDP",
+            RuleTransport::Unknown(value) => value,
+        };
+        write!(
+            f,
+            "{transport} {} -> {}:{}",
+            self.external_port, self.internal_host, self.internal_port
+        )
+    }
+}
+
+impl From<&PolicyBundleEndpoint> for PortRule {
+    fn from(endpoint: &PolicyBundleEndpoint) -> Self {
+        PortRule {
+            transport: RuleTransport::TcpUdp,
+            external_port: endpoint.port,
+            internal_host: endpoint.host.clone(),
+            internal_port: endpoint.port,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -240,6 +358,142 @@ mod tests {
             response.node_list[0].wireguard_public_key.as_deref(),
             Some("wgkey=")
         );
+    }
+
+    /// TT-2514: the port rules as Agent relays them from Portal.
+    #[test]
+    fn deserializes_port_rules_and_prefers_them_over_the_endpoints() {
+        let json = r#"{
+            "gateway_id": "gw-1", "location": "Amsterdam", "hostname": "crm.acme.internal",
+            "access_mode": "SELECTED", "endpoints": [{"host": "10.0.0.5", "port": 443}],
+            "port_rules": [
+                {"transport": "TCP_UDP", "external_port": 443, "internal_host": "10.0.0.5", "internal_port": 443},
+                {"transport": "TCP", "external_port": 2222, "internal_host": "10.0.0.7", "internal_port": 22},
+                {"transport": "UDP", "external_port": 514, "internal_host": "syslog.internal", "internal_port": 514}
+            ],
+            "entitlement_list": []
+        }"#;
+
+        let bundle: PolicyBundle = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            bundle.rules(),
+            vec![
+                PortRule {
+                    transport: RuleTransport::TcpUdp,
+                    external_port: 443,
+                    internal_host: "10.0.0.5".to_string(),
+                    internal_port: 443
+                },
+                PortRule {
+                    transport: RuleTransport::Tcp,
+                    external_port: 2222,
+                    internal_host: "10.0.0.7".to_string(),
+                    internal_port: 22
+                },
+                PortRule {
+                    transport: RuleTransport::Udp,
+                    external_port: 514,
+                    internal_host: "syslog.internal".to_string(),
+                    internal_port: 514
+                },
+            ]
+        );
+    }
+
+    /// TT-2514: a Portal or Agent that predates port rules sends only endpoints - each one serves as
+    /// a TCP + UDP rule with equal ports, exactly what it meant before.
+    #[test]
+    fn a_bundle_without_port_rules_uses_its_endpoints_as_tcp_and_udp_rules() {
+        let json = r#"{
+            "gateway_id": "gw-1", "location": "Amsterdam", "hostname": "crm.acme.internal",
+            "access_mode": "SELECTED", "endpoints": [{"host": "erp.internal", "port": 8080}],
+            "entitlement_list": []
+        }"#;
+
+        let bundle: PolicyBundle = serde_json::from_str(json).unwrap();
+
+        assert_eq!(bundle.port_rules, None);
+        assert_eq!(
+            bundle.rules(),
+            vec![PortRule {
+                transport: RuleTransport::TcpUdp,
+                external_port: 8080,
+                internal_host: "erp.internal".to_string(),
+                internal_port: 8080
+            }]
+        );
+    }
+
+    /// A transport value from a newer Portal must not fail the whole heartbeat (the nullable
+    /// device_public_key lesson): the rule parses as `Unknown`, which matches no flow, and keeps
+    /// the value sent so the audit log shows it.
+    #[test]
+    fn an_unknown_transport_does_not_fail_the_heartbeat_and_is_kept_as_sent() {
+        let json = r#"{"transport": "SCTP", "external_port": 443, "internal_host": "10.0.0.5", "internal_port": 443}"#;
+
+        let rule: PortRule = serde_json::from_str(json).unwrap();
+
+        assert_eq!(rule.transport, RuleTransport::Unknown("SCTP".to_string()));
+        assert_eq!(serde_json::to_value(&rule.transport).unwrap(), "SCTP");
+    }
+
+    #[test]
+    fn known_transports_serialize_as_portal_sends_them() {
+        for wire in ["TCP", "UDP", "TCP_UDP"] {
+            let transport: RuleTransport = serde_json::from_value(serde_json::json!(wire)).unwrap();
+            assert_eq!(serde_json::to_value(&transport).unwrap(), wire);
+        }
+    }
+
+    /// One rule a sender got wrong must not fail the heartbeat for every gateway on this
+    /// Connector (TT-2514 review): it is skipped, the others still apply.
+    #[test]
+    fn a_port_rule_that_does_not_parse_is_skipped_and_the_others_kept() {
+        let json = r#"{
+            "gateway_id": "gw-1", "location": "Mumbai", "hostname": "erp.internal", "access_mode": "ALL",
+            "endpoints": [],
+            "port_rules": [
+                {"transport": "TCP", "external_port": 443, "internal_host": "10.0.0.5", "internal_port": 8443},
+                {"transport": "TCP", "external_port": 70000, "internal_host": "10.0.0.5", "internal_port": 22},
+                {"transport": "UDP", "external_port": null, "internal_host": "10.0.0.5", "internal_port": 53},
+                null,
+                {"transport": "UDP", "external_port": 514, "internal_host": "10.0.0.6", "internal_port": 514}
+            ],
+            "entitlement_list": []
+        }"#;
+
+        let bundle: PolicyBundle = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            bundle.port_rules.unwrap(),
+            vec![
+                PortRule {
+                    transport: RuleTransport::Tcp,
+                    external_port: 443,
+                    internal_host: "10.0.0.5".to_string(),
+                    internal_port: 8443,
+                },
+                PortRule {
+                    transport: RuleTransport::Udp,
+                    external_port: 514,
+                    internal_host: "10.0.0.6".to_string(),
+                    internal_port: 514,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_null_port_rules_field_is_treated_as_absent() {
+        let json = r#"{
+            "gateway_id": "gw-1", "location": "Mumbai", "hostname": "erp.internal", "access_mode": "ALL",
+            "endpoints": [], "port_rules": null, "entitlement_list": []
+        }"#;
+
+        let bundle: PolicyBundle = serde_json::from_str(json).unwrap();
+
+        assert_eq!(bundle.port_rules, None);
     }
 
     /// Regression test: an entitled user with no paired device yet is a real, expected state

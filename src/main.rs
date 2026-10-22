@@ -34,7 +34,7 @@ use policy::PolicyStore;
 use registry_client::RegistryClient;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tunnel::{TunnelEvent, TunnelManager};
 
 /// Explicit CLI modes - checked before tracing init or `Config::from_env` (TT-1886). Matches argv
@@ -536,6 +536,14 @@ async fn run_heartbeat(
 
     apply_result?;
 
+    // TT-2520: only once the package is in force - a rejected one wrote `PolicyRejected` above and
+    // put nothing in force, so it writes neither of these.
+    for event in bundle_audit_events(old_bundles.as_deref(), &new_bundles) {
+        if let Err(audit_error) = audit_log.record(event).await {
+            error!(error = %audit_error, "failed to write policy bundle audit entry");
+        }
+    }
+
     info!(gateways, nodes, "Applied verified heartbeat package");
     if nodes_without_key > 0 {
         warn!(
@@ -556,7 +564,11 @@ async fn run_heartbeat(
         );
         queue_gateway_end_reports(reports, audit_log, gateway_end_queue).await;
     }
-    reconcile_endpoint_changes(flow_table, &new_bundles);
+    for event in reconcile_endpoint_changes(flow_table, &new_bundles) {
+        if let Err(error) = audit_log.record(event).await {
+            error!(%error, "failed to write rule-change flows-ended audit entry");
+        }
+    }
 
     // TT-2066: re-resolve every currently-configured endpoint hostname off this same heartbeat
     // cycle - new_bundles is the full, current set of every attached gateway's endpoints, so this
@@ -579,8 +591,8 @@ async fn run_heartbeat(
 fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
     bundles
         .iter()
-        .flat_map(|bundle| bundle.endpoints.iter())
-        .map(|endpoint| endpoint.host.clone())
+        .flat_map(|bundle| bundle.rules())
+        .map(|rule| rule.internal_host)
         .collect()
 }
 
@@ -692,21 +704,101 @@ async fn queue_gateway_end_reports(
     }
 }
 
-/// Refreshes already-admitted flows' remembered endpoint config to this heartbeat's freshly-applied
-/// bundles (TT-2046 review finding #4): unlike entitlements, endpoints were only ever snapshotted
+/// The per-gateway entries spec §B.10 requires for a just-applied heartbeat package (TT-2520):
+/// `PolicyBundleApplied` for each gateway whose effective configuration is new or changed since
+/// `old_bundles` (every gateway before the first package), and `EntitlementListReceived` for every
+/// gateway on every heartbeat.
+fn bundle_audit_events(
+    old_bundles: Option<&[PolicyBundle]>,
+    new_bundles: &[PolicyBundle],
+) -> Vec<AuditEvent> {
+    // The rules, not the transitional endpoints: they are what the Connector forwards by (TT-2514).
+    let configuration = |bundle: &PolicyBundle| {
+        (
+            bundle.location.clone(),
+            bundle.hostname.clone(),
+            bundle.rules(),
+        )
+    };
+    let mut events = Vec::new();
+    for bundle in new_bundles {
+        let unchanged = old_bundles
+            .and_then(|old| old.iter().find(|o| o.gateway_id == bundle.gateway_id))
+            .is_some_and(|old| configuration(old) == configuration(bundle));
+        if !unchanged {
+            events.push(AuditEvent::PolicyBundleApplied {
+                gateway_id: bundle.gateway_id.clone(),
+                location: bundle.location.clone(),
+                hostname: bundle.hostname.clone(),
+                port_rules: bundle.rules(),
+            });
+        }
+        events.push(AuditEvent::EntitlementListReceived {
+            gateway_id: bundle.gateway_id.clone(),
+            entitlement_count: bundle.entitlement_list.len(),
+            entitlement_list_sha256: entitlement_list_sha256(&bundle.entitlement_list),
+        });
+    }
+    events
+}
+
+/// SHA-256 (hex) of an entitlement list, independent of the order Portal happened to list it in:
+/// the same set of (user, device) pairs always hashes the same. Each pair is JSON-encoded, so no
+/// choice of user id or key can make two different lists encode identically.
+fn entitlement_list_sha256(entitlements: &[dto::Entitlement]) -> String {
+    let mut pairs: Vec<(&str, Option<&str>)> = entitlements
+        .iter()
+        .map(|e| (e.user_id.as_str(), e.device_public_key.as_deref()))
+        .collect();
+    pairs.sort_unstable();
+    let encoded = serde_json::to_vec(&pairs).expect("string pairs always serialize");
+    hex::encode(ring::digest::digest(&ring::digest::SHA256, &encoded))
+}
+
+/// Refreshes already-admitted flows' remembered port rules (endpoints before TT-2514) to this
+/// heartbeat's freshly-applied bundles (TT-2046 review finding #4): unlike entitlements, they were only ever snapshotted
 /// once at admission and never revisited, so an admin repointing or removing a gateway's endpoint
 /// kept every flow admitted before the change forwarding to the old address until the flow ended on
 /// its own. Runs every heartbeat, independent of `old_bundles` (there's no diffing to do - this
-/// just always brings `flow_table` up to date with the latest configured endpoints, a no-op for any
-/// gateway with nothing currently admitted). See `FlowTable::update_endpoints`.
+/// just always brings `flow_table` up to date with the latest configured rules, a no-op for any
+/// gateway with nothing currently admitted). See `FlowTable::update_rules`.
+///
+/// TT-3449: returns one audit entry per gateway whose refreshed rules ended open flows (spec §B.10);
+/// no gateway-end report is queued for them (§B.18).
 fn reconcile_endpoint_changes(
     flow_table: &std::sync::Mutex<FlowTable>,
     new_bundles: &[PolicyBundle],
-) {
+) -> Vec<AuditEvent> {
     let mut table = flow_table.lock().expect("flow table lock poisoned");
+    table.retain_gateway_rules(|gateway_id| {
+        new_bundles
+            .iter()
+            .any(|bundle| bundle.gateway_id == gateway_id)
+    });
+    let mut events = Vec::new();
     for bundle in new_bundles {
-        table.update_endpoints(&bundle.gateway_id, &bundle.endpoints);
+        let ended = table.update_rules(&bundle.gateway_id, &bundle.rules());
+        if ended.is_empty() {
+            continue;
+        }
+        info!(
+            gateway_id = %bundle.gateway_id,
+            flows_ended = ended.len(),
+            "port rule removed: ended the open flow(s) it served"
+        );
+        events.push(AuditEvent::FlowsEndedByRuleChange {
+            gateway_id: bundle.gateway_id.clone(),
+            flows_ended: ended.len(),
+            flows: ended
+                .into_iter()
+                .map(|flow| audit::EndedFlow {
+                    flow_id: flow.flow_id,
+                    device_public_key: flow.device_public_key,
+                })
+                .collect(),
+        });
     }
+    events
 }
 
 /// Syncs the tunnel set to this heartbeat's node list, then kicks off a
@@ -785,10 +877,11 @@ async fn dial_new_nodes(
 ///   real endpoint: it's Gatekeeper's invented, unroutable per-gateway virtual address
 ///   (DNS-resolution only - see `FlowTable::forward`'s doc comment), so forwarding it
 ///   unchanged could never have reached anywhere real even before TT-2046's admission check
-///   existed. `FlowTable::forward` resolves the real address by matching the packet's destination
-///   *port* (never translated by Gatekeeper, so it's the client's real intent) against the
-///   entitled gateway's configured endpoints; `tunnel::rewrite_destination_ipv4` does the
-///   actual byte-level rewrite, including the checksum fixups a raw address change requires.
+///   existed. `FlowTable::forward` resolves the real address and port by matching the packet's
+///   transport and destination *port* (never translated by Gatekeeper, so it's the client's real
+///   intent) against the entitled gateway's port rules (TT-2514); `tunnel::rewrite_destination_ipv4`
+///   and `tunnel::rewrite_destination_port` do the actual byte-level rewrite, including the checksum
+///   fixups.
 ///
 /// Returns `true` (packet mutated in place if a rewrite was needed, ready to write to TUN
 /// as-is) or `false` (packet must not be forwarded - left completely untouched: every check here
@@ -799,13 +892,16 @@ async fn dial_new_nodes(
 fn warn_unforwardable(outcome: ForwardOutcome, node_id: &str, source_port: u16, dst_port: u16) {
     match outcome {
         ForwardOutcome::PortNotConfigured => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no endpoint configured on this port - dropping");
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no port rule for this transport and port - dropping");
         }
         ForwardOutcome::AmbiguousEndpoint => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one configured endpoint shares this port - refusing to guess, dropping");
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one port rule matches this transport and port - refusing to guess, dropping");
         }
         ForwardOutcome::HostUnresolved => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and the port matches, but its configured endpoint host hasn't resolved to an address yet - dropping");
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted and a port rule matches, but its internal host hasn't resolved to an address yet - dropping");
+        }
+        ForwardOutcome::PortTranslationNeedsUpdatedNode => {
+            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its port rule translates the port and the flow came from a node that predates the dialled identity, whose replies could not get the port back - dropping until the node is updated (TT-2514)");
         }
         ForwardOutcome::NoFreeSourcePort => {
             error!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but every source port toward its internal host:port is in use - dropping until one is freed (TT-2639)");
@@ -871,7 +967,7 @@ fn prepare_decrypted_packet_for_forwarding(
         }),
         _ => None,
     };
-    let (real_dst, allocated_port) = match flow_table.forward(
+    let (real_dst, internal_port, allocated_port) = match flow_table.forward(
         node_id,
         source_port,
         dialled,
@@ -880,8 +976,17 @@ fn prepare_decrypted_packet_for_forwarding(
     ) {
         Forwarding::Forward {
             address,
+            destination_port: internal_port,
             source_port: allocated_port,
-        } => (address, allocated_port),
+        } => (address, internal_port, allocated_port),
+        Forwarding::NotAdmitted
+            if flow_table.is_rule_ended(node_id, source_port, dialled, Instant::now()) =>
+        {
+            // TT-3449: its rule was removed and the flow ended; the user's side keeps sending until it
+            // gives up. Dropped quietly - no admission is coming, so nothing to buffer or warn about.
+            debug!(%node_id, source_port, dst_port, "dropped a packet of a flow its removed port rule ended");
+            return false;
+        }
         Forwarding::NotAdmitted => {
             // Not necessarily gone for good (2026-09-22 session notes): Gatekeeper forwards a
             // new flow's raw packets independently of, and often slightly before, the
@@ -909,8 +1014,11 @@ fn prepare_decrypted_packet_for_forwarding(
     };
 
     // A flow with its dialled identity also gets its allocated source port, which keeps it apart
-    // from every other flow on the internal network and is how its replies find it again (TT-2639).
+    // from every other flow on the internal network and is how its replies find it again (TT-2639),
+    // and the rule's internal port when it differs from the dialled one (TT-2514) - its replies get
+    // the dialled port back in `route_reply`.
     if tunnel::rewrite_destination_ipv4(packet, real_dst)
+        && internal_port.is_none_or(|port| tunnel::rewrite_destination_port(packet, port))
         && allocated_port.is_none_or(|port| tunnel::rewrite_source_port(packet, port))
     {
         return true;
@@ -925,7 +1033,7 @@ fn prepare_decrypted_packet_for_forwarding(
             "decrypted packet is IPv6 - endpoint rewriting only supports IPv4 in this version, dropping"
         );
     } else {
-        warn!(%node_id, %real_dst, ?allocated_port, "failed to rewrite decrypted packet's destination - dropping");
+        warn!(%node_id, %real_dst, ?internal_port, ?allocated_port, "failed to rewrite decrypted packet's destination - dropping");
     }
     false
 }
@@ -1419,6 +1527,56 @@ mod tests {
             Some(40100),
             "the translated port"
         );
+    }
+
+    /// TT-2514 through the real forward and reply paths: a TCP 443 rule to an internal :8443 reaches
+    /// the internal port, and the reply goes back from the port the user dialled.
+    #[test]
+    fn a_translated_port_rule_rewrites_the_port_both_ways() {
+        let mut flow_table = FlowTable::new();
+        flow_table.admit_flow(
+            "n-1".to_string(),
+            40100,
+            Some(Dialled {
+                transport: flow_table::Transport::Udp,
+                gateway_address: ERP,
+                destination_port: 443,
+            }),
+            "gw-erp".to_string(),
+            "flow-erp".to_string(),
+            "dev-1".to_string(),
+            vec![dto::PortRule {
+                transport: dto::RuleTransport::TcpUdp,
+                external_port: 443,
+                internal_host: ERP_HOST.to_string(),
+                internal_port: 8443,
+            }],
+        );
+        let mut packet = udp_packet(NODE_WG, ERP, 40100, 443);
+
+        assert!(prepare_decrypted_packet_for_forwarding(
+            &mut packet,
+            "n-1",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1)),
+            &mut flow_table,
+            &dns_cache::DnsCache::new(),
+        ));
+        assert_eq!(tunnel::parse_destination_ipv4(&packet), Some(ERP_HOST));
+        assert_eq!(tunnel::parse_destination_port(&packet), Some(8443));
+        let allocated = tunnel::parse_source_port(&packet).unwrap();
+
+        let mut reply = udp_packet(ERP_HOST, NODE_WG, 8443, allocated);
+        assert_eq!(
+            prepare_reply_packet_for_forwarding(&mut reply, allocated, &flow_table).as_deref(),
+            Some("n-1")
+        );
+        assert_eq!(&reply[12..16], &ERP.octets());
+        assert_eq!(
+            tunnel::parse_source_port(&reply),
+            Some(443),
+            "the port the user dialled"
+        );
+        assert_eq!(tunnel::parse_destination_port(&reply), Some(40100));
     }
 
     #[test]
@@ -2096,6 +2254,100 @@ mod tests {
         assert_eq!(entries[0]["gateway_count"], 0);
     }
 
+    #[tokio::test]
+    async fn run_heartbeat_records_each_gateways_configuration_and_entitlement_list() {
+        let agent_identity = crypto::generate_keypair();
+        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED","endpoints":[{"host":"10.0.0.5","port":443}],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
+        let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(body, "application/json")
+                    .insert_header("X-Signature", signature.as_str()),
+            )
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri());
+        let agent_base_url = agent_server.uri();
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_base_url).await;
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
+
+        let mut admission_pollers = admission_pollers();
+        let result = run_heartbeat(
+            "pk-1",
+            &agent_directory,
+            &registry_client,
+            &heartbeat_client,
+            &policy_store,
+            &audit_log,
+            &tunnel_manager,
+            &wg_socket,
+            &flow_table,
+            &dns_cache,
+            &mut admission_pollers,
+            &test_gateway_end_queue(),
+        )
+        .await;
+
+        // TT-2520 (spec §B.10): the summary, then the gateway's configuration and entitlement list.
+        result.unwrap();
+        let entries = read_audit_lines(&dir);
+        let events: Vec<&str> = entries
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "policy_applied",
+                "policy_bundle_applied",
+                "entitlement_list_received"
+            ]
+        );
+        assert_eq!(entries[1]["gateway_id"], "gw-1");
+        assert_eq!(entries[1]["location"], "Amsterdam");
+        assert_eq!(entries[1]["hostname"], "crm.internal.example.com");
+        // A bundle without port rules: its endpoint as the TCP + UDP rule it is served by (TT-2514).
+        assert_eq!(
+            entries[1]["port_rules"],
+            serde_json::json!([{"transport": "TCP_UDP", "external_port": 443, "internal_host": "10.0.0.5", "internal_port": 443}])
+        );
+        assert_eq!(entries[2]["gateway_id"], "gw-1");
+        assert_eq!(entries[2]["entitlement_count"], 1);
+        assert_eq!(
+            entries[2]["entitlement_list_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+    }
+
     /// TT-1838: `main` uses this returned value to create the TUN device - must be the real
     /// parsed address, not just "heartbeat succeeded".
     #[tokio::test]
@@ -2281,7 +2533,9 @@ mod tests {
     async fn run_heartbeat_rejects_an_already_expired_package_and_does_not_apply_it() {
         let agent_identity = crypto::generate_keypair();
         // 2020 is always in the past relative to any real run of this test.
-        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2020-01-01T09:55:00Z","expires_at":"2020-01-01T10:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}"#;
+        // TT-2520: with a gateway in it, so this also shows a rejected package writes no
+        // policy_bundle_applied or entitlement_list_received entry.
+        let body = r#"{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2020-01-01T09:55:00Z","expires_at":"2020-01-01T10:00:00Z","nonce":"n1","policy_bundles":[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED","endpoints":[{"host":"10.0.0.5","port":443}],"entitlement_list":[{"user_id":"u-1","device_public_key":"dev-A"}]}],"node_list":[]}"#;
         let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
 
         let registry_server = MockServer::start().await;
@@ -2525,6 +2779,7 @@ mod tests {
                         port: 8443,
                     },
                 ],
+                port_rules: None,
                 entitlement_list: vec![],
             },
             PolicyBundle {
@@ -2536,6 +2791,7 @@ mod tests {
                     host: "files.internal.example.com".to_string(),
                     port: 445,
                 }],
+                port_rules: None,
                 entitlement_list: vec![],
             },
         ];
@@ -2548,6 +2804,35 @@ mod tests {
                 "10.0.0.5".to_string(),
                 "erp.internal.example.com".to_string(),
                 "files.internal.example.com".to_string(),
+            ]
+        );
+    }
+
+    /// TT-2514: with port rules, the hosts the DNS cache refreshes and the heartbeat reports as
+    /// unresolved are the rules' internal hosts, not the transitional endpoints'.
+    #[test]
+    fn collect_endpoint_hosts_reads_the_port_rules_when_a_bundle_has_them() {
+        let mut bundle = bundle_with_endpoints("gw-1", &["10.0.0.5"]);
+        bundle.port_rules = Some(vec![
+            dto::PortRule {
+                transport: dto::RuleTransport::Tcp,
+                external_port: 443,
+                internal_host: "erp.internal.example.com".to_string(),
+                internal_port: 8443,
+            },
+            dto::PortRule {
+                transport: dto::RuleTransport::Udp,
+                external_port: 514,
+                internal_host: "syslog.internal.example.com".to_string(),
+                internal_port: 514,
+            },
+        ]);
+
+        assert_eq!(
+            collect_endpoint_hosts(&[bundle]),
+            vec![
+                "erp.internal.example.com".to_string(),
+                "syslog.internal.example.com".to_string(),
             ]
         );
     }
@@ -2565,6 +2850,7 @@ mod tests {
                     port: 443,
                 })
                 .collect(),
+            port_rules: None,
             entitlement_list: vec![],
         }
     }
@@ -3106,6 +3392,7 @@ mod tests {
             hostname: "crm.internal.example.com".to_string(),
             access_mode: "SELECTED_USERS".to_string(),
             endpoints: vec![],
+            port_rules: None,
             entitlement_list: entitled_device_keys
                 .iter()
                 .map(|key| Entitlement {
@@ -3320,6 +3607,169 @@ mod tests {
         reconcile_dropped_entitlements(&flow_table, &[], &[bundle("gw-1", &["dev-A"])], 0);
     }
 
+    fn events_named<'a>(events: &'a [AuditEvent], name: &str) -> Vec<&'a AuditEvent> {
+        events
+            .iter()
+            .filter(|event| serde_json::to_value(event).unwrap()["event"] == name)
+            .collect()
+    }
+
+    #[test]
+    fn the_first_package_records_every_gateways_configuration_and_entitlement_list() {
+        // TT-2520 (spec §B.10).
+        let events = bundle_audit_events(
+            None,
+            &[
+                bundle_with_endpoint("gw-1", "172.22.247.15", 8443),
+                bundle("gw-2", &["dev-A", "dev-B"]),
+            ],
+        );
+
+        let applied = events_named(&events, "policy_bundle_applied");
+        assert_eq!(applied.len(), 2);
+        assert_eq!(
+            applied[0],
+            &AuditEvent::PolicyBundleApplied {
+                gateway_id: "gw-1".to_string(),
+                location: bundle("gw-1", &[]).location,
+                hostname: bundle("gw-1", &[]).hostname,
+                port_rules: vec![dto::PortRule {
+                    transport: dto::RuleTransport::TcpUdp,
+                    external_port: 8443,
+                    internal_host: "172.22.247.15".to_string(),
+                    internal_port: 8443,
+                }],
+            }
+        );
+        let received = events_named(&events, "entitlement_list_received");
+        assert_eq!(received.len(), 2);
+        assert!(matches!(
+            received[1],
+            AuditEvent::EntitlementListReceived { gateway_id, entitlement_count: 2, .. } if gateway_id == "gw-2"
+        ));
+    }
+
+    #[test]
+    fn an_unchanged_configuration_is_not_recorded_again_but_its_entitlement_list_always_is() {
+        let old = [bundle_with_endpoint("gw-1", "10.0.0.5", 443)];
+        let same_config_new_list = PolicyBundle {
+            entitlement_list: bundle("gw-1", &["dev-C"]).entitlement_list,
+            ..bundle_with_endpoint("gw-1", "10.0.0.5", 443)
+        };
+
+        let events = bundle_audit_events(Some(&old), &[same_config_new_list]);
+
+        assert!(events_named(&events, "policy_bundle_applied").is_empty());
+        assert_eq!(events_named(&events, "entitlement_list_received").len(), 1);
+    }
+
+    #[test]
+    fn a_changed_endpoint_hostname_or_location_is_recorded_as_a_new_configuration() {
+        let old = [bundle_with_endpoint("gw-1", "10.0.0.5", 443)];
+        let changed = [
+            bundle_with_endpoint("gw-1", "10.0.0.6", 443),
+            bundle_with_endpoint("gw-1", "10.0.0.5", 8443),
+            PolicyBundle {
+                hostname: "erp.internal.example.com".to_string(),
+                ..bundle_with_endpoint("gw-1", "10.0.0.5", 443)
+            },
+            PolicyBundle {
+                location: "Istanbul".to_string(),
+                ..bundle_with_endpoint("gw-1", "10.0.0.5", 443)
+            },
+        ];
+
+        for bundle in changed {
+            let events = bundle_audit_events(Some(&old), &[bundle]);
+            assert_eq!(events_named(&events, "policy_bundle_applied").len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_gateway_new_since_the_last_package_is_recorded() {
+        let old = [bundle_with_endpoint("gw-1", "10.0.0.5", 443)];
+        let events = bundle_audit_events(
+            Some(&old),
+            &[
+                bundle_with_endpoint("gw-1", "10.0.0.5", 443),
+                bundle_with_endpoint("gw-2", "10.0.0.7", 22),
+            ],
+        );
+
+        let applied = events_named(&events, "policy_bundle_applied");
+        assert_eq!(applied.len(), 1);
+        assert!(matches!(
+            applied[0],
+            AuditEvent::PolicyBundleApplied { gateway_id, .. } if gateway_id == "gw-2"
+        ));
+    }
+
+    /// TT-2514: with port rules, the entry records them, and only a change to the rules - not to the
+    /// transitional endpoints, which the Connector doesn't forward by - is a new configuration.
+    #[test]
+    fn with_port_rules_the_entry_records_the_rules_and_a_rule_change_is_a_new_configuration() {
+        let rule = |internal_port: u16| dto::PortRule {
+            transport: dto::RuleTransport::Tcp,
+            external_port: 443,
+            internal_host: "10.0.0.5".to_string(),
+            internal_port,
+        };
+        let with_rules = |internal_port: u16, endpoint_host: &str| PolicyBundle {
+            port_rules: Some(vec![rule(internal_port)]),
+            ..bundle_with_endpoint("gw-1", endpoint_host, 443)
+        };
+        let old = [with_rules(8443, "10.0.0.5")];
+
+        let applied = bundle_audit_events(None, &old);
+        assert!(matches!(
+            events_named(&applied, "policy_bundle_applied")[0],
+            AuditEvent::PolicyBundleApplied { port_rules, .. } if port_rules == &vec![rule(8443)]
+        ));
+        assert_eq!(
+            serde_json::to_value(events_named(&applied, "policy_bundle_applied")[0]).unwrap()["port_rules"],
+            serde_json::json!([{"transport": "TCP", "external_port": 443, "internal_host": "10.0.0.5", "internal_port": 8443}])
+        );
+        assert_eq!(
+            events_named(
+                &bundle_audit_events(Some(&old), &[with_rules(9443, "10.0.0.5")]),
+                "policy_bundle_applied"
+            )
+            .len(),
+            1,
+            "a changed rule"
+        );
+        assert!(
+            events_named(
+                &bundle_audit_events(Some(&old), &[with_rules(8443, "10.0.0.9")]),
+                "policy_bundle_applied"
+            )
+            .is_empty(),
+            "only the transitional endpoints changed"
+        );
+    }
+
+    #[test]
+    fn the_entitlement_list_hash_depends_on_the_entries_not_their_order() {
+        let entitlement = |user: &str, key: Option<&str>| dto::Entitlement {
+            user_id: user.to_string(),
+            device_public_key: key.map(str::to_string),
+        };
+        let list = [entitlement("u-1", Some("k-1")), entitlement("u-2", None)];
+        let reordered = [entitlement("u-2", None), entitlement("u-1", Some("k-1"))];
+        let other_key = [entitlement("u-1", Some("k-9")), entitlement("u-2", None)];
+        let fewer = [entitlement("u-1", Some("k-1"))];
+
+        let hash = entitlement_list_sha256(&list);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(hash, entitlement_list_sha256(&reordered));
+        assert_ne!(hash, entitlement_list_sha256(&other_key));
+        assert_ne!(hash, entitlement_list_sha256(&fewer));
+        assert_ne!(
+            entitlement_list_sha256(&[]),
+            entitlement_list_sha256(&fewer)
+        );
+    }
+
     fn bundle_with_endpoint(gateway_id: &str, host: &str, port: u16) -> PolicyBundle {
         PolicyBundle {
             endpoints: vec![dto::PolicyBundleEndpoint {
@@ -3383,6 +3833,53 @@ mod tests {
                 .unwrap()
                 .forward_target("n-1", 40001, 443, &dns_cache),
             ForwardOutcome::Forward("10.0.0.1".parse().unwrap())
+        );
+    }
+
+    /// TT-3449: a heartbeat whose rules no longer serve an open flow ends it and returns the local
+    /// audit entry naming it; it is a configuration change, so it is not a gateway-end report.
+    #[test]
+    fn reconcile_endpoint_changes_ends_a_flow_whose_rule_was_removed_and_audits_it() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![dto::PolicyBundleEndpoint {
+                host: "10.0.0.1".to_string(),
+                port: 443,
+            }],
+        );
+        let dns_cache = dns_cache::DnsCache::new();
+        flow_table
+            .lock()
+            .unwrap()
+            .forward("n-1", 40001, None, 443, &dns_cache);
+
+        let events = reconcile_endpoint_changes(
+            &flow_table,
+            &[bundle_with_endpoint("gw-1", "10.0.0.1", 8443)],
+        );
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AuditEvent::FlowsEndedByRuleChange { gateway_id, flows_ended: 1, flows }
+                if gateway_id == "gw-1"
+                    && flows == &vec![audit::EndedFlow {
+                        flow_id: "flow-1".to_string(),
+                        device_public_key: "dev-A".to_string(),
+                    }]
+        ));
+        assert!(
+            flow_table
+                .lock()
+                .unwrap()
+                .gateway_for("n-1", 40001)
+                .is_none(),
+            "the flow is gone"
         );
     }
 

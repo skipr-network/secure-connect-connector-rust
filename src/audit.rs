@@ -24,6 +24,27 @@ pub enum AuditEvent {
     PolicyRejected {
         reason: String,
     },
+    /// TT-2520 (spec §B.10): the effective configuration one gateway's policy bundle carried took
+    /// effect - written when it is first applied or changes, so the entry's timestamp is when that
+    /// configuration came into force: its location, hostname and the port rules the Connector
+    /// forwards by (TT-2514) - for a bundle that predates them, its endpoints as TCP + UDP rules
+    /// with equal ports (`PolicyBundle::rules`).
+    PolicyBundleApplied {
+        gateway_id: String,
+        location: String,
+        hostname: String,
+        /// Each as transport, external port, internal host and internal port.
+        port_rules: Vec<crate::dto::PortRule>,
+    },
+    /// TT-2520 (spec §B.10): one gateway's entitlement list as received on an accepted heartbeat -
+    /// written on every heartbeat, not only on change. Recorded as its entry count and a SHA-256
+    /// of the list (the spec allows a hash) rather than the list itself, which at the default 60 s
+    /// heartbeat would grow the log by the full list every minute.
+    EntitlementListReceived {
+        gateway_id: String,
+        entitlement_count: usize,
+        entitlement_list_sha256: String,
+    },
     AccessAllowed {
         gateway_id: String,
         /// From the matched Entitlement row, never a caller-supplied value -
@@ -44,6 +65,27 @@ pub enum AuditEvent {
         flow_id: String,
         gateway_id: String,
     },
+    /// TT-2519 (spec §B.10): an admitted flow and the port rule that serves it, e.g.
+    /// `TCP 443 -> 10.0.0.5:8443`. Without a single serving rule, `port_rule` is absent and
+    /// `warning` says why.
+    FlowAdmitted {
+        flow_id: String,
+        gateway_id: String,
+        device_public_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port_rule: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    /// TT-3449 (spec §B.8, §B.10): a heartbeat's rule refresh ended these flows of one gateway because
+    /// no port rule serves them any more. A configuration change, not a withdrawal of access, so no
+    /// gateway-end report is queued for them (spec §B.18).
+    FlowsEndedByRuleChange {
+        gateway_id: String,
+        flows_ended: usize,
+        /// Each as flow id and device key.
+        flows: Vec<EndedFlow>,
+    },
     /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
     /// to this gateway, and a gateway-end report was queued for it.
     FlowsEnded {
@@ -55,6 +97,13 @@ pub enum AuditEvent {
     },
 }
 
+/// One flow in a `FlowsEndedByRuleChange` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EndedFlow {
+    pub flow_id: String,
+    pub device_public_key: String,
+}
+
 #[derive(Debug, Serialize)]
 struct AuditRecord<'a> {
     timestamp: String,
@@ -62,6 +111,9 @@ struct AuditRecord<'a> {
     event: &'a AuditEvent,
 }
 
+/// Cheap to clone: a clone writes to the same file under the same lock, so it can be moved into a
+/// task that records an entry in the background.
+#[derive(Clone)]
 pub struct AuditLog {
     path: PathBuf,
     // One log line is one write(); this only prevents this process's own
