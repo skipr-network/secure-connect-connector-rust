@@ -1086,6 +1086,11 @@ impl FlowTable {
 /// wrappers over the single mechanism above, so the same tests keep checking unchanged behaviour.
 #[cfg(test)]
 impl FlowTable {
+    /// How many flows are admitted - lets a test tell two flows from one merged entry.
+    pub fn flow_count(&self) -> usize {
+        self.flows.len()
+    }
+
     pub fn update_endpoints(&mut self, gateway_id: &str, endpoints: &[PolicyBundleEndpoint]) {
         let rules: Vec<PortRule> = endpoints.iter().map(PortRule::from).collect();
         self.update_rules(gateway_id, &rules);

@@ -1461,6 +1461,295 @@ mod tests {
         .then_some(packet)
     }
 
+    // --- TT-2514 AC 11: the TT-2639 scenarios with port rewrite, through the real forward and
+    // reply paths. Every flow below shares the translated source port 40100. ---
+
+    /// Minimal IPv4/TCP packet (no options, no payload), the TCP counterpart of `udp_packet`.
+    fn tcp_packet(
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6; // TCP
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet[32] = 0x50; // data offset: 5 words
+        packet
+    }
+
+    fn rewrite_packet(
+        transport: flow_table::Transport,
+        src: std::net::Ipv4Addr,
+        dst: std::net::Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        match transport {
+            flow_table::Transport::Tcp => tcp_packet(src, dst, src_port, dst_port),
+            flow_table::Transport::Udp => udp_packet(src, dst, src_port, dst_port),
+        }
+    }
+
+    /// Admits a flow on translated port 40100 for what the user dialled, served by `rules`.
+    fn admit_ruled(
+        flow_table: &mut FlowTable,
+        node_id: &str,
+        dialled: Dialled,
+        gateway_id: &str,
+        rules: Vec<dto::PortRule>,
+    ) {
+        flow_table.admit_flow(
+            node_id.to_string(),
+            40100,
+            Some(dialled),
+            gateway_id.to_string(),
+            format!(
+                "flow-{gateway_id}-{node_id}-{:?}-{}",
+                dialled.transport, dialled.destination_port
+            ),
+            format!("dev-{node_id}"),
+            rules,
+        );
+    }
+
+    fn port_rule(
+        transport: dto::RuleTransport,
+        external_port: u16,
+        host: std::net::Ipv4Addr,
+        internal_port: u16,
+    ) -> dto::PortRule {
+        dto::PortRule {
+            transport,
+            external_port,
+            internal_host: host.to_string(),
+            internal_port,
+        }
+    }
+
+    /// What the internal network received for one of the user's packets.
+    struct Forwarded {
+        transport: flow_table::Transport,
+        connector: std::net::Ipv4Addr,
+        host: std::net::Ipv4Addr,
+        internal_port: u16,
+        source_port: u16,
+    }
+
+    /// Sends the user's packet for `dialled` from `node_id` (translated port 40100) through the
+    /// forward path.
+    fn forward_dialled(flow_table: &mut FlowTable, node_id: &str, dialled: Dialled) -> Forwarded {
+        let mut packet = rewrite_packet(
+            dialled.transport,
+            NODE_WG,
+            dialled.gateway_address,
+            40100,
+            dialled.destination_port,
+        );
+        assert!(
+            prepare_decrypted_packet_for_forwarding(
+                &mut packet,
+                node_id,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 98, 0, 1)),
+                flow_table,
+                &dns_cache::DnsCache::new(),
+            ),
+            "{dialled:?} from {node_id} is forwarded"
+        );
+        Forwarded {
+            transport: dialled.transport,
+            connector: tunnel::parse_source_ipv4(&packet).expect("source"),
+            host: tunnel::parse_destination_ipv4(&packet).expect("destination"),
+            internal_port: tunnel::parse_destination_port(&packet).expect("destination port"),
+            source_port: tunnel::parse_source_port(&packet).expect("source port"),
+        }
+    }
+
+    /// Sends the internal service's reply to a forwarded packet through the reply path. Returns the
+    /// node it is routed to and the source address, source port and destination port the user sees.
+    fn reply_to(
+        flow_table: &FlowTable,
+        forwarded: &Forwarded,
+    ) -> (String, std::net::Ipv4Addr, u16, u16) {
+        let mut reply = rewrite_packet(
+            forwarded.transport,
+            forwarded.host,
+            forwarded.connector,
+            forwarded.internal_port,
+            forwarded.source_port,
+        );
+        let routed_to =
+            prepare_reply_packet_for_forwarding(&mut reply, forwarded.source_port, flow_table)
+                .expect("the reply is routed");
+        (
+            routed_to,
+            tunnel::parse_source_ipv4(&reply).expect("reply source"),
+            tunnel::parse_source_port(&reply).expect("reply source port"),
+            tunnel::parse_destination_port(&reply).expect("reply destination port"),
+        )
+    }
+
+    fn dialled_tcp(gateway_address: std::net::Ipv4Addr, destination_port: u16) -> Dialled {
+        Dialled {
+            transport: flow_table::Transport::Tcp,
+            gateway_address,
+            destination_port,
+        }
+    }
+
+    /// AC 11 main case: two gateways on one Connector, each with TCP 443 rewritten to a different
+    /// internal port, used at once by two devices through one node from the same source port.
+    #[test]
+    fn two_gateways_rewriting_tcp_443_keep_two_devices_on_one_node_and_port_apart() {
+        let mut flow_table = FlowTable::new();
+        let erp = dialled_tcp(ERP, 443);
+        let fin = dialled_tcp(FIN, 443);
+        admit_ruled(
+            &mut flow_table,
+            "n-1",
+            erp,
+            "gw-erp",
+            vec![port_rule(dto::RuleTransport::Tcp, 443, ERP_HOST, 8443)],
+        );
+        admit_ruled(
+            &mut flow_table,
+            "n-1",
+            fin,
+            "gw-fin",
+            vec![port_rule(dto::RuleTransport::Tcp, 443, FIN_HOST, 9443)],
+        );
+
+        // Both flows are open before either reply comes back.
+        let to_erp = forward_dialled(&mut flow_table, "n-1", erp);
+        let to_fin = forward_dialled(&mut flow_table, "n-1", fin);
+
+        assert_eq!((to_erp.host, to_erp.internal_port), (ERP_HOST, 8443));
+        assert_eq!((to_fin.host, to_fin.internal_port), (FIN_HOST, 9443));
+        assert_eq!(
+            reply_to(&flow_table, &to_erp),
+            ("n-1".to_string(), ERP, 443, 40100)
+        );
+        assert_eq!(
+            reply_to(&flow_table, &to_fin),
+            ("n-1".to_string(), FIN, 443, 40100)
+        );
+    }
+
+    /// AC 11, two nodes: the same rewritten port reached at once from two nodes with the same source
+    /// port goes to its gateway's service, and each reply goes back to its own node.
+    #[test]
+    fn rewritten_flows_from_two_nodes_on_one_port_reply_to_their_own_node() {
+        let mut flow_table = FlowTable::new();
+        let erp = dialled_tcp(ERP, 443);
+        let fin = dialled_tcp(FIN, 443);
+        let erp_rules = vec![port_rule(dto::RuleTransport::Tcp, 443, ERP_HOST, 8443)];
+        admit_ruled(&mut flow_table, "n-1", erp, "gw-erp", erp_rules.clone());
+        admit_ruled(&mut flow_table, "n-2", erp, "gw-erp", erp_rules);
+        admit_ruled(
+            &mut flow_table,
+            "n-2",
+            fin,
+            "gw-fin",
+            vec![port_rule(dto::RuleTransport::Tcp, 443, FIN_HOST, 9443)],
+        );
+
+        // All three flows are open before any reply comes back.
+        let n1_erp = forward_dialled(&mut flow_table, "n-1", erp);
+        let n2_erp = forward_dialled(&mut flow_table, "n-2", erp);
+        let n2_fin = forward_dialled(&mut flow_table, "n-2", fin);
+
+        assert_eq!((n1_erp.host, n1_erp.internal_port), (ERP_HOST, 8443));
+        assert_eq!((n2_erp.host, n2_erp.internal_port), (ERP_HOST, 8443));
+        assert_eq!((n2_fin.host, n2_fin.internal_port), (FIN_HOST, 9443));
+        assert_ne!(
+            n1_erp.source_port, n2_erp.source_port,
+            "the two nodes' flows to one service get their own source port"
+        );
+        assert_eq!(
+            reply_to(&flow_table, &n1_erp),
+            ("n-1".to_string(), ERP, 443, 40100)
+        );
+        assert_eq!(
+            reply_to(&flow_table, &n2_erp),
+            ("n-2".to_string(), ERP, 443, 40100)
+        );
+        assert_eq!(
+            reply_to(&flow_table, &n2_fin),
+            ("n-2".to_string(), FIN, 443, 40100)
+        );
+    }
+
+    /// AC 11, TCP and UDP on one port: one gateway opens 5353 on both transports, rewritten to the
+    /// same internal address and port; both flows open at once from the same node and source port
+    /// stay apart, each reply on its own transport.
+    #[test]
+    fn tcp_and_udp_rules_on_one_port_keep_their_flows_apart() {
+        let mut flow_table = FlowTable::new();
+        let tcp = dialled_tcp(ERP, 5353);
+        let udp = Dialled {
+            transport: flow_table::Transport::Udp,
+            gateway_address: ERP,
+            destination_port: 5353,
+        };
+        let rules = vec![
+            port_rule(dto::RuleTransport::Tcp, 5353, ERP_HOST, 53),
+            port_rule(dto::RuleTransport::Udp, 5353, ERP_HOST, 53),
+        ];
+        admit_ruled(&mut flow_table, "n-1", tcp, "gw-erp", rules.clone());
+        admit_ruled(&mut flow_table, "n-1", udp, "gw-erp", rules);
+
+        let over_tcp = forward_dialled(&mut flow_table, "n-1", tcp);
+        let over_udp = forward_dialled(&mut flow_table, "n-1", udp);
+
+        assert_eq!((over_tcp.host, over_tcp.internal_port), (ERP_HOST, 53));
+        assert_eq!((over_udp.host, over_udp.internal_port), (ERP_HOST, 53));
+        assert_eq!(
+            reply_to(&flow_table, &over_tcp),
+            ("n-1".to_string(), ERP, 5353, 40100)
+        );
+        assert_eq!(
+            reply_to(&flow_table, &over_udp),
+            ("n-1".to_string(), ERP, 5353, 40100)
+        );
+        assert_eq!(flow_table.flow_count(), 2, "two flows, not one merged");
+    }
+
+    /// AC 11, two ports of one gateway: TCP 443 and TCP 2222 of one gateway, rewritten to different
+    /// internal services, used at once from the same node and source port.
+    #[test]
+    fn two_rewritten_ports_of_one_gateway_reach_their_own_service() {
+        let mut flow_table = FlowTable::new();
+        let https = dialled_tcp(ERP, 443);
+        let ssh = dialled_tcp(ERP, 2222);
+        let rules = vec![
+            port_rule(dto::RuleTransport::Tcp, 443, ERP_HOST, 8443),
+            port_rule(dto::RuleTransport::Tcp, 2222, FIN_HOST, 22),
+        ];
+        admit_ruled(&mut flow_table, "n-1", https, "gw-erp", rules.clone());
+        admit_ruled(&mut flow_table, "n-1", ssh, "gw-erp", rules);
+
+        let to_https = forward_dialled(&mut flow_table, "n-1", https);
+        let to_ssh = forward_dialled(&mut flow_table, "n-1", ssh);
+
+        assert_eq!((to_https.host, to_https.internal_port), (ERP_HOST, 8443));
+        assert_eq!((to_ssh.host, to_ssh.internal_port), (FIN_HOST, 22));
+        assert_eq!(
+            reply_to(&flow_table, &to_https),
+            ("n-1".to_string(), ERP, 443, 40100)
+        );
+        assert_eq!(
+            reply_to(&flow_table, &to_ssh),
+            ("n-1".to_string(), ERP, 2222, 40100)
+        );
+        assert_eq!(flow_table.flow_count(), 2, "two flows, not one merged");
+    }
+
     #[test]
     fn packets_sharing_a_translated_port_reach_their_own_gateways_service() {
         let mut flow_table = FlowTable::new();
