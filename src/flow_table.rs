@@ -628,39 +628,41 @@ impl FlowTable {
     /// the next packet. A flow from a node that predates the dialled identity is served only by a
     /// rule with equal ports, judged by the port its packets used; one that has not forwarded a
     /// packet yet is left alone.
+    ///
+    /// TT-3557: only a flow its rules served until now can be ended by a change. A flow that no rule
+    /// served - admitted for a port or transport the gateway does not open, its packets dropped - is
+    /// not ended here and is not reported as a rule change; it stays until it is released, as before
+    /// TT-3449, and a rule added later for its port serves it.
     pub fn update_rules(&mut self, gateway_id: &str, rules: &[PortRule]) -> Vec<RuleEndedFlow> {
         self.gateway_rules
             .insert(gateway_id.to_string(), rules.to_vec());
+        let ended_keys: Vec<FlowKey> = self
+            .flows
+            .iter()
+            .filter(|(key, flow)| {
+                flow.gateway_id == gateway_id
+                    && still_served(key, flow, &flow.rules)
+                    && !still_served(key, flow, rules)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let ended: Vec<RuleEndedFlow> = ended_keys
+            .iter()
+            .filter_map(|key| self.flows.get(key))
+            .map(|flow| RuleEndedFlow {
+                flow_id: flow.flow_id.clone(),
+                device_public_key: flow.device_public_key.clone(),
+            })
+            .collect();
         for flow in self.flows.values_mut() {
             if flow.gateway_id == gateway_id {
                 flow.rules = rules.to_vec();
             }
         }
-        let ended: Vec<RuleEndedFlow> = self
-            .flows
-            .iter()
-            .filter(|(key, flow)| flow.gateway_id == gateway_id && !still_served(key, flow, rules))
-            .map(|(_, flow)| RuleEndedFlow {
-                flow_id: flow.flow_id.clone(),
-                device_public_key: flow.device_public_key.clone(),
-            })
-            .collect();
-        if !ended.is_empty() {
-            let ended_keys: Vec<FlowKey> = self
-                .flows
-                .iter()
-                .filter(|(key, flow)| {
-                    flow.gateway_id == gateway_id && !still_served(key, flow, rules)
-                })
-                .map(|(key, _)| key.clone())
-                .collect();
-            self.remove_flows_where(|key, flow| {
-                flow.gateway_id == gateway_id && !still_served(key, flow, rules)
-            });
-            let now = Instant::now();
-            for key in ended_keys {
-                self.remember_rule_ended(key, now);
-            }
+        let now = Instant::now();
+        for key in ended_keys {
+            self.remove_flow(&key);
+            self.remember_rule_ended(key, now);
         }
         ended
     }
@@ -3458,6 +3460,92 @@ mod tests {
             forward_packet(&mut table, 40100, https),
             Forwarding::Forward { .. }
         ));
+    }
+
+    /// TT-3557: QA's case. Flows admitted for ports and transports the gateway does not open - their
+    /// packets dropped - are not ended, and not reported as a rule change, by a heartbeat that changes
+    /// nothing; nor are they remembered as ended by one.
+    #[test]
+    fn flows_no_rule_served_are_not_ended_by_a_heartbeat() {
+        let mut table = FlowTable::new();
+        let rules = vec![
+            rule(RuleTransport::Tcp, 80, ERP_HOST, 80),
+            rule(RuleTransport::Tcp, 443, ERP_HOST, 80),
+            rule(RuleTransport::Tcp, 2222, ERP_HOST, 22),
+            rule(RuleTransport::Tcp, 2223, ERP_HOST, 22),
+            rule(RuleTransport::Udp, 5353, ERP_HOST, 53),
+        ];
+        let unserved = [
+            (40100, dialled(Transport::Tcp, ERP, 5353)),
+            (40101, dialled(Transport::Tcp, ERP, 8080)),
+            (40102, dialled(Transport::Udp, ERP, 2222)),
+        ];
+        for (port, dialled) in unserved {
+            admit_with_rules(&mut table, port, Some(dialled), rules.clone());
+            assert_eq!(
+                forward_packet(&mut table, port, dialled),
+                Forwarding::Refused(ForwardOutcome::PortNotConfigured),
+                "no rule serves it, so its packets are dropped"
+            );
+        }
+
+        assert!(table.update_rules("gw-erp", &rules).is_empty());
+
+        for (port, dialled) in unserved {
+            assert_ne!(
+                forward_packet(&mut table, port, dialled),
+                Forwarding::NotAdmitted,
+                "the flow is still admitted"
+            );
+            assert!(!table.is_rule_ended("n-1", port, Some(dialled), Instant::now()));
+        }
+    }
+
+    /// TT-3557: a flow opened after its rule was removed was never served by it, so a later heartbeat
+    /// does not report it as ended by that removal.
+    #[test]
+    fn a_flow_opened_after_its_rule_was_removed_is_not_reported() {
+        let mut table = FlowTable::new();
+        let without_ssh = vec![rule(RuleTransport::Tcp, 2222, ERP_HOST, 80)];
+        table.update_rules("gw-erp", &without_ssh);
+        let ssh = dialled(Transport::Tcp, ERP, 2223);
+        admit_with_rules(&mut table, 40100, Some(ssh), without_ssh.clone());
+
+        assert!(table.update_rules("gw-erp", &without_ssh).is_empty());
+    }
+
+    /// TT-3557: a flow no rule served is kept, so a rule added later for its port serves it.
+    #[test]
+    fn a_rule_added_for_an_unserved_flows_port_serves_it() {
+        let mut table = FlowTable::new();
+        let web = dialled(Transport::Tcp, ERP, 8080);
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(web),
+            vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 80)],
+        );
+
+        let ended = table.update_rules(
+            "gw-erp",
+            &[
+                rule(RuleTransport::Tcp, 443, ERP_HOST, 80),
+                rule(RuleTransport::Tcp, 8080, ERP_HOST, 8080),
+            ],
+        );
+
+        assert!(ended.is_empty());
+        assert!(matches!(
+            forward_packet(&mut table, 40100, web),
+            Forwarding::Forward { .. }
+        ));
+        // Served now, so removing that rule again ends it like any other flow.
+        assert_eq!(
+            table
+                .update_rules("gw-erp", &[rule(RuleTransport::Tcp, 443, ERP_HOST, 80)])
+                .len(),
+            1
+        );
     }
 
     /// A flow from a node that predates the dialled identity is judged by the port its packets

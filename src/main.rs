@@ -3883,6 +3883,40 @@ mod tests {
         );
     }
 
+    /// TT-3557: a flow no rule served - admitted for a port the gateway does not open - is not
+    /// reported as ended by a rule change when the heartbeat's rules did not change.
+    #[test]
+    fn reconcile_endpoint_changes_does_not_report_a_flow_no_rule_served() {
+        let rules = vec![dto::PortRule {
+            transport: dto::RuleTransport::Tcp,
+            external_port: 443,
+            internal_host: "10.0.0.1".to_string(),
+            internal_port: 80,
+        }];
+        let bundle = PolicyBundle {
+            port_rules: Some(rules.clone()),
+            ..bundle("gw-1", &[])
+        };
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        flow_table.lock().unwrap().admit_flow(
+            "n-1".to_string(),
+            40001,
+            Some(flow_table::Dialled {
+                transport: flow_table::Transport::Tcp,
+                gateway_address: std::net::Ipv4Addr::new(10, 99, 0, 1),
+                destination_port: 8080,
+            }),
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            rules,
+        );
+
+        let events = reconcile_endpoint_changes(&flow_table, &[bundle]);
+
+        assert!(events.is_empty(), "nothing to report: {events:?}");
+    }
+
     #[test]
     fn reconcile_endpoint_changes_with_no_bundles_is_a_no_op() {
         let flow_table = std::sync::Mutex::new(FlowTable::new());
