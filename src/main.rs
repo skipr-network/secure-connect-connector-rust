@@ -892,7 +892,11 @@ async fn dial_new_nodes(
 fn warn_unforwardable(outcome: ForwardOutcome, node_id: &str, source_port: u16, dst_port: u16) {
     match outcome {
         ForwardOutcome::PortNotConfigured => {
-            warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no port rule for this transport and port - dropping");
+            // Debug, not warn: the flow's admission already warned once, in the log and the local audit
+            // log - that no single rule serves it, or, for a flow from a node without the dialled
+            // identity, that only rules with equal ports serve it. It lasts until Gatekeeper releases
+            // it (spec §B.9 point 4).
+            debug!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but its gateway has no port rule for this transport and port - dropping");
         }
         ForwardOutcome::AmbiguousEndpoint => {
             warn!(%node_id, source_port, dst_port, "decrypted packet's flow is admitted, but more than one port rule matches this transport and port - refusing to guess, dropping");
@@ -1686,8 +1690,9 @@ mod tests {
     }
 
     /// AC 11, TCP and UDP on one port: one gateway opens 5353 on both transports, rewritten to the
-    /// same internal address and port; both flows open at once from the same node and source port
-    /// stay apart, each reply on its own transport.
+    /// same internal address and port. The two flows come from different nodes on the same source
+    /// port and are given the same allocated port, so only the transport tells their replies apart:
+    /// a reply matched to the other transport's flow would go to the wrong node.
     #[test]
     fn tcp_and_udp_rules_on_one_port_keep_their_flows_apart() {
         let mut flow_table = FlowTable::new();
@@ -1702,20 +1707,24 @@ mod tests {
             port_rule(dto::RuleTransport::Udp, 5353, ERP_HOST, 53),
         ];
         admit_ruled(&mut flow_table, "n-1", tcp, "gw-erp", rules.clone());
-        admit_ruled(&mut flow_table, "n-1", udp, "gw-erp", rules);
+        admit_ruled(&mut flow_table, "n-2", udp, "gw-erp", rules);
 
         let over_tcp = forward_dialled(&mut flow_table, "n-1", tcp);
-        let over_udp = forward_dialled(&mut flow_table, "n-1", udp);
+        let over_udp = forward_dialled(&mut flow_table, "n-2", udp);
 
         assert_eq!((over_tcp.host, over_tcp.internal_port), (ERP_HOST, 53));
         assert_eq!((over_udp.host, over_udp.internal_port), (ERP_HOST, 53));
+        assert_eq!(
+            over_tcp.source_port, over_udp.source_port,
+            "ports are allocated per transport, so both flows get the same one"
+        );
         assert_eq!(
             reply_to(&flow_table, &over_tcp),
             ("n-1".to_string(), ERP, 5353, 40100)
         );
         assert_eq!(
             reply_to(&flow_table, &over_udp),
-            ("n-1".to_string(), ERP, 5353, 40100)
+            ("n-2".to_string(), ERP, 5353, 40100)
         );
         assert_eq!(flow_table.flow_count(), 2, "two flows, not one merged");
     }
