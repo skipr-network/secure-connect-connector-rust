@@ -1,0 +1,282 @@
+name: Build Connector & Release
+
+# Per-run title shown in the Actions list.
+run-name: ${{ contains(github.ref_name, '-') && format('Pre-release {0}', github.ref_name) || format('Release {0}', github.ref_name) }}
+
+# =============================================================================
+# Build & Release pipeline for the Connector (TT-1875).
+#
+# Same tag rules as Portal's build.yml (release-tagging-and-guards.md):
+#   - Clean release tag  vX.Y.Z                  -> only from main (guarded below).
+#   - Pre-release tag    vX.Y.Z-<type>.<shortsha> -> from any branch.
+#     <type> is feature, fix, hotfix, or dev (tags cut directly on develop).
+#
+# One difference from Portal: Portal's pre-releases go to GitHub Packages, but the
+# Connector has no package registry - a GitHub Release is the only place an admin's
+# host can download it from. So every tag gets a GitHub Release, and a pre-release
+# tag's is marked as a pre-release and never becomes "latest": the
+# .../releases/latest/download/... links always point at the newest clean release.
+#
+# Jobs:
+#   1) classify       : checks the tag's name, guards clean releases (must be on main).
+#   2) test           : the same checks as ci.yml - a commit that fails them is never released.
+#   3) build          : one static (musl) binary per CPU (x86_64, aarch64), each built
+#                       on a native runner, packaged with install-systemd.sh, attested.
+#   4) create-release : publishes the GitHub Release with both packages and SHA256SUMS.
+#
+# Package layout: <name>/target/release/secure_connect_connector and
+# <name>/packaging/install-systemd.sh - the same paths as a built checkout, so the
+# existing script installs the prebuilt binary as-is, with no Rust or C toolchain:
+#   tar -xzf <name>.tar.gz && cd <name> && sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... ./packaging/install-systemd.sh
+# =============================================================================
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Serialize runs on the same ref; never cancel an in-flight build/release.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  classify:
+    name: Classify tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag-kind: ${{ steps.classify.outputs.kind }}
+      version: ${{ steps.classify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history - needed for the merge-base ancestry check below
+
+      # Guard 1 (release-tagging-and-guards.md §2): a clean release tag (vX.Y.Z,
+      # no suffix) may only point to a commit reachable from main. A pre-release
+      # tag (vX.Y.Z-<type>.<sha>) is valid from any branch and skips the check.
+      - name: Classify tag and guard clean releases
+        id: classify
+        # TAG is passed via env, never interpolated directly into the script:
+        # a git tag name can legally contain shell metacharacters ($(), `, ;, |),
+        # and a literal ${{ github.ref_name }} inline in `run:` would let a
+        # maliciously-named tag execute arbitrary code in this step.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "kind=release" >> "$GITHUB_OUTPUT"
+            git fetch origin main --quiet
+            if ! git merge-base --is-ancestor "$TAG" origin/main; then
+              echo "::error::Clean release tag '$TAG' does not point to a commit on main. Official releases may only be tagged from main - see release-tagging-and-guards.md."
+              exit 1
+            fi
+            echo "'$TAG' is a clean release tag on main - proceeding."
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(feature|fix|hotfix|dev)\.[0-9a-f]{7,40}$ ]]; then
+            echo "kind=prerelease" >> "$GITHUB_OUTPUT"
+            echo "'$TAG' is a pre-release tag - no ancestry check needed, valid from any branch."
+          else
+            echo "::error::Tag '$TAG' does not match either the release (vX.Y.Z) or pre-release (vX.Y.Z-type.sha) naming convention - see release-tagging-and-guards.md."
+            exit 1
+          fi
+
+          # The version is the tag name itself, minus the leading 'v' - valid semver
+          # for both a clean release (1.4.0) and a pre-release (1.4.0-feature.a1b2c3d).
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [classify]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Shellcheck packaging scripts
+        run: shellcheck packaging/*.sh
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [classify, test]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Native runners for both CPUs (no cross-compiling): aarch64 builds on
+          # GitHub's arm64 runner, free for public repositories.
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # Required by actions/attest-build-provenance: id-token mints the OIDC token
+      # used to sign, attestations writes the provenance record to the repo.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl-gcc: the C compiler for the dependencies with C parts (ring), so the
+      # binary links statically against musl and runs on any Linux distribution,
+      # whatever glibc version (if any) the admin's host has.
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Set version from tag
+        env:
+          VERSION: ${{ needs.classify.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Only the [package] version line (the first top-level `version =`), never a dependency's.
+          sed -i "0,/^version = \".*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
+          # Records the new version of this package in Cargo.lock only - no dependency changes.
+          cargo update --workspace
+          echo "::notice title=Connector version::${VERSION}"
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # The C parts are compiled with musl-gcc; Rust's musl target links them itself
+          # (self-contained), so the linker is left at its default.
+          export "CC_${TARGET//-/_}=musl-gcc"
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Check the binary is static
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/${TARGET}/release/secure_connect_connector"
+          file "$BIN"
+          if ! file "$BIN" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::$BIN is not statically linked - it would depend on the host's C library."
+            exit 1
+          fi
+          "$BIN" --help
+
+      - name: Package
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.classify.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="secure_connect_connector-${VERSION}-${ARCH}-linux"
+          mkdir -p "dist/${NAME}/target/release" "dist/${NAME}/packaging"
+          install -m 755 "target/${TARGET}/release/secure_connect_connector" "dist/${NAME}/target/release/"
+          install -m 755 packaging/install-systemd.sh "dist/${NAME}/packaging/"
+          cp README.md "dist/${NAME}/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          tar -tzf "dist/${NAME}.tar.gz"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      # Cryptographic proof that this package was built by this workflow from this commit.
+      # Anyone can verify it with `gh attestation verify <file> -R skipr-network/secure-connect-connector-rust`.
+      # Pinned to the same commit SHA as Portal's build.yml (see the refresh steps there).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/${{ steps.package.outputs.name }}.tar.gz
+
+      # Hand the package to the create-release job; auto-expires after 14 days.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: connector-${{ github.ref_name }}-${{ matrix.arch }}
+          path: dist/${{ steps.package.outputs.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  create-release:
+    name: Create & Upload Assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [classify, build]
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: connector-${{ github.ref_name }}-*
+          path: release-assets
+          merge-multiple: true
+
+      # The installer verifies a download against this file before installing anything.
+      - name: Write SHA256SUMS
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.classify.outputs.version }}
+          TAG_KIND: ${{ needs.classify.outputs.tag-kind }}
+        run: |
+          {
+            echo "### 📦 Connector \`${VERSION}\` (${TAG_KIND})"
+            echo ""
+            echo "- **tag built from**: \`${GITHUB_REF_NAME}\`"
+            echo "- **packages**: \`x86_64\`, \`aarch64\` (static, any Linux distribution)"
+            if [ "${TAG_KIND}" = "prerelease" ]; then
+              echo "- **GitHub Release**: marked pre-release, never \`latest\` - for \`development\`, \`testing\`, \`staging\`"
+            else
+              echo "- **GitHub Release**: becomes \`latest\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Pinned to an immutable commit SHA (supply-chain safety); v3.0.0 runs on Node 24.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ needs.classify.outputs.tag-kind == 'release' && format('Release {0}', github.ref_name) || format('Pre-release {0}', github.ref_name) }}
+          draft: false
+          prerelease: ${{ needs.classify.outputs.tag-kind == 'prerelease' }}
+          make_latest: ${{ needs.classify.outputs.tag-kind == 'release' && 'true' || 'false' }}
+          files: |
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS
+        env:
+          # Built-in token suffices to create a Release in this repo (contents: write above).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
