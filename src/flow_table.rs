@@ -249,7 +249,8 @@ struct AdmittedFlow {
 }
 
 /// A flow `FlowTable::update_rules` ended because its gateway's port rules no longer serve it
-/// (TT-3449).
+/// (TT-3449), or `FlowTable::end_flows_to_old_address` ended because its gateway's address changed
+/// (TT-3699).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleEndedFlow {
     pub flow_id: String,
@@ -377,8 +378,8 @@ pub struct FlowTable {
     /// changed them takes these instead (`current_rules`), under the same lock, so it never admits
     /// a flow by a rule that heartbeat removed.
     gateway_rules: HashMap<String, Vec<PortRule>>,
-    /// TT-3449 review: flows `update_rules` ended, with when a packet of theirs was last seen - see
-    /// `RULE_ENDED_FLOW_MEMORY`.
+    /// TT-3449 review: flows `update_rules` (or, TT-3699, `end_flows_to_old_address`) ended, with when
+    /// a packet of theirs was last seen - see `RULE_ENDED_FLOW_MEMORY`.
     rule_ended_flows: HashMap<FlowKey, Instant>,
 }
 
@@ -646,7 +647,59 @@ impl FlowTable {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        let ended: Vec<RuleEndedFlow> = ended_keys
+        for flow in self.flows.values_mut() {
+            if flow.gateway_id == gateway_id {
+                flow.rules = rules.to_vec();
+            }
+        }
+        self.end_flows(ended_keys)
+    }
+
+    /// TT-3699 (spec §B.20.3): the gateway's address changed from `old` to `new` on this heartbeat -
+    /// ends the open flows of `gateway_id` that are not on the new address and returns them, their
+    /// source ports freed. Like a removed port rule (`update_rules`), changing the address is a
+    /// configuration change, not a withdrawal of the user's access, so the caller writes the local
+    /// audit entry and queues no gateway-end report (§B.18). A no-op when the address is unchanged.
+    ///
+    /// With a new address, every flow whose address is not the new one ends: the old Portal address,
+    /// and the nodes' pool addresses (which differ per node and are known only from the admissions,
+    /// §B.8) - at the first Portal address, and for a node that had refused an earlier Portal address
+    /// and kept the gateway on its pool address. With no new address (the Portal no longer holds
+    /// one, the nodes go back to their pools), the flows to the old address end. A flow whose
+    /// address is not known yet (a flow from a node that predates the dialled identity that has not
+    /// forwarded a packet) is left alone, as `update_rules` leaves it.
+    ///
+    /// Admissions that arrive after the change are not re-checked against the address: such a flow
+    /// ends when it is released, or at the next address change.
+    pub fn end_flows_to_old_address(
+        &mut self,
+        gateway_id: &str,
+        old: Option<Ipv4Addr>,
+        new: Option<Ipv4Addr>,
+    ) -> Vec<RuleEndedFlow> {
+        if old == new {
+            return Vec::new();
+        }
+        let ended_keys: Vec<FlowKey> = self
+            .flows
+            .iter()
+            .filter(|(_, flow)| {
+                flow.gateway_id == gateway_id
+                    && flow.virtual_address.is_some_and(|address| match new {
+                        Some(new) => address != new,
+                        None => Some(address) == old,
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.end_flows(ended_keys)
+    }
+
+    /// Ends the flows a configuration change no longer serves (`update_rules`,
+    /// `end_flows_to_old_address`): removes them, freeing their source ports, and remembers them so
+    /// their late packets are dropped quietly (`is_rule_ended`).
+    fn end_flows(&mut self, keys: Vec<FlowKey>) -> Vec<RuleEndedFlow> {
+        let ended: Vec<RuleEndedFlow> = keys
             .iter()
             .filter_map(|key| self.flows.get(key))
             .map(|flow| RuleEndedFlow {
@@ -654,13 +707,8 @@ impl FlowTable {
                 device_public_key: flow.device_public_key.clone(),
             })
             .collect();
-        for flow in self.flows.values_mut() {
-            if flow.gateway_id == gateway_id {
-                flow.rules = rules.to_vec();
-            }
-        }
         let now = Instant::now();
-        for key in ended_keys {
+        for key in keys {
             self.remove_flow(&key);
             self.remember_rule_ended(key, now);
         }
@@ -3702,6 +3750,293 @@ mod tests {
                 source_port: Some(443),
                 destination_port: Some(40100),
             })
+        );
+    }
+
+    // --- TT-3699: a changed gateway address ends the open flows to the old address (spec §B.20.3) ---
+
+    /// The Portal's address for the ERP gateway, and the new one it changes to.
+    const ERP_PORTAL: Ipv4Addr = Ipv4Addr::new(100, 64, 5, 10);
+    const ERP_PORTAL_NEW: Ipv4Addr = Ipv4Addr::new(100, 64, 5, 11);
+
+    fn erp_rules() -> Vec<PortRule> {
+        vec![rule(RuleTransport::Tcp, 443, ERP_HOST, 8443)]
+    }
+
+    #[test]
+    fn a_changed_address_ends_only_the_flows_to_the_old_one_and_frees_their_ports() {
+        let mut table = FlowTable::new();
+        let to_old = dialled(Transport::Tcp, ERP_PORTAL, 443);
+        let to_new = dialled(Transport::Tcp, ERP_PORTAL_NEW, 443);
+        admit_with_rules(&mut table, 40100, Some(to_old), erp_rules());
+        admit_with_rules(&mut table, 40101, Some(to_new), erp_rules());
+        let Forwarding::Forward {
+            source_port: Some(allocated),
+            ..
+        } = forward_packet(&mut table, 40100, to_old)
+        else {
+            panic!("expected a forward");
+        };
+
+        let ended =
+            table.end_flows_to_old_address("gw-erp", Some(ERP_PORTAL), Some(ERP_PORTAL_NEW));
+
+        assert_eq!(
+            ended,
+            vec![RuleEndedFlow {
+                flow_id: "flow-40100".to_string(),
+                device_public_key: "dev-1".to_string(),
+            }]
+        );
+        assert_eq!(
+            forward_packet(&mut table, 40100, to_old),
+            Forwarding::NotAdmitted
+        );
+        assert_eq!(
+            table.route_reply(Some(Transport::Tcp), Some(ERP_HOST), Some(8443), allocated),
+            Err(ReplyMiss::NoFlow),
+            "its source port is freed"
+        );
+        assert!(
+            table.is_rule_ended("n-1", 40100, Some(to_old), Instant::now()),
+            "its late packets are dropped quietly"
+        );
+        assert!(
+            matches!(
+                forward_packet(&mut table, 40101, to_new),
+                Forwarding::Forward { .. }
+            ),
+            "a flow already on the new address is untouched"
+        );
+    }
+
+    /// The first Portal address at rollout: the old addresses are the nodes' pool addresses, known
+    /// only from the admissions, so every flow to anything but the new address ends.
+    #[test]
+    fn a_first_portal_address_ends_the_flows_to_the_pool_addresses() {
+        let mut table = FlowTable::new();
+        let pool_node_1 = dialled(Transport::Tcp, ERP, 443);
+        let pool_node_2 = dialled(Transport::Tcp, Ipv4Addr::new(10, 99, 0, 7), 443);
+        let portal = dialled(Transport::Tcp, ERP_PORTAL, 443);
+        admit_with_rules(&mut table, 40100, Some(pool_node_1), erp_rules());
+        admit_with_rules(&mut table, 40101, Some(pool_node_2), erp_rules());
+        admit_with_rules(&mut table, 40102, Some(portal), erp_rules());
+
+        let mut ended: Vec<String> = table
+            .end_flows_to_old_address("gw-erp", None, Some(ERP_PORTAL))
+            .into_iter()
+            .map(|flow| flow.flow_id)
+            .collect();
+        ended.sort();
+
+        assert_eq!(ended, ["flow-40100", "flow-40101"]);
+        assert_eq!(table.flow_count(), 1);
+        assert!(matches!(
+            forward_packet(&mut table, 40102, portal),
+            Forwarding::Forward { .. }
+        ));
+    }
+
+    /// The Portal no longer holds an address: the nodes go back to their pools, and the flows to
+    /// the Portal's old address end.
+    #[test]
+    fn a_removed_portal_address_ends_the_flows_to_it() {
+        let mut table = FlowTable::new();
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(dialled(Transport::Tcp, ERP_PORTAL, 443)),
+            erp_rules(),
+        );
+        admit_with_rules(
+            &mut table,
+            40101,
+            Some(dialled(Transport::Tcp, ERP, 443)),
+            erp_rules(),
+        );
+
+        let ended = table.end_flows_to_old_address("gw-erp", Some(ERP_PORTAL), None);
+
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].flow_id, "flow-40100");
+        assert_eq!(table.flow_count(), 1);
+    }
+
+    #[test]
+    fn an_unchanged_address_ends_nothing() {
+        let mut table = FlowTable::new();
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(dialled(Transport::Tcp, ERP_PORTAL, 443)),
+            erp_rules(),
+        );
+        admit_with_rules(
+            &mut table,
+            40101,
+            Some(dialled(Transport::Tcp, ERP, 443)),
+            erp_rules(),
+        );
+
+        assert!(
+            table
+                .end_flows_to_old_address("gw-erp", Some(ERP_PORTAL), Some(ERP_PORTAL))
+                .is_empty()
+        );
+        assert!(
+            table
+                .end_flows_to_old_address("gw-erp", None, None)
+                .is_empty(),
+            "no Portal address before or now: the pools serve it as before"
+        );
+        assert_eq!(table.flow_count(), 2);
+    }
+
+    #[test]
+    fn a_changed_address_leaves_other_gateways_flows_alone() {
+        let mut table = FlowTable::new();
+        admit_with_rules(
+            &mut table,
+            40102,
+            Some(dialled(Transport::Tcp, ERP_PORTAL, 443)),
+            erp_rules(),
+        );
+        // Another gateway's flows, one to the very address this one changes from (possible across
+        // nodes with different pools): both must be left alone.
+        admit_dialled(
+            &mut table,
+            "n-1",
+            40100,
+            dialled(Transport::Tcp, ERP_PORTAL, 443),
+            "gw-fin",
+            "flow-fin",
+            FIN_HOST,
+        );
+        admit_dialled(
+            &mut table,
+            "n-1",
+            40101,
+            dialled(Transport::Tcp, FIN, 443),
+            "gw-fin",
+            "flow-fin-pool",
+            FIN_HOST,
+        );
+
+        let ended =
+            table.end_flows_to_old_address("gw-erp", Some(ERP_PORTAL), Some(ERP_PORTAL_NEW));
+
+        assert_eq!(
+            ended
+                .into_iter()
+                .map(|flow| flow.flow_id)
+                .collect::<Vec<_>>(),
+            ["flow-40102"],
+            "only this gateway's flow to the old address"
+        );
+        assert!(
+            table
+                .end_flows_to_old_address("gw-erp", None, Some(ERP_PORTAL))
+                .is_empty()
+        );
+        assert_eq!(table.flow_count(), 2);
+    }
+
+    /// A node that refused the earlier Portal address kept the gateway on its pool address: a change
+    /// of address ends that flow too, since every flow not on the new address ends.
+    #[test]
+    fn a_changed_address_also_ends_a_flow_still_on_a_pool_address() {
+        let mut table = FlowTable::new();
+        admit_with_rules(
+            &mut table,
+            40100,
+            Some(dialled(Transport::Tcp, ERP_PORTAL, 443)),
+            erp_rules(),
+        );
+        admit_with_rules(
+            &mut table,
+            40101,
+            Some(dialled(Transport::Tcp, ERP, 443)),
+            erp_rules(),
+        );
+
+        let mut ended: Vec<String> = table
+            .end_flows_to_old_address("gw-erp", Some(ERP_PORTAL), Some(ERP_PORTAL_NEW))
+            .into_iter()
+            .map(|flow| flow.flow_id)
+            .collect();
+        ended.sort();
+
+        assert_eq!(ended, ["flow-40100", "flow-40101"]);
+        assert_eq!(table.flow_count(), 0);
+    }
+
+    /// The first Portal address: a flow whose address is not known yet (from a node that predates
+    /// the dialled identity, no packet forwarded) stays.
+    #[test]
+    fn a_first_portal_address_leaves_a_flow_with_no_known_address_alone() {
+        let mut table = FlowTable::new();
+        admit_with_rules(&mut table, 40100, None, erp_rules());
+        admit_with_rules(
+            &mut table,
+            40101,
+            Some(dialled(Transport::Tcp, ERP, 443)),
+            erp_rules(),
+        );
+
+        let ended = table.end_flows_to_old_address("gw-erp", None, Some(ERP_PORTAL));
+
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].flow_id, "flow-40101");
+        assert_eq!(table.gateway_for("n-1", 40100), Some("gw-erp"));
+    }
+
+    /// A flow from a node that predates the dialled identity is judged by the address its packets
+    /// were seen with; one that has not forwarded a packet yet has no address and is left alone.
+    #[test]
+    fn a_flow_without_a_dialled_identity_is_judged_by_the_address_its_packets_used() {
+        let mut table = FlowTable::new();
+        admit_with_rules(&mut table, 40100, None, erp_rules());
+        admit_with_rules(&mut table, 40101, None, erp_rules());
+        table.record_virtual_address("n-1", 40100, ERP_PORTAL);
+
+        let ended =
+            table.end_flows_to_old_address("gw-erp", Some(ERP_PORTAL), Some(ERP_PORTAL_NEW));
+
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].flow_id, "flow-40100");
+        assert_eq!(table.gateway_for("n-1", 40100), None);
+        assert_eq!(table.gateway_for("n-1", 40101), Some("gw-erp"));
+    }
+
+    /// TT-2529 "Apply the same access rules to hostname and Gateway IP": a flow to the Portal's
+    /// address is served by the same port rules as one to a pool address - the address only
+    /// identifies the flow, it never picks a rule. Entitlement is the same too: access is decided by
+    /// `gateway_id` (`access::decide_access`), never by the address, so it does not matter whether
+    /// the user dialled the hostname or the Gateway IP.
+    #[test]
+    fn a_flow_to_the_portal_address_is_served_by_the_same_port_rules() {
+        let mut table = FlowTable::new();
+        let portal = dialled(Transport::Tcp, ERP_PORTAL, 443);
+        let pool = dialled(Transport::Tcp, ERP, 443);
+        admit_with_rules(&mut table, 40100, Some(portal), erp_rules());
+        admit_with_rules(&mut table, 40101, Some(pool), erp_rules());
+
+        for (port, to) in [(40100, portal), (40101, pool)] {
+            assert!(matches!(
+                forward_packet(&mut table, port, to),
+                Forwarding::Forward {
+                    address: ERP_HOST,
+                    destination_port: Some(8443),
+                    source_port: Some(_),
+                }
+            ));
+        }
+        let port_8080 = dialled(Transport::Tcp, ERP_PORTAL, 8080);
+        admit_with_rules(&mut table, 40102, Some(port_8080), erp_rules());
+        assert_eq!(
+            forward_packet(&mut table, 40102, port_8080),
+            Forwarding::Refused(ForwardOutcome::PortNotConfigured),
+            "a port no rule opens is refused on the Portal address too"
         );
     }
 }
