@@ -14,6 +14,7 @@ mod heartbeat;
 mod identity;
 mod policy;
 mod registry_client;
+mod request_proof;
 mod tun_device;
 mod tunnel;
 
@@ -135,7 +136,13 @@ async fn main() -> anyhow::Result<()> {
 
     let http = build_http_client(&config)?;
     let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-    let agent_directory = AgentDirectory::new(http.clone(), config.agents_json_url.clone());
+    // TT-3717 (spec §B.4 point 4): proves each heartbeat with its own copy of the identity secret
+    // (moved into the tunnel below), keeping each Agent's key-agreement key next to the identity key.
+    let agent_directory = AgentDirectory::new(http.clone(), config.agents_json_url.clone())
+        .with_request_prover(request_proof::RequestProver::new(
+            connector_identity.secret.clone(),
+            request_proof::kept_agent_keys_path(&config.identity_key_path),
+        ));
     let heartbeat_client = HeartbeatClient::new(http);
     // Kept past the move of connector_identity.secret below: every heartbeat identifies this
     // Connector by it (TT-2210).
@@ -370,7 +377,13 @@ async fn deregister() -> i32 {
         let identity = identity::load_existing(&config.identity_key_path)?;
         let http = build_http_client(&config)?;
         let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
-        let agent_directory = AgentDirectory::new(http.clone(), config.agents_json_url.clone());
+        // TT-3717: proven like the heartbeat, with the daemon's kept Agent keys - read only, as this
+        // runs as root while the daemon still runs (install-systemd.sh --decommission).
+        let agent_directory = AgentDirectory::new(http.clone(), config.agents_json_url.clone())
+            .with_request_prover(request_proof::RequestProver::read_only(
+                identity.secret.clone(),
+                request_proof::kept_agent_keys_path(&config.identity_key_path),
+            ));
         let heartbeat_client = HeartbeatClient::new(http);
         agent_directory
             .deregister(

@@ -14,23 +14,30 @@
 //! registers it, so nothing has to be configured on its host afterwards. Until then Agent answers
 //! "not registered" (spec §B.4 point 1) - see [`AgentRejected`].
 //!
-//! The request itself (`ConnectorHeartbeatRequest`, TT-2069) carries no signature the other
-//! direction - this call has never had any per-request authentication (any caller who can reach
-//! this URL for a given Connector already gets back that connector's real, signed policy bundle),
-//! so a request body doesn't introduce a new trust boundary, only extends the existing one it
-//! already operates under.
+//! TT-3717 (spec §B.4 point 4): each request carries the Connector request proof when the caller
+//! has a key for that Agent - a MAC over the exact body bytes sent, so the body is serialized once
+//! and those bytes are both MACed and sent. The Agent refuses a bad proof with `401` and a
+//! `reason`, read here into [`ProofRefused`] - unlike [`AgentRejected`], a refusal for this Agent
+//! instance only, so the caller moves on to the next one.
 
 use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, StatusCode};
+use reqwest::header::CONTENT_TYPE;
+use reqwest::{Client, Response, StatusCode};
+use serde::Serialize;
 
 use crate::crypto;
 use crate::dto::{
     ConnectorDeregisterRequest, ConnectorDeregisterResponse, ConnectorHeartbeatRequest,
     ConnectorHeartbeatResponse,
 };
+use crate::request_proof::AgentProofKey;
+
+/// Also the path MACed into the request proof (spec §B.4 point 4).
+pub const HEARTBEAT_PATH: &str = "/api/connectors/heartbeat";
+pub const DEREGISTER_PATH: &str = "/api/connectors/deregister";
 
 const SIGNATURE_HEADER: &str = "X-Signature";
 
@@ -84,6 +91,67 @@ impl fmt::Display for AgentRejected {
 
 impl std::error::Error for AgentRejected {}
 
+/// TT-3717: why an Agent refused the Connector request proof (spec §B.4 point 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofRefusal {
+    /// MAC wrong, malformed, partial or unknown version - possibly a rotated Agent key.
+    Invalid,
+    /// Timestamp outside the Agent's window - most likely this host's clock.
+    Expired,
+    Replayed,
+    /// No proof, after the migration end date or from a Connector that has proven itself before.
+    Required,
+}
+
+impl ProofRefusal {
+    fn from_reason(reason: &str) -> Option<Self> {
+        // `contains`, like the reasons above: they may arrive prefixed (`error.`).
+        [
+            ("connectorproofinvalid", Self::Invalid),
+            ("connectorproofexpired", Self::Expired),
+            ("connectorproofreplayed", Self::Replayed),
+            ("connectorproofrequired", Self::Required),
+        ]
+        .into_iter()
+        .find_map(|(code, refusal)| reason.contains(code).then_some(refusal))
+    }
+}
+
+/// TT-3717: the Agent answered `401` with a proof refusal. Unlike [`AgentRejected`] this is about
+/// this Agent instance (each has its own key), so the caller moves on to the next one.
+#[derive(Debug)]
+pub struct ProofRefused {
+    pub refusal: ProofRefusal,
+    pub reason: String,
+}
+
+impl fmt::Display for ProofRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Agent refused the request proof: {}", self.reason)
+    }
+}
+
+impl std::error::Error for ProofRefused {}
+
+async fn reason_of(response: Response) -> Option<String> {
+    response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| body.get("reason")?.as_str().map(str::to_string))
+}
+
+/// A `401` naming a proof refusal becomes [`ProofRefused`]; any other `401` stays a plain error.
+async fn proof_refused_or_unauthorized(response: Response, url: &str) -> anyhow::Error {
+    match reason_of(response).await {
+        Some(reason) => match ProofRefusal::from_reason(&reason) {
+            Some(refusal) => ProofRefused { refusal, reason }.into(),
+            None => anyhow::anyhow!("Agent returned 401 ({reason}) at {url}"),
+        },
+        None => anyhow::anyhow!("Agent returned 401 at {url}"),
+    }
+}
+
 pub struct HeartbeatClient {
     http: Client,
 }
@@ -93,41 +161,67 @@ impl HeartbeatClient {
         Self { http }
     }
 
+    /// Posts `body` as JSON, with the request proof for this Agent when there is a key for it.
+    /// The body is serialized once: the proof covers exactly the bytes sent.
+    async fn post(
+        &self,
+        agent_base_url: &str,
+        path: &str,
+        body: &impl Serialize,
+        proof_key: Option<&AgentProofKey>,
+    ) -> Result<(String, Response)> {
+        let url = format!("{}{path}", agent_base_url.trim_end_matches('/'));
+        let body = serde_json::to_vec(body).context("failed to serialize the request body")?;
+        let mut request = self
+            .http
+            .post(&url)
+            .timeout(HEARTBEAT_REQUEST_TIMEOUT)
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(proof_key) = proof_key {
+            // A new timestamp on every attempt: the Agent refuses a MAC it has already accepted.
+            let timestamp_ms = chrono::Utc::now().timestamp_millis();
+            for (name, value) in proof_key.headers("POST", path, &body, timestamp_ms) {
+                request = request.header(name, value);
+            }
+        }
+        let response = request
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("request to {url} failed"))?;
+        Ok((url, response))
+    }
+
     /// Fetches, verifies, and deserializes a Connector heartbeat from the Agent at
     /// `agent_base_url`. `agent_public_key_hex` must be that specific Agent's key (Registry's
     /// per-Agent lookup, TT-1742) - never any registered Agent's key. `request` carries this
     /// Connector's own public key and observed state (TT-2069) - the hosts, if any, `dns_cache`
     /// still couldn't resolve as of the previous cycle.
     ///
-    /// Fails with [`AgentRejected`] when Agent answers with a refusal, and with a plain error for
-    /// anything else (unreachable, 5xx, bad signature, wrong shape).
+    /// `proof_key` is this Agent's request-proof key (TT-3717); `None` sends no proof.
+    ///
+    /// Fails with [`AgentRejected`] when Agent answers with a refusal, with [`ProofRefused`] when
+    /// it refuses the proof, and with a plain error for anything else (unreachable, 5xx, bad
+    /// signature, wrong shape).
     pub async fn fetch_and_verify(
         &self,
         agent_base_url: &str,
         agent_public_key_hex: &str,
+        proof_key: Option<&AgentProofKey>,
         request: &ConnectorHeartbeatRequest,
     ) -> Result<ConnectorHeartbeatResponse> {
-        let url = format!(
-            "{}/api/connectors/heartbeat",
-            agent_base_url.trim_end_matches('/')
-        );
-        let response = self
-            .http
-            .post(&url)
-            .timeout(HEARTBEAT_REQUEST_TIMEOUT)
-            .json(request)
-            .send()
+        let (url, response) = self
+            .post(agent_base_url, HEARTBEAT_PATH, request, proof_key)
             .await
-            .with_context(|| format!("heartbeat request to {url} failed"))?;
+            .context("heartbeat request failed")?;
 
         let status = response.status();
         if status == StatusCode::BAD_REQUEST {
-            let reason = response
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|body| body.get("reason")?.as_str().map(str::to_string));
+            let reason = reason_of(response).await;
             return Err(AgentRejected { status, reason }.into());
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(proof_refused_or_unauthorized(response, &url).await);
         }
         if !status.is_success() {
             bail!("Agent returned {status} for heartbeat at {url}");
@@ -172,34 +266,27 @@ impl HeartbeatClient {
     /// Connector's own key - and only while it has not expired: the host removes its service and key on it.
     ///
     /// Fails with [`AgentRejected`] for Portal's refusals (400 `connectornotregistered`, 409
-    /// `connectornotdecommissioning`), and with a plain error for anything else.
+    /// `connectornotdecommissioning`), with [`ProofRefused`] when the Agent refuses the request
+    /// proof (TT-3717), and with a plain error for anything else.
     pub async fn deregister_and_verify(
         &self,
         agent_base_url: &str,
         agent_public_key_hex: &str,
+        proof_key: Option<&AgentProofKey>,
         request: &ConnectorDeregisterRequest,
     ) -> Result<ConnectorDeregisterResponse> {
-        let url = format!(
-            "{}/api/connectors/deregister",
-            agent_base_url.trim_end_matches('/')
-        );
-        let response = self
-            .http
-            .post(&url)
-            .timeout(HEARTBEAT_REQUEST_TIMEOUT)
-            .json(request)
-            .send()
+        let (url, response) = self
+            .post(agent_base_url, DEREGISTER_PATH, request, proof_key)
             .await
-            .with_context(|| format!("deregistration request to {url} failed"))?;
+            .context("deregistration request failed")?;
 
         let status = response.status();
         if status == StatusCode::BAD_REQUEST || status == StatusCode::CONFLICT {
-            let reason = response
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|body| body.get("reason")?.as_str().map(str::to_string));
+            let reason = reason_of(response).await;
             return Err(AgentRejected { status, reason }.into());
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(proof_refused_or_unauthorized(response, &url).await);
         }
         if !status.is_success() {
             bail!("Agent returned {status} for the deregistration at {url}");
@@ -287,7 +374,12 @@ mod tests {
         let server = agent_answering(SAMPLE_BODY, Some(&signature)).await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await
             .unwrap();
 
@@ -304,7 +396,12 @@ mod tests {
         let server = agent_answering(SAMPLE_BODY, Some(&signature)).await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -316,7 +413,12 @@ mod tests {
         let server = agent_answering(SAMPLE_BODY, None).await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -330,7 +432,12 @@ mod tests {
         let server = agent_answering(tampered_body, Some(&signature)).await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -349,7 +456,12 @@ mod tests {
         let server = agent_answering(other_connectors_body, Some(&signature)).await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -364,7 +476,12 @@ mod tests {
         let server = agent_answering(keyless_body, Some(&signature)).await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -381,7 +498,12 @@ mod tests {
             .await;
 
         let error = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await
             .unwrap_err();
 
@@ -407,12 +529,68 @@ mod tests {
             .await;
 
         let error = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await
             .unwrap_err();
 
         let rejection = error.downcast_ref::<AgentRejected>().unwrap();
         assert!(rejection.is_not_registered());
+    }
+
+    /// TT-3717: a proof refusal is read from a 401 and kept apart from a refusal every Agent
+    /// would give (`AgentRejected`).
+    #[tokio::test]
+    async fn reads_each_proof_refusal_from_a_401() {
+        for (reason, refusal) in [
+            ("error.connectorproofinvalid", ProofRefusal::Invalid),
+            ("error.connectorproofexpired", ProofRefusal::Expired),
+            ("error.connectorproofreplayed", ProofRefusal::Replayed),
+            ("error.connectorproofrequired", ProofRefusal::Required),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/connectors/heartbeat"))
+                .respond_with(
+                    ResponseTemplate::new(401)
+                        .set_body_json(serde_json::json!({ "reason": reason })),
+                )
+                .mount(&server)
+                .await;
+
+            let error = HeartbeatClient::new(Client::new())
+                .fetch_and_verify(&server.uri(), "unused", None, &request())
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error.downcast_ref::<ProofRefused>().unwrap().refusal,
+                refusal
+            );
+            assert!(error.downcast_ref::<AgentRejected>().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_without_a_proof_reason_is_a_plain_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/deregister"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let error = HeartbeatClient::new(Client::new())
+            .deregister_and_verify(&server.uri(), "unused", None, &deregister_request())
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProofRefused>().is_none());
+        assert!(error.downcast_ref::<AgentRejected>().is_none());
     }
 
     #[tokio::test]
@@ -426,7 +604,12 @@ mod tests {
             .await;
 
         let error = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await
             .unwrap_err();
 
@@ -443,6 +626,7 @@ mod tests {
             .fetch_and_verify(
                 "http://127.0.0.1:1",
                 &agent_identity.public_key_hex,
+                None,
                 &request(),
             )
             .await;
@@ -459,7 +643,12 @@ mod tests {
         let server = agent_answering(malformed_body, Some(&signature)).await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request())
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -491,7 +680,12 @@ mod tests {
             .await;
 
         let result = HeartbeatClient::new(Client::new())
-            .fetch_and_verify(&server.uri(), &agent_identity.public_key_hex, &request)
+            .fetch_and_verify(
+                &server.uri(),
+                &agent_identity.public_key_hex,
+                None,
+                &request,
+            )
             .await;
 
         assert!(
@@ -544,6 +738,7 @@ mod tests {
             .deregister_and_verify(
                 &server.uri(),
                 &agent_identity.public_key_hex,
+                None,
                 &deregister_request(),
             )
             .await
@@ -570,6 +765,7 @@ mod tests {
             .deregister_and_verify(
                 &server.uri(),
                 &agent_identity.public_key_hex,
+                None,
                 &deregister_request(),
             )
             .await
@@ -594,6 +790,7 @@ mod tests {
             .deregister_and_verify(
                 &server.uri(),
                 &agent_identity.public_key_hex,
+                None,
                 &deregister_request(),
             )
             .await
@@ -619,6 +816,7 @@ mod tests {
             .deregister_and_verify(
                 &server.uri(),
                 &agent_identity.public_key_hex,
+                None,
                 &deregister_request(),
             )
             .await
@@ -644,6 +842,7 @@ mod tests {
             .deregister_and_verify(
                 &server.uri(),
                 &agent_identity.public_key_hex,
+                None,
                 &deregister_request(),
             )
             .await
@@ -661,7 +860,7 @@ mod tests {
             .await;
 
         let error = HeartbeatClient::new(Client::new())
-            .deregister_and_verify(&server.uri(), "unused", &deregister_request())
+            .deregister_and_verify(&server.uri(), "unused", None, &deregister_request())
             .await
             .unwrap_err();
 
@@ -679,7 +878,7 @@ mod tests {
         .await;
 
         let error = HeartbeatClient::new(Client::new())
-            .deregister_and_verify(&server.uri(), "unused", &deregister_request())
+            .deregister_and_verify(&server.uri(), "unused", None, &deregister_request())
             .await
             .unwrap_err();
 

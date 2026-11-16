@@ -112,6 +112,11 @@ occasional ancient or malformed entry always has been).
 waiting for a successful heartbeat, so a revoked user's **Access removed** notice still arrives
 after a Connector restart. The directory must stay writable by the service user.
 
+**`CONNECTOR_IDENTITY_KEY_PATH`** - the Connector's identity key. The Connector also keeps
+`agent-x25519-keys` in the same directory (mode 600): the last key-agreement key fetched for each
+Agent, used for the request proof on the heartbeat and deregistration (TT-3717) when the Registry
+returns none. The directory must stay writable by the service user; decommissioning removes the file.
+
 **`CONNECTOR_IDENTITY_KEY_PATH` must match the path `--generate-identity` actually used** when
 running the raw binary by hand - it is not persisted anywhere by itself (the systemd install below
 handles this for you, writing the path it used into `connector.env`). Starting the daemon with a
