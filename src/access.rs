@@ -175,6 +175,7 @@ mod tests {
                 port: 443,
             }],
             port_rules: None,
+            gateway_address: None,
             entitlement_list: entitlements,
         }
     }

@@ -79,6 +79,13 @@ pub struct PolicyBundle {
     /// warning rather than failing the whole heartbeat, which would stop every gateway here.
     #[serde(default, deserialize_with = "deserialize_port_rules")]
     pub port_rules: Option<Vec<PortRule>>,
+    /// TT-2529 (spec §B.20.3): the gateway's address as the Portal holds it - dotted IPv4, no mask.
+    /// `None` when the Portal holds none (absent or `null`, also from a Portal or Agent that
+    /// predates it): the nodes then use their own pool address. A value that is not an IPv4 address
+    /// is treated as absent with a warning rather than failing the whole heartbeat, as Gatekeeper
+    /// falls back to its pool for it too.
+    #[serde(default, deserialize_with = "deserialize_gateway_address")]
+    pub gateway_address: Option<std::net::Ipv4Addr>,
     pub entitlement_list: Vec<Entitlement>,
 }
 
@@ -158,6 +165,39 @@ fn deserialize_port_rules<'de, D: serde::Deserializer<'de>>(
             })
             .collect()
     }))
+}
+
+/// TT-2529: reads `gateway_address` leniently - a value of any type that is not a dotted IPv4
+/// address is dropped with a warning, so one bad value never stops every gateway on this Connector.
+fn deserialize_gateway_address<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::net::Ipv4Addr>, D::Error> {
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let address = match &raw {
+        None => return Ok(None),
+        Some(serde_json::Value::String(value)) => value.parse().ok(),
+        Some(_) => None,
+    };
+    if address.is_none()
+        && let Some(value) = raw
+    {
+        // The value's type and at most 64 characters of it: never a whole unexpected document.
+        let kind = match &value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        };
+        let excerpt: String = value.to_string().chars().take(64).collect();
+        tracing::warn!(
+            kind,
+            value = %excerpt,
+            "Ignored a gateway_address that is not an IPv4 address"
+        );
+    }
+    Ok(address)
 }
 
 /// One port a gateway opens and where it leads (TT-2514): a flow on `transport` to the gateway's
@@ -494,6 +534,65 @@ mod tests {
         let bundle: PolicyBundle = serde_json::from_str(json).unwrap();
 
         assert_eq!(bundle.port_rules, None);
+    }
+
+    /// TT-2529 (spec §B.20.3): the Portal's address for the gateway, as Agent relays it.
+    #[test]
+    fn deserializes_the_gateway_address() {
+        let json = r#"{
+            "gateway_id": "gw-1", "location": "Mumbai", "hostname": "erp.internal", "access_mode": "ALL",
+            "endpoints": [], "gateway_address": "100.64.5.10", "entitlement_list": []
+        }"#;
+
+        let bundle: PolicyBundle = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            bundle.gateway_address,
+            Some(std::net::Ipv4Addr::new(100, 64, 5, 10))
+        );
+    }
+
+    /// TT-2529: a Portal or Agent that holds no address leaves the field out (or sends `null`): the
+    /// bundle reads exactly as before.
+    #[test]
+    fn an_absent_or_null_gateway_address_is_none() {
+        for field in ["", r#""gateway_address": null,"#] {
+            let json = format!(
+                r#"{{"gateway_id": "gw-1", "location": "Mumbai", "hostname": "erp.internal",
+                "access_mode": "ALL", "endpoints": [], {field} "entitlement_list": []}}"#
+            );
+
+            let bundle: PolicyBundle = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(bundle.gateway_address, None, "{field}");
+        }
+    }
+
+    /// TT-2529: a value that is not a dotted IPv4 address - with a mask, IPv6, a name, empty, not a
+    /// string - is treated as absent and never fails the heartbeat (the nullable
+    /// device_public_key lesson).
+    #[test]
+    fn an_invalid_gateway_address_is_treated_as_absent() {
+        for value in [
+            r#""100.64.5.10/32""#,
+            r#""fd00::1""#,
+            r#""crm.example.com""#,
+            r#""""#,
+            "42",
+            "true",
+            r#"["100.64.5.10"]"#,
+            r#"{"address": "100.64.5.10"}"#,
+        ] {
+            let json = format!(
+                r#"{{"gateway_id": "gw-1", "location": "Mumbai", "hostname": "erp.internal",
+                "access_mode": "ALL", "endpoints": [], "gateway_address": {value},
+                "entitlement_list": []}}"#
+            );
+
+            let bundle: PolicyBundle = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(bundle.gateway_address, None, "{value}");
+        }
     }
 
     /// Regression test: an entitled user with no paired device yet is a real, expected state

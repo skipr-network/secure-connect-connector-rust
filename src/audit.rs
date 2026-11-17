@@ -35,6 +35,10 @@ pub enum AuditEvent {
         hostname: String,
         /// Each as transport, external port, internal host and internal port.
         port_rules: Vec<crate::dto::PortRule>,
+        /// TT-2529 (spec §B.20.3): the gateway's address as the Portal holds it; left out when it
+        /// holds none, so such an entry reads as before.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gateway_address: Option<std::net::Ipv4Addr>,
     },
     /// TT-2520 (spec §B.10): one gateway's entitlement list as received on an accepted heartbeat -
     /// written on every heartbeat, not only on change. Recorded as its entry count and a SHA-256
@@ -86,6 +90,19 @@ pub enum AuditEvent {
         /// Each as flow id and device key.
         flows: Vec<EndedFlow>,
     },
+    /// TT-3699 (spec §B.20.3, §B.10): a heartbeat changed one gateway's address and these open flows
+    /// to the old address were ended. `old_gateway_address` is `null` when the Portal held none
+    /// before - the nodes' pool addresses - and `gateway_address` is `null` when it holds none now.
+    /// A configuration change, not a withdrawal of access, so no gateway-end report is queued for
+    /// them (spec §B.18).
+    FlowsEndedByAddressChange {
+        gateway_id: String,
+        old_gateway_address: Option<std::net::Ipv4Addr>,
+        gateway_address: Option<std::net::Ipv4Addr>,
+        flows_ended: usize,
+        /// Each as flow id and device key.
+        flows: Vec<EndedFlow>,
+    },
     /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
     /// to this gateway, and a gateway-end report was queued for it.
     FlowsEnded {
@@ -97,7 +114,7 @@ pub enum AuditEvent {
     },
 }
 
-/// One flow in a `FlowsEndedByRuleChange` entry.
+/// One flow in a `FlowsEndedByRuleChange` or `FlowsEndedByAddressChange` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EndedFlow {
     pub flow_id: String,
