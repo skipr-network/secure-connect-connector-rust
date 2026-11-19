@@ -26,6 +26,9 @@
 //! instance only (each has its own key), so it is handled like an outage, not like a refusal - with
 //! one exception: on `connectorproofinvalid` the Agent's key may have rotated, so it is fetched
 //! again and that Agent retried once with a new proof before moving on.
+//!
+//! TT-3767: a `429` ([`RateLimited`]) is a limit of that Agent instance too - moved on from like
+//! an outage, without a retry, but logged as rate limiting rather than as "did not answer".
 
 use std::future::Future;
 use std::sync::Mutex;
@@ -40,7 +43,7 @@ use crate::dto::{
     ConnectorDeregisterRequest, ConnectorDeregisterResponse, ConnectorHeartbeatRequest,
     ConnectorHeartbeatResponse,
 };
-use crate::heartbeat::{AgentRejected, HeartbeatClient, ProofRefusal, ProofRefused};
+use crate::heartbeat::{AgentRejected, HeartbeatClient, ProofRefusal, ProofRefused, RateLimited};
 use crate::registry_client::RegistryClient;
 use crate::request_proof::{AgentProofKey, RequestProver};
 
@@ -149,6 +152,10 @@ impl AgentDirectory {
                     warn_proof_refused(&agent, &error, "heartbeat");
                     failures.push(format!("{}: {error:#}", agent.ip_address));
                 }
+                Err(error) if error.downcast_ref::<RateLimited>().is_some() => {
+                    warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent rate limited the heartbeat - trying the next operational Agent");
+                    failures.push(format!("{}: {error:#}", agent.ip_address));
+                }
                 Err(error) => {
                     warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent did not answer the heartbeat - trying the next operational Agent");
                     failures.push(format!("{}: {error:#}", agent.ip_address));
@@ -185,6 +192,10 @@ impl AgentDirectory {
                 Err(error) if error.downcast_ref::<AgentRejected>().is_some() => return Err(error),
                 Err(error) if error.downcast_ref::<ProofRefused>().is_some() => {
                     warn_proof_refused(&agent, &error, "deregistration");
+                    failures.push(format!("{}: {error:#}", agent.ip_address));
+                }
+                Err(error) if error.downcast_ref::<RateLimited>().is_some() => {
+                    warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent rate limited the deregistration - trying the next operational Agent");
                     failures.push(format!("{}: {error:#}", agent.ip_address));
                 }
                 Err(error) => {
@@ -1284,6 +1295,76 @@ mod proof_tests {
         );
         assert_eq!(env.requests_to("10.0.0.2").await.len(), 2);
         assert!(env.requests_to("10.0.0.3").await.is_empty());
+    }
+
+    fn rate_limited() -> ResponseTemplate {
+        ResponseTemplate::new(429)
+            .insert_header("Retry-After", "30")
+            .set_body_json(serde_json::json!({ "reason": "connectorratelimited" }))
+    }
+
+    /// TT-3767: a `429` moves on to the next Agent like any other failure of that Agent - no
+    /// retry on it, the heartbeat does not end - and is reported as rate limiting.
+    #[tokio::test]
+    async fn moves_on_to_the_next_agent_when_one_rate_limits_the_heartbeat() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let limiting = AgentKeys::new();
+        let healthy = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &limiting, true, None)
+            .await;
+        env.registry_answers("10.0.0.3", &healthy, true, None).await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, rate_limited(), None)
+            .await;
+        env.agent_answers("10.0.0.3", HEARTBEAT, env.heartbeat_ok(&healthy), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        assert_eq!(env.requests_to("10.0.0.2").await.len(), 1, "no retry");
+        assert_eq!(env.requests_to("10.0.0.3").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reports_rate_limiting_when_every_agent_rate_limits() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, true, None).await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, rate_limited(), None)
+            .await;
+        env.agent_answers("10.0.0.2", DEREGISTER, rate_limited(), None)
+            .await;
+
+        let heartbeat = env.heartbeat(&env.directory()).await.unwrap_err();
+        let deregistration = env.deregister(&env.directory()).await.unwrap_err();
+
+        for error in [heartbeat, deregistration] {
+            assert!(error.downcast_ref::<AgentRejected>().is_none());
+            assert!(
+                error.to_string().contains(
+                    "10.0.0.2: Agent rate limited the request (connectorratelimited), Retry-After 30"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn moves_on_to_the_next_agent_when_one_rate_limits_the_deregistration() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let limiting = AgentKeys::new();
+        let healthy = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &limiting, true, None)
+            .await;
+        env.registry_answers("10.0.0.3", &healthy, true, None).await;
+        env.agent_answers("10.0.0.2", DEREGISTER, rate_limited(), None)
+            .await;
+        env.agent_answers("10.0.0.3", DEREGISTER, env.deregister_ok(&healthy), None)
+            .await;
+
+        env.deregister(&env.directory()).await.unwrap();
+
+        assert_eq!(env.requests_to("10.0.0.2").await.len(), 1, "no retry");
+        assert_eq!(env.requests_to("10.0.0.3").await.len(), 1);
     }
 
     #[tokio::test]

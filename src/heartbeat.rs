@@ -19,12 +19,16 @@
 //! and those bytes are both MACed and sent. The Agent refuses a bad proof with `401` and a
 //! `reason`, read here into [`ProofRefused`] - unlike [`AgentRejected`], a refusal for this Agent
 //! instance only, so the caller moves on to the next one.
+//!
+//! TT-3767: the Agent answers `429` (`connectorratelimited`, with `Retry-After`) when it rate
+//! limits proof checking - read here into [`RateLimited`] only so the caller can log it as what it
+//! is; it is still handled like any other failure of that Agent.
 
 use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 use serde::Serialize;
 
@@ -133,6 +137,46 @@ impl fmt::Display for ProofRefused {
 
 impl std::error::Error for ProofRefused {}
 
+/// TT-3767 (TT-3717): the Agent answered `429` - it rate limits proof checking per address, per
+/// Connector key and by concurrent verifications. A limit of this Agent instance, so the caller
+/// moves on to the next Agent as for any other failure; kept distinct only so it is logged as rate
+/// limiting rather than as an Agent that did not answer. `Retry-After` is logged, not honoured.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub retry_after: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl RateLimited {
+    async fn from_response(response: Response) -> Self {
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let reason = reason_of(response).await;
+        Self {
+            retry_after,
+            reason,
+        }
+    }
+}
+
+impl fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Agent rate limited the request")?;
+        if let Some(reason) = &self.reason {
+            write!(f, " ({reason})")?;
+        }
+        if let Some(retry_after) = &self.retry_after {
+            write!(f, ", Retry-After {retry_after}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
 async fn reason_of(response: Response) -> Option<String> {
     response
         .json::<serde_json::Value>()
@@ -201,8 +245,8 @@ impl HeartbeatClient {
     /// `proof_key` is this Agent's request-proof key (TT-3717); `None` sends no proof.
     ///
     /// Fails with [`AgentRejected`] when Agent answers with a refusal, with [`ProofRefused`] when
-    /// it refuses the proof, and with a plain error for anything else (unreachable, 5xx, bad
-    /// signature, wrong shape).
+    /// it refuses the proof, with [`RateLimited`] on a `429`, and with a plain error for anything
+    /// else (unreachable, 5xx, bad signature, wrong shape).
     pub async fn fetch_and_verify(
         &self,
         agent_base_url: &str,
@@ -222,6 +266,9 @@ impl HeartbeatClient {
         }
         if status == StatusCode::UNAUTHORIZED {
             return Err(proof_refused_or_unauthorized(response, &url).await);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(RateLimited::from_response(response).await.into());
         }
         if !status.is_success() {
             bail!("Agent returned {status} for heartbeat at {url}");
@@ -267,7 +314,8 @@ impl HeartbeatClient {
     ///
     /// Fails with [`AgentRejected`] for Portal's refusals (400 `connectornotregistered`, 409
     /// `connectornotdecommissioning`), with [`ProofRefused`] when the Agent refuses the request
-    /// proof (TT-3717), and with a plain error for anything else.
+    /// proof (TT-3717), with [`RateLimited`] on a `429` (TT-3767), and with a plain error for
+    /// anything else.
     pub async fn deregister_and_verify(
         &self,
         agent_base_url: &str,
@@ -287,6 +335,9 @@ impl HeartbeatClient {
         }
         if status == StatusCode::UNAUTHORIZED {
             return Err(proof_refused_or_unauthorized(response, &url).await);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(RateLimited::from_response(response).await.into());
         }
         if !status.is_success() {
             bail!("Agent returned {status} for the deregistration at {url}");
@@ -591,6 +642,47 @@ mod tests {
 
         assert!(error.downcast_ref::<ProofRefused>().is_none());
         assert!(error.downcast_ref::<AgentRejected>().is_none());
+    }
+
+    /// TT-3767: a `429` is read as rate limiting - with the Agent's reason and `Retry-After` - on
+    /// both routes, and is neither a refusal nor a proof refusal.
+    #[tokio::test]
+    async fn reads_a_429_as_rate_limited_on_both_routes() {
+        for route in [HEARTBEAT_PATH, DEREGISTER_PATH] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(429)
+                        .insert_header("Retry-After", "30")
+                        .set_body_json(serde_json::json!({ "reason": "connectorratelimited" })),
+                )
+                .mount(&server)
+                .await;
+            let client = HeartbeatClient::new(Client::new());
+
+            let error = if route == HEARTBEAT_PATH {
+                client
+                    .fetch_and_verify(&server.uri(), "unused", None, &request())
+                    .await
+                    .unwrap_err()
+            } else {
+                client
+                    .deregister_and_verify(&server.uri(), "unused", None, &deregister_request())
+                    .await
+                    .unwrap_err()
+            };
+
+            let limited = error.downcast_ref::<RateLimited>().expect(route);
+            assert_eq!(limited.retry_after.as_deref(), Some("30"), "{route}");
+            assert_eq!(limited.reason.as_deref(), Some("connectorratelimited"));
+            assert!(error.downcast_ref::<AgentRejected>().is_none(), "{route}");
+            assert!(error.downcast_ref::<ProofRefused>().is_none(), "{route}");
+            assert_eq!(
+                error.to_string(),
+                "Agent rate limited the request (connectorratelimited), Retry-After 30"
+            );
+        }
     }
 
     #[tokio::test]
