@@ -576,6 +576,11 @@ async fn run_heartbeat(
             chrono::Utc::now().timestamp_millis(),
         );
         queue_gateway_end_reports(reports, audit_log, gateway_end_queue).await;
+        for event in reconcile_gateway_address_changes(flow_table, &old_bundles, &new_bundles) {
+            if let Err(error) = audit_log.record(event).await {
+                error!(%error, "failed to write address-change flows-ended audit entry");
+            }
+        }
     }
     for event in reconcile_endpoint_changes(flow_table, &new_bundles) {
         if let Err(error) = audit_log.record(event).await {
@@ -731,6 +736,7 @@ fn bundle_audit_events(
             bundle.location.clone(),
             bundle.hostname.clone(),
             bundle.rules(),
+            bundle.gateway_address,
         )
     };
     let mut events = Vec::new();
@@ -744,6 +750,7 @@ fn bundle_audit_events(
                 location: bundle.location.clone(),
                 hostname: bundle.hostname.clone(),
                 port_rules: bundle.rules(),
+                gateway_address: bundle.gateway_address,
             });
         }
         events.push(AuditEvent::EntitlementListReceived {
@@ -801,6 +808,64 @@ fn reconcile_endpoint_changes(
         );
         events.push(AuditEvent::FlowsEndedByRuleChange {
             gateway_id: bundle.gateway_id.clone(),
+            flows_ended: ended.len(),
+            flows: ended
+                .into_iter()
+                .map(|flow| audit::EndedFlow {
+                    flow_id: flow.flow_id,
+                    device_public_key: flow.device_public_key,
+                })
+                .collect(),
+        });
+    }
+    events
+}
+
+/// Ends the open flows to a gateway's old address when this heartbeat changed it (TT-3699, spec
+/// §B.20.3): the spec decides that changing the address is a configuration change and that open
+/// flows to the old address end at the Connector's next heartbeat. On the first Portal address this
+/// includes, once, the flows of a node that refused it and keeps the gateway on its pool address.
+/// Diffs old vs. new per gateway, like `reconcile_dropped_entitlements`; a gateway new on this
+/// heartbeat has no flow to end, and an unchanged address ends nothing. See
+/// `FlowTable::end_flows_to_old_address` for which flows end. Admissions that arrive after the
+/// change are not re-checked against the address.
+///
+/// Returns one audit entry per gateway whose change ended open flows (spec §B.10); no gateway-end
+/// report is queued for them (§B.18): changing the address is a configuration change, not a
+/// withdrawal of the user's access.
+fn reconcile_gateway_address_changes(
+    flow_table: &std::sync::Mutex<FlowTable>,
+    old_bundles: &[PolicyBundle],
+    new_bundles: &[PolicyBundle],
+) -> Vec<AuditEvent> {
+    let mut table = flow_table.lock().expect("flow table lock poisoned");
+    let mut events = Vec::new();
+    for bundle in new_bundles {
+        let Some(old_bundle) = old_bundles
+            .iter()
+            .find(|old| old.gateway_id == bundle.gateway_id)
+        else {
+            continue;
+        };
+        let ended = table.end_flows_to_old_address(
+            &bundle.gateway_id,
+            old_bundle.gateway_address,
+            bundle.gateway_address,
+        );
+        if ended.is_empty() {
+            continue;
+        }
+        info!(
+            gateway_id = %bundle.gateway_id,
+            old_gateway_address = ?old_bundle.gateway_address,
+            gateway_address = ?bundle.gateway_address,
+            flows_ended = ended.len(),
+            "gateway address changed: ended the open flow(s) to the old address"
+        );
+        events.push(AuditEvent::FlowsEndedByAddressChange {
+            gateway_id: bundle.gateway_id.clone(),
+            old_gateway_address: old_bundle.gateway_address,
+            gateway_address: bundle.gateway_address,
             flows_ended: ended.len(),
             flows: ended
                 .into_iter()
@@ -3091,6 +3156,7 @@ mod tests {
                     },
                 ],
                 port_rules: None,
+                gateway_address: None,
                 entitlement_list: vec![],
             },
             PolicyBundle {
@@ -3103,6 +3169,7 @@ mod tests {
                     port: 445,
                 }],
                 port_rules: None,
+                gateway_address: None,
                 entitlement_list: vec![],
             },
         ];
@@ -3162,6 +3229,7 @@ mod tests {
                 })
                 .collect(),
             port_rules: None,
+            gateway_address: None,
             entitlement_list: vec![],
         }
     }
@@ -3704,6 +3772,7 @@ mod tests {
             access_mode: "SELECTED_USERS".to_string(),
             endpoints: vec![],
             port_rules: None,
+            gateway_address: None,
             entitlement_list: entitled_device_keys
                 .iter()
                 .map(|key| Entitlement {
@@ -3950,6 +4019,7 @@ mod tests {
                     internal_host: "172.22.247.15".to_string(),
                     internal_port: 8443,
                 }],
+                gateway_address: None,
             }
         );
         let received = events_named(&events, "entitlement_list_received");
@@ -4235,6 +4305,147 @@ mod tests {
         reconcile_endpoint_changes(&flow_table, &[]);
     }
 
+    // --- TT-3699: a changed gateway address ends the open flows to the old one (spec §B.20.3) ---
+
+    fn bundle_with_address(gateway_id: &str, address: Option<[u8; 4]>) -> PolicyBundle {
+        PolicyBundle {
+            gateway_address: address.map(std::net::Ipv4Addr::from),
+            ..bundle_with_endpoint(gateway_id, "10.0.0.1", 443)
+        }
+    }
+
+    fn admit_to(
+        flow_table: &std::sync::Mutex<FlowTable>,
+        gateway_id: &str,
+        port: u16,
+        to: [u8; 4],
+    ) {
+        flow_table.lock().unwrap().admit_flow(
+            "n-1".to_string(),
+            port,
+            Some(flow_table::Dialled {
+                transport: flow_table::Transport::Tcp,
+                gateway_address: std::net::Ipv4Addr::from(to),
+                destination_port: 443,
+            }),
+            gateway_id.to_string(),
+            format!("flow-{port}"),
+            "dev-A".to_string(),
+            bundle_with_endpoint(gateway_id, "10.0.0.1", 443).rules(),
+        );
+    }
+
+    #[test]
+    fn reconcile_gateway_address_changes_ends_the_flows_to_the_old_address_and_audits_them() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        admit_to(&flow_table, "gw-1", 40001, [100, 64, 5, 10]);
+        admit_to(&flow_table, "gw-2", 40002, [100, 64, 5, 20]);
+        let old = [
+            bundle_with_address("gw-1", Some([100, 64, 5, 10])),
+            bundle_with_address("gw-2", Some([100, 64, 5, 20])),
+        ];
+        let new = [
+            bundle_with_address("gw-1", Some([100, 64, 5, 11])),
+            bundle_with_address("gw-2", Some([100, 64, 5, 20])),
+        ];
+
+        let events = reconcile_gateway_address_changes(&flow_table, &old, &new);
+
+        assert_eq!(
+            events,
+            vec![AuditEvent::FlowsEndedByAddressChange {
+                gateway_id: "gw-1".to_string(),
+                old_gateway_address: Some(std::net::Ipv4Addr::new(100, 64, 5, 10)),
+                gateway_address: Some(std::net::Ipv4Addr::new(100, 64, 5, 11)),
+                flows_ended: 1,
+                flows: vec![audit::EndedFlow {
+                    flow_id: "flow-40001".to_string(),
+                    device_public_key: "dev-A".to_string(),
+                }],
+            }]
+        );
+        assert_eq!(
+            flow_table.lock().unwrap().flow_count(),
+            1,
+            "the other gateway's flow stays"
+        );
+    }
+
+    #[test]
+    fn reconcile_gateway_address_changes_ends_nothing_for_an_unchanged_or_new_gateway() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        admit_to(&flow_table, "gw-1", 40001, [100, 64, 5, 10]);
+        admit_to(&flow_table, "gw-2", 40002, [10, 99, 0, 2]);
+        admit_to(&flow_table, "gw-3", 40003, [10, 99, 0, 3]);
+        let old = [
+            bundle_with_address("gw-1", Some([100, 64, 5, 10])),
+            bundle_with_address("gw-2", None),
+        ];
+        let new = [
+            bundle_with_address("gw-1", Some([100, 64, 5, 10])),
+            bundle_with_address("gw-2", None),
+            bundle_with_address("gw-3", Some([100, 64, 5, 30])),
+        ];
+
+        let events = reconcile_gateway_address_changes(&flow_table, &old, &new);
+
+        assert!(events.is_empty(), "nothing to end: {events:?}");
+        assert_eq!(flow_table.lock().unwrap().flow_count(), 3);
+    }
+
+    /// The Portal no longer holds an address: the flows to the old one end, the flows already on a
+    /// pool address stay.
+    #[test]
+    fn reconcile_gateway_address_changes_ends_the_flows_to_a_removed_address() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        admit_to(&flow_table, "gw-1", 40001, [100, 64, 5, 10]);
+        admit_to(&flow_table, "gw-1", 40002, [10, 99, 0, 1]);
+
+        let events = reconcile_gateway_address_changes(
+            &flow_table,
+            &[bundle_with_address("gw-1", Some([100, 64, 5, 10]))],
+            &[bundle_with_address("gw-1", None)],
+        );
+
+        assert!(matches!(
+            &events[..],
+            [AuditEvent::FlowsEndedByAddressChange {
+                old_gateway_address: Some(_),
+                gateway_address: None,
+                flows_ended: 1,
+                flows,
+                ..
+            }] if flows[0].flow_id == "flow-40001"
+        ));
+        assert_eq!(flow_table.lock().unwrap().flow_count(), 1);
+    }
+
+    /// TT-2529: the address is part of the gateway's configuration (spec §B.10), recorded only when
+    /// the Portal holds one - an entry without it reads as before.
+    #[test]
+    fn a_gateway_address_change_is_a_new_configuration_and_is_recorded() {
+        let old = [bundle_with_address("gw-1", None)];
+        let new = [bundle_with_address("gw-1", Some([100, 64, 5, 10]))];
+
+        let unchanged = bundle_audit_events(Some(&old), &old);
+        let changed = bundle_audit_events(Some(&old), &new);
+
+        assert!(events_named(&unchanged, "policy_bundle_applied").is_empty());
+        let applied = events_named(&changed, "policy_bundle_applied");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(
+            serde_json::to_value(applied[0]).unwrap()["gateway_address"],
+            "100.64.5.10"
+        );
+        let without = bundle_audit_events(None, &old);
+        assert!(
+            serde_json::to_value(events_named(&without, "policy_bundle_applied")[0])
+                .unwrap()
+                .get("gateway_address")
+                .is_none()
+        );
+    }
+
     /// End-to-end through two real `run_heartbeat` calls: entitlement present on the first, dropped
     /// on the second - proving the diff actually runs off `PolicyStore`'s real before/after state,
     /// not just the pure reconciliation function above.
@@ -4361,5 +4572,165 @@ mod tests {
             Some("gw-2"),
             "the same device's flow on a gateway it's still entitled to must survive"
         );
+    }
+
+    /// TT-3699 end to end through real `run_heartbeat` calls (TT-2529 "Nodes use the Portal's
+    /// Gateway IP", including a change of address): the first Portal address ends the flows to the
+    /// pool address, an unchanged address ends nothing, a changed one ends the flows to the old
+    /// address - only that gateway's, with no gateway-end report, and recorded in the local audit log.
+    #[tokio::test]
+    async fn heartbeats_that_change_a_gateways_address_end_only_the_flows_to_the_old_one() {
+        let agent_identity = crypto::generate_keypair();
+        let body = |nonce: &str, gw_1_address: Option<&str>| {
+            let address = gw_1_address
+                .map(|address| format!(r#""gateway_address":"{address}","#))
+                .unwrap_or_default();
+            format!(
+                r#"{{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"{nonce}","policy_bundles":[{{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[{{"host":"10.0.0.1","port":443}}],{address}"entitlement_list":[{{"user_id":"u-1","device_public_key":"dev-A"}}]}},{{"gateway_id":"gw-2","location":"Amsterdam","hostname":"erp.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[{{"host":"10.0.0.1","port":443}}],"entitlement_list":[{{"user_id":"u-1","device_public_key":"dev-A"}}]}}],"node_list":[]}}"#
+            )
+        };
+        let bodies = [
+            body("n1", None),
+            body("n2", Some("100.64.5.10")),
+            body("n3", Some("100.64.5.10")),
+            body("n4", Some("100.64.5.11")),
+        ];
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        for body in &bodies {
+            let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+            Mock::given(method("POST"))
+                .and(path("/api/connectors/heartbeat"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(body.clone(), "application/json")
+                        .insert_header("X-Signature", signature.as_str()),
+                )
+                .up_to_n_times(1)
+                .mount(&agent_server)
+                .await;
+        }
+
+        let config = config(registry_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_server.uri()).await;
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
+        let gateway_end_queue = test_gateway_end_queue();
+        let mut admission_pollers = admission_pollers();
+        let mut heartbeat = async || {
+            run_heartbeat(
+                "pk-1",
+                &agent_directory,
+                &registry_client,
+                &heartbeat_client,
+                &policy_store,
+                &audit_log,
+                &tunnel_manager,
+                &wg_socket,
+                &flow_table,
+                &dns_cache,
+                &mut admission_pollers,
+                &gateway_end_queue,
+            )
+            .await
+            .unwrap();
+        };
+        let dialled = |to: [u8; 4]| flow_table::Dialled {
+            transport: flow_table::Transport::Tcp,
+            gateway_address: std::net::Ipv4Addr::from(to),
+            destination_port: 443,
+        };
+        let forwards = |port: u16, to: [u8; 4]| {
+            matches!(
+                flow_table
+                    .lock()
+                    .unwrap()
+                    .forward("n-1", port, Some(dialled(to)), 443, &dns_cache),
+                flow_table::Forwarding::Forward { .. }
+            )
+        };
+
+        // 1. No Portal address yet: the nodes serve both gateways on their pool addresses.
+        heartbeat().await;
+        admit_to(&flow_table, "gw-1", 40001, [10, 99, 0, 1]);
+        admit_to(&flow_table, "gw-2", 40002, [10, 99, 0, 2]);
+        assert!(forwards(40001, [10, 99, 0, 1]) && forwards(40002, [10, 99, 0, 2]));
+
+        // 2. The Portal's first address for gw-1 (the rollout): its flow to the pool address ends.
+        heartbeat().await;
+        assert!(
+            !forwards(40001, [10, 99, 0, 1]),
+            "the flow to the pool address ended"
+        );
+        assert!(
+            forwards(40002, [10, 99, 0, 2]),
+            "the other gateway's flow stays"
+        );
+        admit_to(&flow_table, "gw-1", 40003, [100, 64, 5, 10]);
+        assert!(
+            forwards(40003, [100, 64, 5, 10]),
+            "served on the Portal address"
+        );
+
+        // 3. The same address again: nothing ends.
+        heartbeat().await;
+        assert!(forwards(40003, [100, 64, 5, 10]) && forwards(40002, [10, 99, 0, 2]));
+
+        // 4. The address changes: the flow to the old one ends.
+        heartbeat().await;
+        assert!(
+            !forwards(40003, [100, 64, 5, 10]),
+            "the flow to the old address ended"
+        );
+        assert!(forwards(40002, [10, 99, 0, 2]));
+        assert_eq!(flow_table.lock().unwrap().flow_count(), 1);
+
+        // A configuration change, not a withdrawal of access: no gateway-end report (spec §B.18).
+        assert!(
+            gateway_end_queue
+                .pending(chrono::Utc::now().timestamp_millis())
+                .await
+                .is_empty()
+        );
+        let entries = read_audit_lines(&dir);
+        assert!(entries.iter().all(|e| e["event"] != "flows_ended"));
+        let ended: Vec<&serde_json::Value> = entries
+            .iter()
+            .filter(|e| e["event"] == "flows_ended_by_address_change")
+            .collect();
+        assert_eq!(ended.len(), 2);
+        assert_eq!(ended[0]["gateway_id"], "gw-1");
+        assert_eq!(ended[0]["old_gateway_address"], serde_json::Value::Null);
+        assert_eq!(ended[0]["gateway_address"], "100.64.5.10");
+        assert_eq!(ended[0]["flows"][0]["flow_id"], "flow-40001");
+        assert_eq!(ended[1]["old_gateway_address"], "100.64.5.10");
+        assert_eq!(ended[1]["gateway_address"], "100.64.5.11");
+        assert_eq!(ended[1]["flows"][0]["flow_id"], "flow-40003");
+        let gw_1_applied: Vec<&serde_json::Value> = entries
+            .iter()
+            .filter(|e| e["event"] == "policy_bundle_applied" && e["gateway_id"] == "gw-1")
+            .collect();
+        assert_eq!(gw_1_applied.len(), 3, "heartbeats 1, 2 and 4 changed it");
+        assert!(gw_1_applied[0].get("gateway_address").is_none());
+        assert_eq!(gw_1_applied[2]["gateway_address"], "100.64.5.11");
     }
 }

@@ -1310,6 +1310,7 @@ mod tests {
                     access_mode: "SELECTED_USERS".to_string(),
                     endpoints: vec![],
                     port_rules: None,
+                    gateway_address: None,
                     entitlement_list: vec![crate::dto::Entitlement {
                         user_id: "u-1".to_string(),
                         device_public_key: Some(device.public_key_hex.clone()),

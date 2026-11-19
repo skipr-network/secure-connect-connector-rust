@@ -497,6 +497,7 @@ mod tests {
                         port: 443,
                     }],
                     port_rules: None,
+                    gateway_address: None,
                     entitlement_list: vec![Entitlement {
                         user_id: user_id.to_string(),
                         device_public_key: Some(device_public_key.to_string()),
@@ -861,6 +862,7 @@ mod tests {
                             port: 443,
                         }],
                         port_rules: None,
+                        gateway_address: None,
                         entitlement_list: vec![Entitlement {
                             user_id: "u-1".to_string(),
                             device_public_key: Some(device.public_key_hex.clone()),
@@ -876,6 +878,7 @@ mod tests {
                             port: 443,
                         }],
                         port_rules: None,
+                        gateway_address: None,
                         entitlement_list: vec![Entitlement {
                             user_id: "u-1".to_string(),
                             device_public_key: Some(device.public_key_hex.clone()),
