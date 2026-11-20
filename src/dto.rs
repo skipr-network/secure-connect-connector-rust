@@ -281,6 +281,10 @@ pub struct ConnectorDeregisterResponse {
 #[derive(Debug, Deserialize)]
 pub struct AgentPermittedKeyResponse {
     pub permitted_key: String,
+    /// TT-3717: the Agent's key-agreement key for the Connector request proof (spec §B.4 point 4),
+    /// absent until that Agent has written it to the Registry.
+    #[serde(default)]
+    pub x25519_public_key: Option<String>,
 }
 
 #[cfg(test)]

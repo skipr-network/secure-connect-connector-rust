@@ -1,7 +1,8 @@
 //! Registry client for the one call the Connector needs today: looking up its
 //! paired Agent's Ed25519 public key by IP (TT-1742), so the Connector verifies
 //! a heartbeat response against that specific Agent - never any registered Agent
-//! globally, per the confirmed TT-1732 contract decision.
+//! globally, per the confirmed TT-1732 contract decision. The same answer carries
+//! that Agent's X25519 key-agreement key for the request proof (TT-3717).
 
 use std::time::Duration;
 
@@ -26,7 +27,10 @@ impl RegistryClient {
     }
 
     /// `GET /api/agents/{ipAddress}/permitted-key`
-    pub async fn get_agent_permitted_key(&self, agent_ip_address: &str) -> Result<String> {
+    pub async fn get_agent_keys(
+        &self,
+        agent_ip_address: &str,
+    ) -> Result<AgentPermittedKeyResponse> {
         let url = format!(
             "{}/api/agents/{}/permitted-key",
             self.base_url.trim_end_matches('/'),
@@ -44,11 +48,10 @@ impl RegistryClient {
             bail!("Registry returned {} for {url}", response.status());
         }
 
-        let body: AgentPermittedKeyResponse = response
+        response
             .json()
             .await
-            .with_context(|| format!("failed to parse Registry response from {url}"))?;
-        Ok(body.permitted_key)
+            .with_context(|| format!("failed to parse Registry response from {url}"))
     }
 }
 
@@ -71,9 +74,35 @@ mod tests {
             .await;
 
         let client = RegistryClient::new(Client::new(), server.uri());
-        let key = client.get_agent_permitted_key("10.0.0.5").await.unwrap();
+        let keys = client.get_agent_keys("10.0.0.5").await.unwrap();
 
-        assert_eq!(key, "abc123");
+        assert_eq!(keys.permitted_key, "abc123");
+        assert_eq!(keys.x25519_public_key, None);
+    }
+
+    /// TT-3717: the Agent's key-agreement key comes with its signing key.
+    #[tokio::test]
+    async fn fetches_the_agents_x25519_public_key_with_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": "abc123",
+                "x25519_public_key": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+            })))
+            .mount(&server)
+            .await;
+
+        let keys = RegistryClient::new(Client::new(), server.uri())
+            .get_agent_keys("10.0.0.5")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            keys.x25519_public_key.as_deref(),
+            Some("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+        );
     }
 
     #[tokio::test]
@@ -87,7 +116,7 @@ mod tests {
 
         let client = RegistryClient::new(Client::new(), server.uri());
 
-        assert!(client.get_agent_permitted_key("10.0.0.99").await.is_err());
+        assert!(client.get_agent_keys("10.0.0.99").await.is_err());
     }
 
     #[tokio::test]
@@ -96,7 +125,7 @@ mod tests {
         // an HTTP-level error status.
         let client = RegistryClient::new(Client::new(), "http://127.0.0.1:1".to_string());
 
-        assert!(client.get_agent_permitted_key("10.0.0.5").await.is_err());
+        assert!(client.get_agent_keys("10.0.0.5").await.is_err());
     }
 
     #[tokio::test]
@@ -110,6 +139,6 @@ mod tests {
 
         let client = RegistryClient::new(Client::new(), server.uri());
 
-        assert!(client.get_agent_permitted_key("10.0.0.5").await.is_err());
+        assert!(client.get_agent_keys("10.0.0.5").await.is_err());
     }
 }

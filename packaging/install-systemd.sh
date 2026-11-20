@@ -154,7 +154,11 @@ if [ "$DECOMMISSION" = true ]; then
   sudo rm -f "$UNIT_PATH"
   sudo systemctl daemon-reload 2>/dev/null || true
 
-  sudo rm -f "$INSTALLED_BINARY_PATH" "$IDENTITY_KEY_PATH" "$PENDING_REPORTS_PATH"
+  # TT-3717: the Agents' key-agreement keys the request proof keeps next to the identity key, and any
+  # temporary file a write left behind (agent-x25519-keys.tmp.<pid>), so the key directory can go.
+  KEPT_AGENT_KEYS_PATH="$(dirname "$IDENTITY_KEY_PATH")/agent-x25519-keys"
+  sudo rm -f "$INSTALLED_BINARY_PATH" "$IDENTITY_KEY_PATH" "$PENDING_REPORTS_PATH" "$KEPT_AGENT_KEYS_PATH"
+  sudo sh -c 'rm -f "$1".tmp.*' sh "$KEPT_AGENT_KEYS_PATH"
   sudo rmdir "$(dirname "$IDENTITY_KEY_PATH")" 2>/dev/null || true
   sudo rm -rf "$ENV_DIR"
 

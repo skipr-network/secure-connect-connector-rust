@@ -20,7 +20,17 @@
 //!
 //! If `agents.json` itself can't be fetched, the last list that could be is used instead - an S3
 //! blip must not take down Connectors whose Agent is perfectly healthy.
+//!
+//! TT-3717 (spec §B.4 point 4): each request carries the Connector request proof for the Agent it
+//! goes to, keyed by that Agent's `x25519_public_key` from Registry. A proof refusal concerns that
+//! instance only (each has its own key), so it is handled like an outage, not like a refusal - with
+//! one exception: on `connectorproofinvalid` the Agent's key may have rotated, so it is fetched
+//! again and that Agent retried once with a new proof before moving on.
+//!
+//! TT-3767: a `429` ([`RateLimited`]) is a limit of that Agent instance too - moved on from like
+//! an outage, without a retry, but logged as rate limiting rather than as "did not answer".
 
+use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -33,8 +43,9 @@ use crate::dto::{
     ConnectorDeregisterRequest, ConnectorDeregisterResponse, ConnectorHeartbeatRequest,
     ConnectorHeartbeatResponse,
 };
-use crate::heartbeat::{AgentRejected, HeartbeatClient};
+use crate::heartbeat::{AgentRejected, HeartbeatClient, ProofRefusal, ProofRefused, RateLimited};
 use crate::registry_client::RegistryClient;
+use crate::request_proof::{AgentProofKey, RequestProver};
 
 const AGENTS_JSON_TIMEOUT: Duration = Duration::from_secs(10);
 const OPERATIONAL_STATUS: &str = "operational";
@@ -73,6 +84,8 @@ pub struct AgentDirectory {
     agents_json_url: String,
     base_url_for: BaseUrlFor,
     state: Mutex<DirectoryState>,
+    /// TT-3717: `None` sends no request proof to any Agent.
+    prover: Option<RequestProver>,
 }
 
 impl AgentDirectory {
@@ -95,7 +108,14 @@ impl AgentDirectory {
             agents_json_url,
             base_url_for,
             state: Mutex::new(DirectoryState::default()),
+            prover: None,
         }
+    }
+
+    /// TT-3717: proves every request to an Agent with this Connector's identity.
+    pub fn with_request_prover(mut self, prover: RequestProver) -> Self {
+        self.prover = Some(prover);
+        self
     }
 
     /// Heartbeats through the first operational Agent that answers - see the module doc for the
@@ -109,7 +129,16 @@ impl AgentDirectory {
         let candidates = self.candidates().await?;
         let mut failures = Vec::new();
         for agent in candidates {
-            match heartbeat_through(&agent, registry_client, heartbeat_client, request).await {
+            // Per Agent, never one key for all of them: the response must verify against the
+            // specific Agent that sent it (TT-1742), and the proof is made for it (TT-3717).
+            let base_url = agent.base_url.as_str();
+            let attempt =
+                self.call_with_proof(&agent, registry_client, |agent_key, proof_key| async move {
+                    heartbeat_client
+                        .fetch_and_verify(base_url, &agent_key, proof_key.as_ref(), request)
+                        .await
+                });
+            match attempt.await {
                 Ok(response) => {
                     self.remember_answered(&agent);
                     return Ok(response);
@@ -118,6 +147,14 @@ impl AgentDirectory {
                     // Reachable and answering - worth staying on, even though the answer is no.
                     self.remember_answered(&agent);
                     return Err(error);
+                }
+                Err(error) if error.downcast_ref::<ProofRefused>().is_some() => {
+                    warn_proof_refused(&agent, &error, "heartbeat");
+                    failures.push(format!("{}: {error:#}", agent.ip_address));
+                }
+                Err(error) if error.downcast_ref::<RateLimited>().is_some() => {
+                    warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent rate limited the heartbeat - trying the next operational Agent");
+                    failures.push(format!("{}: {error:#}", agent.ip_address));
                 }
                 Err(error) => {
                     warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent did not answer the heartbeat - trying the next operational Agent");
@@ -143,17 +180,24 @@ impl AgentDirectory {
         let candidates = self.candidates().await?;
         let mut failures = Vec::new();
         for agent in candidates {
-            let attempt = async {
-                let agent_public_key = registry_client
-                    .get_agent_permitted_key(&agent.ip_address)
-                    .await?;
-                heartbeat_client
-                    .deregister_and_verify(&agent.base_url, &agent_public_key, request)
-                    .await
-            };
+            let base_url = agent.base_url.as_str();
+            let attempt =
+                self.call_with_proof(&agent, registry_client, |agent_key, proof_key| async move {
+                    heartbeat_client
+                        .deregister_and_verify(base_url, &agent_key, proof_key.as_ref(), request)
+                        .await
+                });
             match attempt.await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.downcast_ref::<AgentRejected>().is_some() => return Err(error),
+                Err(error) if error.downcast_ref::<ProofRefused>().is_some() => {
+                    warn_proof_refused(&agent, &error, "deregistration");
+                    failures.push(format!("{}: {error:#}", agent.ip_address));
+                }
+                Err(error) if error.downcast_ref::<RateLimited>().is_some() => {
+                    warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent rate limited the deregistration - trying the next operational Agent");
+                    failures.push(format!("{}: {error:#}", agent.ip_address));
+                }
                 Err(error) => {
                     warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent did not answer the deregistration - trying the next operational Agent");
                     failures.push(format!("{}: {error:#}", agent.ip_address));
@@ -242,22 +286,55 @@ impl AgentDirectory {
     fn remember_answered(&self, agent: &Agent) {
         self.state.lock().unwrap().last_answered = Some(agent.clone());
     }
+
+    /// Calls `agent` with its Registry signing key and, when there is one, its request-proof key
+    /// (TT-3717). On `connectorproofinvalid` both keys are fetched again - the Agent's key may
+    /// have rotated - and the call is retried once, with a new proof; any refusal after that is
+    /// returned for the caller to move on to the next Agent.
+    async fn call_with_proof<T, F, Fut>(
+        &self,
+        agent: &Agent,
+        registry_client: &RegistryClient,
+        call: F,
+    ) -> Result<T>
+    where
+        F: Fn(String, Option<AgentProofKey>) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let keys = registry_client.get_agent_keys(&agent.ip_address).await?;
+        let proof_key = self.proof_key_for(agent, keys.x25519_public_key.as_deref());
+        let result = call(keys.permitted_key, proof_key).await;
+        if proof_refusal(&result) != Some(ProofRefusal::Invalid) {
+            return result;
+        }
+        warn!(agent = %agent.ip_address, "Agent refused the request proof as invalid - fetching its key again and retrying it once");
+        let keys = registry_client.get_agent_keys(&agent.ip_address).await?;
+        let proof_key = self.proof_key_for(agent, keys.x25519_public_key.as_deref());
+        call(keys.permitted_key, proof_key).await
+    }
+
+    fn proof_key_for(&self, agent: &Agent, published: Option<&str>) -> Option<AgentProofKey> {
+        self.prover
+            .as_ref()?
+            .key_for_agent(&agent.ip_address, published)
+    }
 }
 
-async fn heartbeat_through(
-    agent: &Agent,
-    registry_client: &RegistryClient,
-    heartbeat_client: &HeartbeatClient,
-    request: &ConnectorHeartbeatRequest,
-) -> Result<ConnectorHeartbeatResponse> {
-    // Per Agent, never one key for all of them: the response must verify against the specific
-    // Agent that sent it (TT-1742).
-    let agent_public_key = registry_client
-        .get_agent_permitted_key(&agent.ip_address)
-        .await?;
-    heartbeat_client
-        .fetch_and_verify(&agent.base_url, &agent_public_key, request)
-        .await
+/// One warning per refused attempt; `connectorproofexpired` names the likely cause, the clock.
+fn warn_proof_refused(agent: &Agent, error: &anyhow::Error, request: &str) {
+    let expired = error
+        .downcast_ref::<ProofRefused>()
+        .is_some_and(|refused| refused.refusal == ProofRefusal::Expired);
+    if expired {
+        warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent refused the {request}'s request proof as expired - this host's clock is most likely wrong, keep it synchronised (NTP); trying the next operational Agent");
+    } else {
+        warn!(agent = %agent.ip_address, error = %format!("{error:#}"), "Agent refused the {request}'s request proof - trying the next operational Agent");
+    }
+}
+
+fn proof_refusal<T>(result: &Result<T>) -> Option<ProofRefusal> {
+    let refused = result.as_ref().err()?.downcast_ref::<ProofRefused>()?;
+    Some(refused.refusal)
 }
 
 #[cfg(test)]
@@ -706,5 +783,648 @@ mod tests {
                 base_url: "https://13.233.148.23".to_string(),
             }]
         );
+    }
+}
+
+/// TT-3717 (spec §B.4 point 4): the request proof each Agent gets, and what a proof refusal does.
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+    use crate::crypto::{self, KeyPair};
+    use crate::dto::ConnectorDeregisterRequest;
+    use crate::request_proof::tests::expected_proof;
+    use crate::request_proof::{
+        PROOF_HEADER, PROOF_VERSION_HEADER, PUBLIC_KEY_HEADER, TIMESTAMP_HEADER,
+        kept_agent_keys_path,
+    };
+    use rand_core::OsRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const HEARTBEAT: &str = "/api/connectors/heartbeat";
+    const DEREGISTER: &str = "/api/connectors/deregister";
+
+    /// One Agent instance: its Ed25519 signing identity and its X25519 key-agreement key.
+    struct AgentKeys {
+        signing: KeyPair,
+        agreement: StaticSecret,
+    }
+
+    impl AgentKeys {
+        fn new() -> Self {
+            Self {
+                signing: crypto::generate_keypair(),
+                agreement: StaticSecret::random_from_rng(OsRng),
+            }
+        }
+
+        fn x25519_hex(&self) -> String {
+            hex::encode(PublicKey::from(&self.agreement).as_bytes())
+        }
+    }
+
+    struct Env {
+        agents_json: MockServer,
+        registry: MockServer,
+        agents: HashMap<String, MockServer>,
+        connector_public_key: String,
+        connector_secret: StaticSecret,
+        /// Stands for the identity key's directory.
+        keys_dir: TempDir,
+    }
+
+    impl Env {
+        async fn new(ips: &[&str]) -> Self {
+            let agents_json = MockServer::start().await;
+            let entries: Vec<_> = ips
+                .iter()
+                .map(|ip| serde_json::json!({ "ip_address": ip, "status": "operational" }))
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/agents.json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "agents": entries })),
+                )
+                .mount(&agents_json)
+                .await;
+            let mut agents = HashMap::new();
+            for ip in ips {
+                agents.insert(ip.to_string(), MockServer::start().await);
+            }
+            let connector_secret = StaticSecret::random_from_rng(OsRng);
+            let connector_public_key = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .encode(PublicKey::from(&connector_secret).as_bytes())
+            };
+            Self {
+                agents_json,
+                registry: MockServer::start().await,
+                agents,
+                connector_public_key,
+                connector_secret,
+                keys_dir: tempfile::tempdir().unwrap(),
+            }
+        }
+
+        /// Registry's answer for `ip`; `times` limits it to the first lookups, ahead of a later
+        /// answer mounted without a limit.
+        async fn registry_answers(
+            &self,
+            ip: &str,
+            keys: &AgentKeys,
+            x25519_published: bool,
+            times: Option<u64>,
+        ) {
+            let mut body = serde_json::json!({
+                "ip_address": ip,
+                "permitted_key": keys.signing.public_key_hex,
+            });
+            if x25519_published {
+                body["x25519_public_key"] = keys.x25519_hex().into();
+            }
+            let mock = Mock::given(method("GET"))
+                .and(path(format!("/api/agents/{ip}/permitted-key")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body));
+            match times {
+                Some(times) => mock.up_to_n_times(times).with_priority(1),
+                None => mock,
+            }
+            .mount(&self.registry)
+            .await;
+        }
+
+        /// The Agent at `ip` answers `route` with `template`, for the first `times` requests when
+        /// given, ahead of a later answer mounted without a limit.
+        async fn agent_answers(
+            &self,
+            ip: &str,
+            route: &str,
+            template: ResponseTemplate,
+            times: Option<u64>,
+        ) {
+            let mock = Mock::given(method("POST"))
+                .and(path(route.to_string()))
+                .respond_with(template);
+            match times {
+                Some(times) => mock.up_to_n_times(times).with_priority(1),
+                None => mock,
+            }
+            .mount(&self.agents[ip])
+            .await;
+        }
+
+        fn heartbeat_ok(&self, keys: &AgentKeys) -> ResponseTemplate {
+            let body = format!(
+                r#"{{"connector_id":"c-1","connector_public_key":"{}","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1","policy_bundles":[],"node_list":[]}}"#,
+                self.connector_public_key
+            );
+            signed(keys, body)
+        }
+
+        fn deregister_ok(&self, keys: &AgentKeys) -> ResponseTemplate {
+            let body = format!(
+                r#"{{"connector_id":"c-1","connector_public_key":"{}","status":"DEREGISTERED","generated_at":"2026-10-13T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"n1"}}"#,
+                self.connector_public_key
+            );
+            signed(keys, body)
+        }
+
+        fn directory(&self) -> AgentDirectory {
+            let uris: HashMap<String, String> = self
+                .agents
+                .iter()
+                .map(|(ip, server)| (ip.clone(), server.uri()))
+                .collect();
+            let uris = Arc::new(uris);
+            AgentDirectory::with_base_url_for(
+                Client::new(),
+                format!("{}/agents.json", self.agents_json.uri()),
+                Box::new(move |ip| uris[ip].clone()),
+            )
+            .with_request_prover(RequestProver::new(
+                self.connector_secret.clone(),
+                kept_agent_keys_path(&self.keys_dir.path().join("identity.key")),
+            ))
+        }
+
+        async fn heartbeat(
+            &self,
+            directory: &AgentDirectory,
+        ) -> Result<ConnectorHeartbeatResponse> {
+            directory
+                .heartbeat(
+                    &RegistryClient::new(Client::new(), self.registry.uri()),
+                    &HeartbeatClient::new(Client::new()),
+                    &ConnectorHeartbeatRequest {
+                        connector_public_key: self.connector_public_key.clone(),
+                        unresolved_endpoint_hosts: None,
+                        ended_flows: vec![],
+                    },
+                )
+                .await
+        }
+
+        async fn deregister(
+            &self,
+            directory: &AgentDirectory,
+        ) -> Result<ConnectorDeregisterResponse> {
+            directory
+                .deregister(
+                    &RegistryClient::new(Client::new(), self.registry.uri()),
+                    &HeartbeatClient::new(Client::new()),
+                    &ConnectorDeregisterRequest {
+                        connector_public_key: self.connector_public_key.clone(),
+                    },
+                )
+                .await
+        }
+
+        async fn requests_to(&self, ip: &str) -> Vec<Request> {
+            self.agents[ip].received_requests().await.unwrap()
+        }
+
+        async fn registry_lookups(&self, ip: &str) -> usize {
+            self.registry
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path().contains(ip))
+                .count()
+        }
+    }
+
+    fn signed(keys: &AgentKeys, body: String) -> ResponseTemplate {
+        let signature = crypto::sign_to_base64(&keys.signing.signing_key, body.as_bytes());
+        ResponseTemplate::new(200)
+            .set_body_raw(body, "application/json")
+            .insert_header("X-Signature", signature.as_str())
+    }
+
+    fn refused(reason: &str) -> ResponseTemplate {
+        ResponseTemplate::new(401).set_body_json(serde_json::json!({ "reason": reason }))
+    }
+
+    fn header(request: &Request, name: &str) -> Option<String> {
+        request
+            .headers
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    /// Checks the proof as the Agent holding `keys` would, over the body bytes it received.
+    fn assert_proven_for(request: &Request, keys: &AgentKeys, route: &str, connector_key: &str) {
+        assert_eq!(header(request, PROOF_VERSION_HEADER).as_deref(), Some("1"));
+        assert_eq!(
+            header(request, PUBLIC_KEY_HEADER).as_deref(),
+            Some(connector_key)
+        );
+        let timestamp = header(request, TIMESTAMP_HEADER).unwrap();
+        assert!(timestamp.parse::<i64>().unwrap() > 0 && !timestamp.starts_with('0'));
+        assert_eq!(
+            header(request, PROOF_HEADER).unwrap(),
+            expected_proof(
+                &keys.agreement,
+                connector_key,
+                "POST",
+                route,
+                &timestamp,
+                &request.body
+            ),
+            "the MAC covers exactly the body bytes sent, for this Agent's key"
+        );
+    }
+
+    fn assert_unproven(request: &Request) {
+        for name in [
+            PROOF_VERSION_HEADER,
+            PUBLIC_KEY_HEADER,
+            TIMESTAMP_HEADER,
+            PROOF_HEADER,
+        ] {
+            assert_eq!(header(request, name), None, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_a_proof_over_the_exact_body_bytes_that_the_agent_can_verify() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, true, None).await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, env.heartbeat_ok(&keys), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        let requests = env.requests_to("10.0.0.2").await;
+        assert_proven_for(&requests[0], &keys, HEARTBEAT, &env.connector_public_key);
+        assert_eq!(
+            header(&requests[0], "content-type").as_deref(),
+            Some("application/json")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["connector_public_key"], env.connector_public_key);
+    }
+
+    #[tokio::test]
+    async fn sends_no_proof_to_an_agent_without_a_key() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, false, None).await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, env.heartbeat_ok(&keys), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        assert_unproven(&env.requests_to("10.0.0.2").await[0]);
+    }
+
+    /// A key missing from the Registry later (a rollback, a cleared entry) does not lock out a
+    /// Connector that has proven itself - also across a restart.
+    #[tokio::test]
+    async fn uses_the_kept_key_when_the_registry_returns_none() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, true, Some(1)).await;
+        env.registry_answers("10.0.0.2", &keys, false, None).await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, env.heartbeat_ok(&keys), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+        // A restart: a new directory, reading only the kept file.
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        let requests = env.requests_to("10.0.0.2").await;
+        assert_eq!(requests.len(), 2);
+        assert_proven_for(&requests[1], &keys, HEARTBEAT, &env.connector_public_key);
+    }
+
+    /// The Agent's key rotated: the Connector fetches it again and retries that Agent once with
+    /// a new proof, without moving on.
+    #[tokio::test]
+    async fn refetches_the_key_and_retries_the_same_agent_once_on_connectorproofinvalid() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let old_keys = AgentKeys::new();
+        let rotated = AgentKeys {
+            signing: KeyPair {
+                signing_key: old_keys.signing.signing_key.clone(),
+                public_key_hex: old_keys.signing.public_key_hex.clone(),
+            },
+            agreement: StaticSecret::random_from_rng(OsRng),
+        };
+        env.registry_answers("10.0.0.2", &old_keys, true, Some(1))
+            .await;
+        env.registry_answers("10.0.0.2", &rotated, true, None).await;
+        env.agent_answers(
+            "10.0.0.2",
+            HEARTBEAT,
+            refused("error.connectorproofinvalid"),
+            Some(1),
+        )
+        .await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, env.heartbeat_ok(&rotated), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        let requests = env.requests_to("10.0.0.2").await;
+        assert_eq!(requests.len(), 2);
+        assert_proven_for(
+            &requests[0],
+            &old_keys,
+            HEARTBEAT,
+            &env.connector_public_key,
+        );
+        assert_proven_for(&requests[1], &rotated, HEARTBEAT, &env.connector_public_key);
+        assert_ne!(
+            header(&requests[0], PROOF_HEADER),
+            header(&requests[1], PROOF_HEADER)
+        );
+        assert_eq!(env.registry_lookups("10.0.0.2").await, 2);
+        assert!(env.requests_to("10.0.0.3").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn moves_on_to_the_next_agent_when_the_retry_is_refused_too() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let refusing = AgentKeys::new();
+        let healthy = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &refusing, true, None)
+            .await;
+        env.registry_answers("10.0.0.3", &healthy, true, None).await;
+        env.agent_answers(
+            "10.0.0.2",
+            HEARTBEAT,
+            refused("error.connectorproofinvalid"),
+            None,
+        )
+        .await;
+        env.agent_answers("10.0.0.3", HEARTBEAT, env.heartbeat_ok(&healthy), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        assert_eq!(env.requests_to("10.0.0.2").await.len(), 2, "retried once");
+        assert_eq!(env.requests_to("10.0.0.3").await.len(), 1);
+    }
+
+    /// Unlike `connectornotregistered`, no proof refusal ends the heartbeat, and only
+    /// `connectorproofinvalid` is retried.
+    #[tokio::test]
+    async fn moves_on_without_a_retry_on_every_other_proof_refusal() {
+        for reason in [
+            "error.connectorproofexpired",
+            "error.connectorproofreplayed",
+            "error.connectorproofrequired",
+        ] {
+            let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+            let refusing = AgentKeys::new();
+            let healthy = AgentKeys::new();
+            env.registry_answers("10.0.0.2", &refusing, true, None)
+                .await;
+            env.registry_answers("10.0.0.3", &healthy, true, None).await;
+            env.agent_answers("10.0.0.2", HEARTBEAT, refused(reason), None)
+                .await;
+            env.agent_answers("10.0.0.3", HEARTBEAT, env.heartbeat_ok(&healthy), None)
+                .await;
+
+            env.heartbeat(&env.directory()).await.unwrap();
+
+            assert_eq!(env.requests_to("10.0.0.2").await.len(), 1, "{reason}");
+            assert_eq!(env.registry_lookups("10.0.0.2").await, 1, "{reason}");
+            assert_eq!(env.requests_to("10.0.0.3").await.len(), 1, "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_with_every_refusal_when_no_agent_accepts_the_proof() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, true, None).await;
+        env.agent_answers(
+            "10.0.0.2",
+            HEARTBEAT,
+            refused("error.connectorproofrequired"),
+            None,
+        )
+        .await;
+
+        let error = env.heartbeat(&env.directory()).await.unwrap_err();
+
+        assert!(error.downcast_ref::<AgentRejected>().is_none());
+        assert!(
+            error.to_string().contains("connectorproofrequired"),
+            "{error}"
+        );
+    }
+
+    /// The Registry cannot be reached for the refetch: that Agent counts as not answering.
+    #[tokio::test]
+    async fn moves_on_when_the_registry_refetch_fails_during_the_retry() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let refusing = AgentKeys::new();
+        let healthy = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &refusing, true, Some(1))
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.2/permitted-key"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&env.registry)
+            .await;
+        env.registry_answers("10.0.0.3", &healthy, true, None).await;
+        env.agent_answers(
+            "10.0.0.2",
+            HEARTBEAT,
+            refused("error.connectorproofinvalid"),
+            None,
+        )
+        .await;
+        env.agent_answers("10.0.0.3", HEARTBEAT, env.heartbeat_ok(&healthy), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        assert_eq!(env.registry_lookups("10.0.0.2").await, 2);
+        assert_eq!(
+            env.requests_to("10.0.0.2").await.len(),
+            1,
+            "no retry without a key"
+        );
+        assert_eq!(env.requests_to("10.0.0.3").await.len(), 1);
+    }
+
+    /// A refusal every Agent would give, answered on the retry, still ends the heartbeat.
+    #[tokio::test]
+    async fn a_not_registered_answer_on_the_retry_ends_the_heartbeat_as_before() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let keys = AgentKeys::new();
+        let other = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, true, None).await;
+        env.registry_answers("10.0.0.3", &other, true, None).await;
+        env.agent_answers(
+            "10.0.0.2",
+            HEARTBEAT,
+            refused("error.connectorproofinvalid"),
+            Some(1),
+        )
+        .await;
+        env.agent_answers(
+            "10.0.0.2",
+            HEARTBEAT,
+            ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({ "reason": "error.connectornotregistered" })),
+            None,
+        )
+        .await;
+        env.agent_answers("10.0.0.3", HEARTBEAT, env.heartbeat_ok(&other), None)
+            .await;
+
+        let error = env.heartbeat(&env.directory()).await.unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<AgentRejected>()
+                .unwrap()
+                .is_not_registered()
+        );
+        assert_eq!(env.requests_to("10.0.0.2").await.len(), 2);
+        assert!(env.requests_to("10.0.0.3").await.is_empty());
+    }
+
+    fn rate_limited() -> ResponseTemplate {
+        ResponseTemplate::new(429)
+            .insert_header("Retry-After", "30")
+            .set_body_json(serde_json::json!({ "reason": "connectorratelimited" }))
+    }
+
+    /// TT-3767: a `429` moves on to the next Agent like any other failure of that Agent - no
+    /// retry on it, the heartbeat does not end - and is reported as rate limiting.
+    #[tokio::test]
+    async fn moves_on_to_the_next_agent_when_one_rate_limits_the_heartbeat() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let limiting = AgentKeys::new();
+        let healthy = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &limiting, true, None)
+            .await;
+        env.registry_answers("10.0.0.3", &healthy, true, None).await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, rate_limited(), None)
+            .await;
+        env.agent_answers("10.0.0.3", HEARTBEAT, env.heartbeat_ok(&healthy), None)
+            .await;
+
+        env.heartbeat(&env.directory()).await.unwrap();
+
+        assert_eq!(env.requests_to("10.0.0.2").await.len(), 1, "no retry");
+        assert_eq!(env.requests_to("10.0.0.3").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reports_rate_limiting_when_every_agent_rate_limits() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, true, None).await;
+        env.agent_answers("10.0.0.2", HEARTBEAT, rate_limited(), None)
+            .await;
+        env.agent_answers("10.0.0.2", DEREGISTER, rate_limited(), None)
+            .await;
+
+        let heartbeat = env.heartbeat(&env.directory()).await.unwrap_err();
+        let deregistration = env.deregister(&env.directory()).await.unwrap_err();
+
+        for error in [heartbeat, deregistration] {
+            assert!(error.downcast_ref::<AgentRejected>().is_none());
+            assert!(
+                error.to_string().contains(
+                    "10.0.0.2: Agent rate limited the request (connectorratelimited), Retry-After 30"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn moves_on_to_the_next_agent_when_one_rate_limits_the_deregistration() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let limiting = AgentKeys::new();
+        let healthy = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &limiting, true, None)
+            .await;
+        env.registry_answers("10.0.0.3", &healthy, true, None).await;
+        env.agent_answers("10.0.0.2", DEREGISTER, rate_limited(), None)
+            .await;
+        env.agent_answers("10.0.0.3", DEREGISTER, env.deregister_ok(&healthy), None)
+            .await;
+
+        env.deregister(&env.directory()).await.unwrap();
+
+        assert_eq!(env.requests_to("10.0.0.2").await.len(), 1, "no retry");
+        assert_eq!(env.requests_to("10.0.0.3").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn proves_the_deregistration_too() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, true, None).await;
+        env.agent_answers("10.0.0.2", DEREGISTER, env.deregister_ok(&keys), None)
+            .await;
+
+        env.deregister(&env.directory()).await.unwrap();
+
+        assert_proven_for(
+            &env.requests_to("10.0.0.2").await[0],
+            &keys,
+            DEREGISTER,
+            &env.connector_public_key,
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_a_deregistration_once_then_moves_on_to_the_next_agent() {
+        let env = Env::new(&["10.0.0.2", "10.0.0.3"]).await;
+        let refusing = AgentKeys::new();
+        let healthy = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &refusing, true, None)
+            .await;
+        env.registry_answers("10.0.0.3", &healthy, true, None).await;
+        env.agent_answers(
+            "10.0.0.2",
+            DEREGISTER,
+            refused("error.connectorproofinvalid"),
+            None,
+        )
+        .await;
+        env.agent_answers("10.0.0.3", DEREGISTER, env.deregister_ok(&healthy), None)
+            .await;
+
+        env.deregister(&env.directory()).await.unwrap();
+
+        assert_eq!(env.requests_to("10.0.0.2").await.len(), 2, "retried once");
+        assert_eq!(env.registry_lookups("10.0.0.2").await, 2);
+        assert_proven_for(
+            &env.requests_to("10.0.0.3").await[0],
+            &healthy,
+            DEREGISTER,
+            &env.connector_public_key,
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_no_deregistration_proof_to_an_agent_without_a_key() {
+        let env = Env::new(&["10.0.0.2"]).await;
+        let keys = AgentKeys::new();
+        env.registry_answers("10.0.0.2", &keys, false, None).await;
+        env.agent_answers("10.0.0.2", DEREGISTER, env.deregister_ok(&keys), None)
+            .await;
+
+        env.deregister(&env.directory()).await.unwrap();
+
+        assert_unproven(&env.requests_to("10.0.0.2").await[0]);
     }
 }
