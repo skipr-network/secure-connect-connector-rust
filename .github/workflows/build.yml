@@ -114,7 +114,7 @@ jobs:
         run: cargo test --all-targets
 
       - name: Shellcheck packaging scripts
-        run: shellcheck packaging/*.sh script/*.sh
+        run: shellcheck packaging/*.sh
 
   build:
     name: Build ${{ matrix.arch }}

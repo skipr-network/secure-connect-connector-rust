@@ -4,18 +4,15 @@
 # from a GitHub Release, checks it against the release's SHA256SUMS, unpacks it and hands over to
 # the packaged install-systemd.sh - no Rust toolchain, C compiler or git needed on this host.
 #
-#   curl -fsSL https://raw.githubusercontent.com/skipr-network/secure-connect-connector-rust/main/script/install.sh | AGENTS_JSON_URL=... REGISTRY_BASE_URL=... sh
-#
-# (Served from this repository's main branch - the same file a get.skipr.network address can point
-# at later. See the README's "Installing a released Connector".)
+#   curl -fsSL <url of this script> | AGENTS_JSON_URL=... REGISTRY_BASE_URL=... sh
 #
 # Run it as the normal user the service should run as (like install-systemd.sh, it uses sudo for
 # what needs root and refuses to install a service that runs as root).
 #
 # Environment:
 #   AGENTS_JSON_URL, REGISTRY_BASE_URL, CONNECTOR_CA_BUNDLE_URL, CONNECTOR_USER
-#                           passed on to install-systemd.sh - see the README. Portal's Deploy
-#                           Connector screen fills in the first two.
+#                           passed on to install-systemd.sh (packaging/install-systemd.sh).
+#                           Portal's Deploy Connector screen fills in the first two.
 #   CONNECTOR_VERSION       the release tag to install, e.g. v0.2.0 or v0.2.1-dev.0123abcd9.
 #                           Default: the latest release (never a pre-release).
 #   CONNECTOR_RELEASES_URL  where releases are downloaded from. Default: this repository's GitHub
@@ -51,7 +48,7 @@ detect_arch() {
   case "$machine" in
     x86_64 | amd64) echo x86_64 ;;
     aarch64 | arm64) echo aarch64 ;;
-    *) fail "no prebuilt Connector for this CPU ($machine) - only x86_64 and aarch64 are released. Build it from source instead (see the README)." ;;
+    *) fail "no prebuilt Connector for this CPU ($machine) - only x86_64 and aarch64 are released. Build it from source instead." ;;
   esac
 }
 

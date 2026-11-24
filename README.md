@@ -15,40 +15,7 @@ Implementation lands in feature PRs. Identity + verified heartbeat client
 against Agent, WireGuard tunneling, and flow admission/release are in place;
 see individual ticket history for what's landed.
 
-## Installing a released Connector (one line, no build)
-
-Every release (TT-1875) publishes a prebuilt, statically linked Connector for
-`x86_64` and `aarch64` Linux with a `SHA256SUMS` file. `script/install.sh`
-installs one in a single line - no Rust, C compiler or git on the host. Run it
-as the normal user the service should run as:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/skipr-network/secure-connect-connector-rust/main/script/install.sh | AGENTS_JSON_URL=<your environment's agents.json> REGISTRY_BASE_URL=<your environment's Registry> sh
-```
-
-It picks the package for this host's CPU from the latest release, checks it
-against the release's `SHA256SUMS` (and refuses to install it otherwise),
-unpacks it to `~/secure-connect-connector`, and runs the packaged
-`install-systemd.sh` from there - everything below about that script applies
-unchanged. Paste the public key it prints into Portal's Deploy Connector screen.
-
-| Variable                 | Default                                   |
-| ------------------------ | ----------------------------------------- |
-| `CONNECTOR_VERSION`      | the latest release (never a pre-release), e.g. `v0.2.0` or `v0.2.1-dev.0123abcd9` |
-| `CONNECTOR_RELEASES_URL` | this repository's GitHub releases - a mirror for hosts without GitHub access |
-| `CONNECTOR_INSTALL_DIR`  | `~/secure-connect-connector` - where the package is kept |
-
-`AGENTS_JSON_URL`, `REGISTRY_BASE_URL`, `CONNECTOR_CA_BUNDLE_URL` and
-`CONNECTOR_USER` are passed on to `install-systemd.sh`. Options for that script
-go after `sh -s --`, e.g. `... | sh -s -- --regenerate-identity`. Running the
-same line again upgrades to the latest release; `--uninstall` and
-`--decommission` are run from the install folder:
-`cd ~/secure-connect-connector && ./packaging/install-systemd.sh --uninstall`.
-
-`curl` is needed to fetch the script itself; everything else the install needs
-is checked and, where apt can provide it, installed by `install-systemd.sh`.
-
-## Building and installing from source
+## Installing on a fresh machine
 
 A C toolchain is required before `cargo build` - several dependencies
 (including BoringTun) need `cc` for their build scripts, and it's not present
