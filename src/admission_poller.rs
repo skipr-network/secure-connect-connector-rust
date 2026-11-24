@@ -87,8 +87,9 @@ use tracing::{error, info, warn};
 
 use crate::dto::HeartbeatNode;
 use crate::flow_control::{
-    ControlPlaneState, DnsAdmissionRequest, DnsAdmissionResponse, FlowAdmissionRequest,
-    FlowReleaseRequest, handle_dns_admission, handle_flow_admission, handle_flow_release,
+    AdmissionSlot, ControlPlaneState, DnsAdmissionRequest, DnsAdmissionResponse,
+    FlowAdmissionRequest, FlowReleaseRequest, handle_dns_admission, handle_flow_admission_in_slot,
+    handle_flow_release,
 };
 
 /// Backoff between poll attempts after a transport failure (connection refused, timeout, non-2xx
@@ -438,6 +439,7 @@ async fn dispatch_message(
             connector_id,
             state,
             message,
+            None,
         )
         .await;
         return;
@@ -450,8 +452,10 @@ async fn dispatch_message(
     let node_id = node_id.to_string();
     let connector_id = connector_id.to_string();
     let state = state.clone();
+    let semaphore = admission_slots.clone();
     in_flight.spawn(async move {
-        let _permit = permit;
+        // Handed in, so a flow waiting for a fresher live-session snapshot can give its slot back
+        // while it waits (TT-3770); otherwise held until the message is handled.
         handle_message(
             &node_id,
             gatekeeper_addr,
@@ -459,6 +463,7 @@ async fn dispatch_message(
             &connector_id,
             &state,
             message,
+            Some(AdmissionSlot::new(semaphore, permit)),
         )
         .await;
     });
@@ -471,6 +476,7 @@ async fn handle_message(
     connector_id: &str,
     state: &ControlPlaneState,
     message: ConnectorPollResponse,
+    slot: Option<AdmissionSlot>,
 ) {
     match message.kind.as_str() {
         "admission" => {
@@ -481,6 +487,7 @@ async fn handle_message(
                 connector_id,
                 state,
                 message.admission,
+                slot,
             )
             .await
         }
@@ -510,6 +517,7 @@ async fn handle_admission(
     connector_id: &str,
     state: &ControlPlaneState,
     request: Option<FlowAdmissionRequest>,
+    mut slot: Option<AdmissionSlot>,
 ) {
     let Some(request) = request else {
         error!(%node_id, "poll response claimed type=admission but carried no admission body - ignoring");
@@ -518,11 +526,12 @@ async fn handle_admission(
     let flow_id = request.flow_id.clone();
     let port = request.port;
     let dialled = request.dialled();
-    let response = handle_flow_admission(
+    let response = handle_flow_admission_in_slot(
         &state.policy_store,
         &state.audit_log,
         &state.flow_table,
         request,
+        &mut slot,
     )
     .await;
 
@@ -605,8 +614,12 @@ async fn handle_dns(
         return;
     };
     let correlation_id = request.correlation_id.clone();
-    let response: DnsAdmissionResponse =
-        handle_dns_admission(&state.policy_store, &state.audit_log, request).await;
+    // TT-3770: no decision yet - post nothing, so the node answers SERVFAIL on its own timeout.
+    let Some(response): Option<DnsAdmissionResponse> =
+        handle_dns_admission(&state.policy_store, &state.audit_log, request).await
+    else {
+        return;
+    };
 
     let result_path = format!("/api/connector/{connector_id}/admission-result");
     let host_header = format!("{gatekeeper_addr}:{gatekeeper_http_port}");
@@ -1317,6 +1330,8 @@ mod tests {
                     }],
                 }],
                 node_list: vec![],
+                zero_trust_enabled: None,
+                live_sessions: None,
             })
             .unwrap();
         let signature = crate::crypto::sign_to_base64(&device.signing_key, b"session-nonce-1");
@@ -1359,6 +1374,7 @@ mod tests {
                 "c-1",
                 &state,
                 Some(request),
+                None,
             )
             .await;
             if let Ok(result) = rx.try_recv() {
@@ -1413,6 +1429,7 @@ mod tests {
             "c-1",
             &state,
             Some(request),
+            None,
         )
         .await;
 
@@ -1479,6 +1496,7 @@ mod tests {
                 release: None,
                 dns_admission: None,
             },
+            None,
         )
         .await;
         // No assertion beyond "this returns without touching anything or attempting a network

@@ -103,6 +103,25 @@ pub enum AuditEvent {
         /// Each as flow id and device key.
         flows: Vec<EndedFlow>,
     },
+    /// TT-3770 (spec §B.9 point 1, §B.10): this device's open flow(s) to this gateway ended because
+    /// the live-session snapshot no longer holds their session (reconnect, disconnect, lease end).
+    /// A session ending, not a revoked entitlement, so no gateway-end report is queued (spec §B.18).
+    FlowsEndedByLeaseEnd {
+        gateway_id: String,
+        device_public_key: String,
+        flows_ended: usize,
+        /// Each as flow id and device key.
+        flows: Vec<EndedFlow>,
+    },
+    /// TT-3770 (spec §B.9 point 1): a heartbeat's live-session snapshot was over the size limit and
+    /// refused whole; the last accepted one stays in use.
+    LiveSessionSnapshotRefused {
+        entries: usize,
+        limit: usize,
+    },
+    /// TT-3770: a heartbeat carried no live-session snapshot after one had been accepted; the last
+    /// accepted one stays in use, up to its maximum age.
+    LiveSessionSnapshotMissing,
     /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
     /// to this gateway, and a gateway-end report was queued for it.
     FlowsEnded {

@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use std::env;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+
+use crate::live_sessions::{self, LiveSessionSettings};
 use std::time::Duration;
 
 pub struct Config {
@@ -55,6 +57,13 @@ pub struct Config {
     /// `ca_trust::load_extra_root_certificates` for how this is used and why an unreadable/invalid
     /// path fails startup rather than silently falling back to the default roots.
     pub ca_bundle_path: Option<PathBuf>,
+    /// TT-3770 (spec §B.9 point 1): the lease binding's settings - the snapshot size limit
+    /// (`CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES`, default 20,000), how long a flow with an
+    /// unknown session waits for a fresher snapshot (`CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS`,
+    /// default 8, kept below Gatekeeper's 10-second flow-admission timeout), the shortest gap between
+    /// off-schedule heartbeats (`CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS`, default 20)
+    /// and the kept snapshot's maximum age (three heartbeat intervals).
+    pub live_sessions: LiveSessionSettings,
 }
 
 /// Konyk's answer (TT-1732 comment thread): default 60s, must stay below
@@ -100,6 +109,7 @@ impl Config {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(Ipv4Addr::new(255, 255, 255, 0)),
             heartbeat_interval: parse_heartbeat_interval(),
+            live_sessions: parse_live_session_settings(parse_heartbeat_interval()),
             // PR #11 review: trims before use, not just before the blank-check - a value with
             // stray leading/trailing whitespace (systemd EnvironmentFile doesn't strip it,
             // per install-systemd.sh's own CONNECTOR_IDENTITY_KEY_PATH lesson) previously passed
@@ -113,6 +123,43 @@ impl Config {
         })
     }
 }
+
+/// A positive whole number from `name`, or `default` when it is unset, unparseable or zero.
+fn positive_env(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_live_session_settings(heartbeat_interval: Duration) -> LiveSessionSettings {
+    let flow_wait = Duration::from_secs(positive_env(
+        "CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS",
+        live_sessions::DEFAULT_FLOW_WAIT.as_secs(),
+    ));
+    if flow_wait >= GATEKEEPER_FLOW_ADMISSION_TIMEOUT {
+        tracing::warn!(
+            flow_wait_seconds = flow_wait.as_secs(),
+            "CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS is not below Gatekeeper's 10-second flow-admission timeout - a flow waiting that long is refused by the node before the Connector decides"
+        );
+    }
+    LiveSessionSettings {
+        max_entries: positive_env(
+            "CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES",
+            live_sessions::DEFAULT_MAX_ENTRIES as u64,
+        ) as usize,
+        max_age: heartbeat_interval * live_sessions::MAX_AGE_IN_HEARTBEAT_INTERVALS,
+        flow_wait,
+        off_schedule_min_interval: Duration::from_secs(positive_env(
+            "CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS",
+            live_sessions::DEFAULT_OFF_SCHEDULE_MIN_INTERVAL.as_secs(),
+        )),
+    }
+}
+
+/// Gatekeeper's own default flow-admission timeout (`admission-result-timeout-ms`).
+const GATEKEEPER_FLOW_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn require_env(name: &str) -> Result<String> {
     // A systemd EnvironmentFile line like `VAR=` sets VAR to the empty string, not unset - an
@@ -177,6 +224,9 @@ mod tests {
             "CONNECTOR_TUN_NETMASK",
             "HEARTBEAT_INTERVAL_SECONDS",
             "CONNECTOR_CA_BUNDLE_PATH",
+            "CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES",
+            "CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS",
+            "CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS",
         ] {
             unsafe { env::remove_var(key) };
         }

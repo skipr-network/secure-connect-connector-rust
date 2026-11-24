@@ -39,7 +39,7 @@ pub enum RefusalReason {
 }
 
 impl RefusalReason {
-    fn as_audit_str(self) -> &'static str {
+    pub(crate) fn as_audit_str(self) -> &'static str {
         match self {
             RefusalReason::NoPolicyApplied => "no_policy_applied",
             RefusalReason::PolicyExpired => "policy_expired",
@@ -86,6 +86,7 @@ pub fn decide_access(
 /// Pairs `decide_access` with TT-1820's audit trail - the acceptance
 /// criteria requires an audit entry for every allow/deny decision, not just
 /// the decision itself. Called by `flow_control`'s admission handler.
+#[cfg(test)]
 pub async fn decide_access_and_audit(
     store: &PolicyStore,
     audit_log: &AuditLog,
@@ -93,17 +94,34 @@ pub async fn decide_access_and_audit(
     device_public_key: &str,
 ) -> AccessDecision {
     let decision = decide_access(store, gateway_id, device_public_key);
+    let reason = match &decision {
+        AccessDecision::Allowed { .. } => None,
+        AccessDecision::Refused(reason) => Some(reason.as_audit_str()),
+    };
+    record_access_decision(audit_log, gateway_id, device_public_key, &decision, reason).await;
+    decision
+}
 
-    let event = match &decision {
-        AccessDecision::Allowed { user_id, .. } => AuditEvent::AccessAllowed {
+/// Writes the audit entry of one access decision (TT-1820). `refusal_reason` is the audit reason
+/// when the request was refused - the entitlement's own, or (TT-3770) the lease binding's for a key
+/// the entitlement check allowed - and `None` when it was allowed.
+pub async fn record_access_decision(
+    audit_log: &AuditLog,
+    gateway_id: &str,
+    device_public_key: &str,
+    decision: &AccessDecision,
+    refusal_reason: Option<&str>,
+) {
+    let event = match (decision, refusal_reason) {
+        (AccessDecision::Allowed { user_id, .. }, None) => AuditEvent::AccessAllowed {
             gateway_id: gateway_id.to_string(),
             user_id: user_id.clone(),
             device_public_key: device_public_key.to_string(),
         },
-        AccessDecision::Refused(reason) => AuditEvent::AccessRefused {
+        (_, reason) => AuditEvent::AccessRefused {
             gateway_id: gateway_id.to_string(),
             device_public_key: device_public_key.to_string(),
-            reason: reason.as_audit_str().to_string(),
+            reason: reason.unwrap_or("not_entitled").to_string(),
         },
     };
     // Best-effort: an audit-write failure must not itself block or flip an
@@ -111,8 +129,6 @@ pub async fn decide_access_and_audit(
     if let Err(error) = audit_log.record(event).await {
         tracing::error!(%error, "failed to write access-decision audit entry");
     }
-
-    decision
 }
 
 fn decide_access_at(
@@ -190,6 +206,8 @@ mod tests {
             nonce: "n1".to_string(),
             policy_bundles: bundles,
             node_list: vec![],
+            zero_trust_enabled: None,
+            live_sessions: None,
         }
     }
 

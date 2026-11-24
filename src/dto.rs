@@ -63,6 +63,15 @@ pub struct ConnectorHeartbeatResponse {
     pub nonce: String,
     pub policy_bundles: Vec<PolicyBundle>,
     pub node_list: Vec<HeartbeatNode>,
+    /// TT-3770 (spec §B.9 point 1): whether the Zero Trust module is on. `None` from an Agent or
+    /// Portal that predates it - not the same as "off".
+    #[serde(default)]
+    pub zero_trust_enabled: Option<bool>,
+    /// TT-3770: the live-session snapshot - for each device key on this Connector's entitlement
+    /// lists that has a live lease, the token digests of its live leases. Kept apart from the
+    /// entitlement lists; see `live_sessions`. `None` when the reply carries none.
+    #[serde(default)]
+    pub live_sessions: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
