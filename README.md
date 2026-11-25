@@ -196,8 +196,9 @@ service, the binary, the identity key, `/etc/skipr/connector` and the pending ga
 and removes the IP-forwarding sysctl file and every NAT rule the install tagged as its own (an
 `iptables` comment, `skipr-connector-nat`), on whichever interface it was added. It lists any
 untagged `MASQUERADE` rule still left (a host installed before the tag may have one) for you to
-check. The local audit log and the copy of the script are kept. It is safe to run again. If this host cannot reach an Agent,
-Portal shows the Connector as Unreachable and offers to remove it; after that, this command completes.
+check. The local audit log and the copy of the script are kept. It is safe to run again. If this
+host cannot reach an Agent, Portal shows the Connector as Unreachable and offers to remove it;
+after that, this command completes.
 
 To remove the service without decommissioning, for a reinstall on the same host (`connector.env` is
 left in place):

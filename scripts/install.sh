@@ -113,9 +113,9 @@ main() {
 
   # Kept, not deleted after the install: the release that was installed stays on the host, to re-run
   # the install from or check (--uninstall and --decommission run from the copy install-systemd.sh
-  # keeps at /usr/local/lib/secure-connect-connector/, not from here). Replaced as a whole, so nothing of an older version is left next to the new one - but only an
-  # empty folder or an earlier install: a CONNECTOR_INSTALL_DIR pointing anywhere else is refused,
-  # never deleted.
+  # keeps at /usr/local/lib/secure-connect-connector/, not from here). Replaced as a whole, so
+  # nothing of an older version is left next to the new one - but only an empty folder or an
+  # earlier install: a CONNECTOR_INSTALL_DIR pointing anywhere else is refused, never deleted.
   if [ -e "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ] && [ ! -f "$INSTALL_DIR/packaging/install-systemd.sh" ]; then
     fail "$INSTALL_DIR already exists and is not an earlier Connector install - not replacing it. Set CONNECTOR_INSTALL_DIR to another folder."
   fi

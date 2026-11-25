@@ -204,9 +204,12 @@ if [ "$DECOMMISSION" = true ]; then
   echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
   echo "when it is no longer needed. The folder the Connector was installed from (and the Rust"
   echo "toolchain, if it was built from source) can be removed too."
-  # TT-1875: kept, so this exact command can be run again whatever happened to this run.
-  echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
-  echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
+  # TT-1875: kept, so this exact command can be run again whatever happened to this run. A host
+  # installed before that copy existed (run from its checkout instead) has none to mention.
+  if sudo test -f "$INSTALLED_SCRIPT_PATH"; then
+    echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
+    echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
+  fi
   exit 0
 fi
 
