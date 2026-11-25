@@ -238,6 +238,46 @@ if [ "$RUN_AS_USER" = "root" ]; then
   exit 1
 fi
 
+# TT-1875: the install changes this host step by step (connector.env, the identity key, IP
+# forwarding, the NAT rule, the unit), and a command missing halfway used to stop it there - a
+# minimal Ubuntu has no iptables, so connector.env, an identity key and IP forwarding were left
+# behind with no service, and a public key that looked ready to register. Check everything the
+# install needs before changing anything: install what apt can provide, the same way a missing C
+# toolchain is recovered below, and otherwise stop with nothing changed. Looked up through sudo,
+# like every use below, so a command only on root's PATH (/usr/sbin) is found.
+host_has() {
+  sudo sh -c 'command -v "$1"' sh "$1" >/dev/null 2>&1
+}
+if [ ! -d /run/systemd/system ] || ! host_has systemctl; then
+  echo "error: systemd is not running on this host - the Connector is installed as a systemd" >&2
+  echo "       service. Nothing on this host was changed." >&2
+  exit 1
+fi
+# "command:package" - the commands the install runs, and the package that provides each one. curl
+# only when there is a CA bundle to download (a minimal host has no curl either).
+REQUIRED_COMMANDS=(iptables:iptables ip:iproute2 sysctl:procps)
+if [ -n "${CONNECTOR_CA_BUNDLE_URL:-}" ]; then
+  REQUIRED_COMMANDS+=(curl:curl)
+fi
+MISSING_PACKAGES=()
+for required in "${REQUIRED_COMMANDS[@]}"; do
+  host_has "${required%%:*}" || MISSING_PACKAGES+=("${required#*:}")
+done
+if [ "${#MISSING_PACKAGES[@]}" -gt 0 ]; then
+  if host_has apt-get; then
+    echo "Installing ${MISSING_PACKAGES[*]} (required to install the Connector)..."
+    { sudo apt-get update -qq && sudo apt-get install -y "${MISSING_PACKAGES[@]}"; } || true
+  fi
+  for required in "${REQUIRED_COMMANDS[@]}"; do
+    if ! host_has "${required%%:*}"; then
+      echo "error: '${required%%:*}' is required to install the Connector, and could not be installed." >&2
+      echo "       Install ${MISSING_PACKAGES[*]} with this host's package manager and run this" >&2
+      echo "       command again. No Connector configuration was written." >&2
+      exit 1
+    fi
+  done
+fi
+
 if [ ! -x "$BUILT_BINARY_PATH" ]; then
   # TT-2030 follow-up: the Portal install command chains `cargo build --release && ...` with no
   # C toolchain guaranteed on a fresh box - several dependencies (including BoringTun) need `cc`
@@ -337,8 +377,16 @@ fi
 if [ -n "${CONNECTOR_CA_BUNDLE_URL:-}" ]; then
   CA_BUNDLE_PATH="${ENV_DIR}/ca-bundle.pem"
   echo "Downloading the CA bundle to trust from $CONNECTOR_CA_BUNDLE_URL..."
-  curl -fsS "$CONNECTOR_CA_BUNDLE_URL" | sudo tee "$CA_BUNDLE_PATH" > /dev/null
-  sudo chmod 644 "$CA_BUNDLE_PATH"
+  # TT-1875: downloaded to a temporary file and put in place only once complete - piping curl into
+  # tee left an empty ca-bundle.pem behind whenever the download failed.
+  CA_BUNDLE_DOWNLOAD="$(mktemp)"
+  if ! curl -fsS "$CONNECTOR_CA_BUNDLE_URL" -o "$CA_BUNDLE_DOWNLOAD"; then
+    rm -f "$CA_BUNDLE_DOWNLOAD"
+    echo "error: could not download the CA bundle from $CONNECTOR_CA_BUNDLE_URL." >&2
+    exit 1
+  fi
+  sudo install -m 644 "$CA_BUNDLE_DOWNLOAD" "$CA_BUNDLE_PATH"
+  rm -f "$CA_BUNDLE_DOWNLOAD"
   set_env_value CONNECTOR_CA_BUNDLE_PATH "$CA_BUNDLE_PATH"
 fi
 
