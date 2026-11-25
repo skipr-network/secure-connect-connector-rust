@@ -12,6 +12,7 @@ mod flow_table;
 mod gateway_end;
 mod heartbeat;
 mod identity;
+mod live_sessions;
 mod policy;
 mod registry_client;
 mod request_proof;
@@ -147,7 +148,9 @@ async fn main() -> anyhow::Result<()> {
     // Kept past the move of connector_identity.secret below: every heartbeat identifies this
     // Connector by it (TT-2210).
     let connector_public_key = connector_identity.public_key_base64.clone();
-    let policy_store = Arc::new(PolicyStore::new());
+    let policy_store = Arc::new(PolicyStore::with_live_session_settings(
+        config.live_sessions,
+    ));
     let audit_log = Arc::new(AuditLog::new(&config.audit_log_path));
     // TT-2464: kept next to the audit log, so undelivered gateway-end reports survive a restart.
     let gateway_end_queue = gateway_end::GatewayEndQueue::load(
@@ -281,9 +284,22 @@ async fn main() -> anyhow::Result<()> {
     // when the current one actually finished, so a slow cycle just pushes later ones back instead
     // of compounding into a burst of immediately-repeated heartbeats.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // TT-3770 (spec §B.9 point 1): an admission with an entitled key and an unknown session digest
+    // asks for one heartbeat off schedule. One runs at a time (this loop runs one heartbeat at a
+    // time), at most one starts per minimum interval, and after a failure the gap doubles, up to
+    // the regular interval.
+    let mut off_schedule = live_sessions::OffSchedule::new(
+        config.live_sessions.off_schedule_min_interval,
+        config.heartbeat_interval,
+    );
     loop {
-        interval.tick().await;
-        match run_heartbeat(
+        // Biased to the regular tick: when both are due, one heartbeat answers both.
+        let off_schedule_run = tokio::select! {
+            biased;
+            _ = interval.tick() => false,
+            _ = off_schedule.ready(policy_store.live_sessions()) => true,
+        };
+        let result = run_heartbeat(
             &connector_public_key,
             &agent_directory,
             &registry_client,
@@ -297,8 +313,12 @@ async fn main() -> anyhow::Result<()> {
             &mut admission_pollers,
             &gateway_end_queue,
         )
-        .await
-        {
+        .await;
+        // A successful heartbeat of either kind ends any backoff; a failed off-schedule one extends it.
+        if result.is_ok() || off_schedule_run {
+            off_schedule.ran(result.is_ok());
+        }
+        match result {
             // A steady-state heartbeat reporting a different connector_virtual_ip than the one
             // the TUN device and control-plane listener were already created with (TT-1838) -
             // rebinding either live isn't supported, so this can only be surfaced, not applied.
@@ -487,6 +507,10 @@ async fn run_heartbeat(
         .map(|report| report.report_id.clone())
         .collect();
 
+    // TT-3770: this heartbeat's reply answers every off-schedule request made before it is sent, and
+    // its snapshot counts for every admission that arrived before then.
+    policy_store.live_sessions().clear_refresh_request();
+    let requested_at = std::time::Instant::now();
     let response = agent_directory
         .heartbeat(
             registry_client,
@@ -529,12 +553,12 @@ async fn run_heartbeat(
 
     // Applying can still reject the package (e.g. an already-expired one) even
     // though the signature verified - don't touch existing local state on that.
-    let apply_result = policy_store.apply(response);
+    let apply_result = policy_store.apply_requested_at(response, requested_at);
 
     // Audited either way (TT-1820), and best-effort: a failure to *write* the
     // audit entry must not itself change or hide the underlying apply outcome.
     let audit_event = match &apply_result {
-        Ok(()) => AuditEvent::PolicyApplied {
+        Ok(_) => AuditEvent::PolicyApplied {
             connector_id: connector_id.clone(),
             gateway_count: gateways,
             node_count: nodes,
@@ -547,7 +571,8 @@ async fn run_heartbeat(
         error!(error = %audit_error, "failed to write policy audit entry");
     }
 
-    apply_result?;
+    let snapshot_update = apply_result?;
+    record_snapshot_update(&snapshot_update, audit_log).await;
 
     // TT-2520: only once the package is in force - a rejected one wrote `PolicyRejected` above and
     // put nothing in force, so it writes neither of these.
@@ -579,6 +604,19 @@ async fn run_heartbeat(
         for event in reconcile_gateway_address_changes(flow_table, &old_bundles, &new_bundles) {
             if let Err(error) = audit_log.record(event).await {
                 error!(%error, "failed to write address-change flows-ended audit entry");
+            }
+        }
+    }
+    // TT-3770 (spec §B.9 point 1): after the entitlement check above, so a revoked entitlement still
+    // ends its flows with a gateway-end report; then the flows whose session the fresh snapshot no
+    // longer holds end, with a local audit entry of their own and no report.
+    if matches!(
+        snapshot_update,
+        live_sessions::SnapshotUpdate::Accepted { .. }
+    ) {
+        for event in reconcile_lease_ends(flow_table, policy_store.live_sessions()) {
+            if let Err(error) = audit_log.record(event).await {
+                error!(%error, "failed to write lease-end flows-ended audit entry");
             }
         }
     }
@@ -785,6 +823,73 @@ fn entitlement_list_sha256(entitlements: &[dto::Entitlement]) -> String {
 ///
 /// TT-3449: returns one audit entry per gateway whose refreshed rules ended open flows (spec §B.10);
 /// no gateway-end report is queued for them (§B.18).
+/// TT-3770 (spec §B.9 point 1, §B.10): ends every open flow whose session the just-accepted
+/// live-session snapshot no longer holds - a reconnect, a disconnect or a lease end - and returns one
+/// `FlowsEndedByLeaseEnd` entry per gateway and device. A flow admitted without a session digest (before
+/// the first snapshot, or from signed data without a token) ends here too.
+fn reconcile_lease_ends(
+    flow_table: &std::sync::Mutex<FlowTable>,
+    sessions: &live_sessions::LiveSessions,
+) -> Vec<AuditEvent> {
+    let ended = flow_table
+        .lock()
+        .expect("flow table lock poisoned")
+        .end_flows_without_live_session(|key, digest| sessions.is_live(key, digest));
+    let mut by_gateway_device: std::collections::BTreeMap<(String, String), Vec<audit::EndedFlow>> =
+        std::collections::BTreeMap::new();
+    for flow in ended {
+        by_gateway_device
+            .entry((flow.gateway_id, flow.device_public_key.clone()))
+            .or_default()
+            .push(audit::EndedFlow {
+                flow_id: flow.flow_id,
+                device_public_key: flow.device_public_key,
+            });
+    }
+    by_gateway_device
+        .into_iter()
+        .map(|((gateway_id, device_public_key), flows)| {
+            info!(
+                %gateway_id,
+                flows_ended = flows.len(),
+                "session no longer live: ended its open flow(s)"
+            );
+            AuditEvent::FlowsEndedByLeaseEnd {
+                gateway_id,
+                device_public_key,
+                flows_ended: flows.len(),
+                flows,
+            }
+        })
+        .collect()
+}
+
+/// TT-3770 (spec §B.9 point 1): a refused or missing snapshot is logged and written to the local
+/// audit log - the Connector's own record (§B.10) - since the last accepted snapshot stays in use.
+async fn record_snapshot_update(update: &live_sessions::SnapshotUpdate, audit_log: &AuditLog) {
+    let event = match update {
+        live_sessions::SnapshotUpdate::Refused { entries, limit } => {
+            warn!(
+                entries,
+                limit,
+                "live-session snapshot is over its size limit - refused it whole and kept the last one"
+            );
+            AuditEvent::LiveSessionSnapshotRefused {
+                entries: *entries,
+                limit: *limit,
+            }
+        }
+        live_sessions::SnapshotUpdate::Missing => {
+            warn!("heartbeat carried no live-session snapshot - kept the last one");
+            AuditEvent::LiveSessionSnapshotMissing
+        }
+        _ => return,
+    };
+    if let Err(error) = audit_log.record(event).await {
+        error!(%error, "failed to write live-session snapshot audit entry");
+    }
+}
+
 fn reconcile_endpoint_changes(
     flow_table: &std::sync::Mutex<FlowTable>,
     new_bundles: &[PolicyBundle],
@@ -1410,6 +1515,7 @@ mod tests {
             tun_netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
             heartbeat_interval: Duration::from_secs(60),
             ca_bundle_path: None,
+            live_sessions: live_sessions::LiveSessionSettings::default(),
         }
     }
 
@@ -4572,6 +4678,214 @@ mod tests {
             Some("gw-2"),
             "the same device's flow on a gateway it's still entitled to must survive"
         );
+    }
+
+    /// TT-3770 (spec §B.9 point 1) end to end through real `run_heartbeat` calls: once a fresh
+    /// live-session snapshot no longer holds a flow's session, that flow ends with a local audit entry
+    /// of its own and no gateway-end report; a flow whose session is still live stays.
+    #[tokio::test]
+    async fn a_heartbeat_ends_only_the_flows_whose_session_dropped_out_of_the_snapshot() {
+        let agent_identity = crypto::generate_keypair();
+        let live_a = live_sessions::token_digest("token-a");
+        let live_b = live_sessions::token_digest("token-b");
+        let body = |nonce: &str, digests: &[&str]| {
+            let digests = digests
+                .iter()
+                .map(|digest| format!(r#""{digest}""#))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                r#"{{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"{nonce}","policy_bundles":[{{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.internal.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{{"user_id":"u-1","device_public_key":"dev-A"}}]}}],"node_list":[],"zero_trust_enabled":true,"live_sessions":{{"dev-A":[{digests}]}}}}"#
+            )
+        };
+        let first_body = body("n1", &[&live_a, &live_b]);
+        let second_body = body("n2", &[&live_b]);
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        for (body, times) in [(&first_body, Some(1)), (&second_body, None)] {
+            let signature = crypto::sign_to_base64(&agent_identity.signing_key, body.as_bytes());
+            let mock = Mock::given(method("POST"))
+                .and(path("/api/connectors/heartbeat"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(body.clone(), "application/json")
+                        .insert_header("X-Signature", signature.as_str()),
+                );
+            match times {
+                Some(times) => mock.up_to_n_times(times).mount(&agent_server).await,
+                None => mock.mount(&agent_server).await,
+            }
+        }
+
+        let config = config(registry_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_server.uri()).await;
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
+        let gateway_end_queue = test_gateway_end_queue();
+        let mut admission_pollers = admission_pollers();
+
+        for round in 0..2 {
+            run_heartbeat(
+                "pk-1",
+                &agent_directory,
+                &registry_client,
+                &heartbeat_client,
+                &policy_store,
+                &audit_log,
+                &tunnel_manager,
+                &wg_socket,
+                &flow_table,
+                &dns_cache,
+                &mut admission_pollers,
+                &gateway_end_queue,
+            )
+            .await
+            .unwrap();
+            if round == 0 {
+                let mut table = flow_table.lock().unwrap();
+                for (port, flow_id, digest) in
+                    [(40001, "flow-a", &live_a), (40002, "flow-b", &live_b)]
+                {
+                    table.admit_session_flow(
+                        "n-1".to_string(),
+                        port,
+                        None,
+                        "gw-1".to_string(),
+                        flow_id.to_string(),
+                        "dev-A".to_string(),
+                        vec![],
+                        Some(digest.clone()),
+                    );
+                }
+            }
+        }
+
+        {
+            let table = flow_table.lock().unwrap();
+            assert!(
+                table.gateway_for("n-1", 40001).is_none(),
+                "the flow whose session dropped out of the snapshot must end"
+            );
+            assert_eq!(table.gateway_for("n-1", 40002), Some("gw-1"));
+        }
+        assert!(
+            gateway_end_queue
+                .pending(chrono::Utc::now().timestamp_millis())
+                .await
+                .is_empty(),
+            "a session ending is not a revoked entitlement - no gateway-end report"
+        );
+        let audit = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        let lease_end: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|entry| entry["event"] == "flows_ended_by_lease_end")
+            .collect();
+        assert_eq!(lease_end.len(), 1);
+        assert_eq!(lease_end[0]["gateway_id"], "gw-1");
+        assert_eq!(lease_end[0]["device_public_key"], "dev-A");
+        assert_eq!(lease_end[0]["flows_ended"], 1);
+        assert_eq!(lease_end[0]["flows"][0]["flow_id"], "flow-a");
+        assert!(!audit.contains(r#""event":"flows_ended""#));
+    }
+
+    /// TT-3770 (spec §B.9 point 1, Rollout): a flow admitted without a session digest - before the
+    /// first snapshot - ends on the first snapshot that enforces the binding; one whose session is in
+    /// it stays. No snapshot in force ends nothing.
+    #[test]
+    fn the_first_snapshot_ends_the_flows_admitted_without_a_session() {
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let sessions = live_sessions::LiveSessions::new(Default::default());
+        for (port, flow_id, digest) in [(40001, "f-old", None), (40002, "f-live", Some("d1"))] {
+            flow_table.lock().unwrap().admit_session_flow(
+                "n-1".to_string(),
+                port,
+                None,
+                "gw-1".to_string(),
+                flow_id.to_string(),
+                "dev-A".to_string(),
+                vec![],
+                digest.map(ToString::to_string),
+            );
+        }
+        assert!(reconcile_lease_ends(&flow_table, &sessions).is_empty());
+
+        sessions.update(
+            Some(true),
+            Some(std::collections::HashMap::from([(
+                "dev-A".to_string(),
+                vec!["d1".to_string()],
+            )])),
+            std::time::Instant::now(),
+        );
+        let events = reconcile_lease_ends(&flow_table, &sessions);
+
+        assert_eq!(
+            events,
+            vec![AuditEvent::FlowsEndedByLeaseEnd {
+                gateway_id: "gw-1".to_string(),
+                device_public_key: "dev-A".to_string(),
+                flows_ended: 1,
+                flows: vec![audit::EndedFlow {
+                    flow_id: "f-old".to_string(),
+                    device_public_key: "dev-A".to_string(),
+                }],
+            }]
+        );
+        assert_eq!(
+            flow_table.lock().unwrap().gateway_for("n-1", 40002),
+            Some("gw-1")
+        );
+    }
+
+    /// TT-3770: a snapshot over the size limit is refused whole and recorded; the last one stays in use.
+    #[tokio::test]
+    async fn a_refused_snapshot_is_recorded_and_the_last_one_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        record_snapshot_update(
+            &live_sessions::SnapshotUpdate::Refused {
+                entries: 20_001,
+                limit: 20_000,
+            },
+            &audit_log,
+        )
+        .await;
+        record_snapshot_update(&live_sessions::SnapshotUpdate::Missing, &audit_log).await;
+        record_snapshot_update(
+            &live_sessions::SnapshotUpdate::Accepted { entries: 1 },
+            &audit_log,
+        )
+        .await;
+        let audit = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        let events: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "live_session_snapshot_refused");
+        assert_eq!(events[0]["entries"], 20_001);
+        assert_eq!(events[0]["limit"], 20_000);
+        assert_eq!(events[1]["event"], "live_session_snapshot_missing");
     }
 
     /// TT-3699 end to end through real `run_heartbeat` calls (TT-2529 "Nodes use the Portal's

@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use std::sync::RwLock;
 
 use crate::dto::{ConnectorHeartbeatResponse, HeartbeatNode, PolicyBundle};
+use crate::live_sessions::{LiveSessionSettings, LiveSessions, SnapshotUpdate};
 
 #[derive(Debug, Clone)]
 pub struct PolicyState {
@@ -34,30 +35,64 @@ pub struct PolicyState {
 
 pub struct PolicyStore {
     state: RwLock<Option<PolicyState>>,
+    /// TT-3770 (spec §B.9 point 1): the live-session snapshot, applied from the same verified,
+    /// in-force replies as the policy but kept apart from it - see `live_sessions`.
+    live_sessions: LiveSessions,
 }
 
 impl PolicyStore {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_live_session_settings(LiveSessionSettings::default())
+    }
+
+    pub fn with_live_session_settings(settings: LiveSessionSettings) -> Self {
         Self {
             state: RwLock::new(None),
+            live_sessions: LiveSessions::new(settings),
         }
+    }
+
+    pub fn live_sessions(&self) -> &LiveSessions {
+        &self.live_sessions
     }
 
     /// Applies a verified heartbeat response as the new local policy state,
     /// unless it's already expired - an expired package leaves whatever state
     /// was already stored completely untouched, same as a signature failure.
-    pub fn apply(&self, response: ConnectorHeartbeatResponse) -> Result<()> {
-        self.apply_at(response, Utc::now())
+    #[cfg(test)]
+    pub fn apply(&self, response: ConnectorHeartbeatResponse) -> Result<SnapshotUpdate> {
+        self.apply_requested_at(response, std::time::Instant::now())
+    }
+
+    /// `apply`, for a reply to a heartbeat whose request was sent at `requested_at` - the snapshot it
+    /// carries counts only for admissions that arrived before then (TT-3770).
+    pub fn apply_requested_at(
+        &self,
+        response: ConnectorHeartbeatResponse,
+        requested_at: std::time::Instant,
+    ) -> Result<SnapshotUpdate> {
+        self.apply_at_requested_at(response, Utc::now(), requested_at)
     }
 
     /// `pub(crate)` (not just test-private) so other in-crate modules' tests -
     /// e.g. `access`'s - can set up precisely timed scenarios through the
     /// real validated-apply path instead of hand-building a `PolicyState`.
+    #[cfg(test)]
     pub(crate) fn apply_at(
         &self,
         response: ConnectorHeartbeatResponse,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<SnapshotUpdate> {
+        self.apply_at_requested_at(response, now, std::time::Instant::now())
+    }
+
+    fn apply_at_requested_at(
+        &self,
+        response: ConnectorHeartbeatResponse,
+        now: DateTime<Utc>,
+        requested_at: std::time::Instant,
+    ) -> Result<SnapshotUpdate> {
         let expires_at = DateTime::parse_from_rfc3339(&response.expires_at).with_context(|| {
             format!(
                 "heartbeat package has an unparseable expires_at: {}",
@@ -80,7 +115,13 @@ impl PolicyStore {
             policy_bundles: response.policy_bundles,
             node_list: response.node_list,
         });
-        Ok(())
+        drop(guard);
+        // Only a package in force updates the snapshot: an expired one, refused above, changes nothing.
+        Ok(self.live_sessions.update(
+            response.zero_trust_enabled,
+            response.live_sessions,
+            requested_at,
+        ))
     }
 
     /// A snapshot of the currently applied policy state, or `None` if no
@@ -109,6 +150,8 @@ mod tests {
             nonce: "n1".to_string(),
             policy_bundles: vec![],
             node_list: vec![],
+            zero_trust_enabled: None,
+            live_sessions: None,
         }
     }
 

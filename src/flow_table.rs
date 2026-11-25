@@ -246,6 +246,18 @@ struct AdmittedFlow {
     /// and destination port its first forwarded packet used, so a rule removal can tell whether a
     /// rule still serves it. `None` until a packet has been forwarded.
     served: Option<(Option<Transport>, u16)>,
+    /// TT-3770 (spec §B.9 point 1): the digest of the session token its admission's signed data
+    /// carried, `None` when it carried none. A snapshot that no longer holds it ends the flow.
+    session_digest: Option<String>,
+}
+
+/// A flow `FlowTable::end_flows_without_live_session` ended because its session's lease ended
+/// (TT-3770).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseEndedFlow {
+    pub gateway_id: String,
+    pub flow_id: String,
+    pub device_public_key: String,
 }
 
 /// A flow `FlowTable::update_rules` ended because its gateway's port rules no longer serve it
@@ -470,6 +482,7 @@ impl FlowTable {
     /// (TT-2639), otherwise by node and translated port alone, as before. Re-admitting the same key
     /// (its release never arrived) replaces the old entry and frees its source port. A flow with an
     /// identity gets its source port when its first packet is forwarded (`forward`).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn admit_flow(
         &mut self,
@@ -480,6 +493,31 @@ impl FlowTable {
         flow_id: String,
         device_public_key: String,
         rules: Vec<PortRule>,
+    ) {
+        self.admit_session_flow(
+            node_id,
+            port,
+            dialled,
+            gateway_id,
+            flow_id,
+            device_public_key,
+            rules,
+            None,
+        );
+    }
+
+    /// `admit_flow`, remembering the digest of the session token the admission carried (TT-3770).
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_session_flow(
+        &mut self,
+        node_id: String,
+        port: u16,
+        dialled: Option<Dialled>,
+        gateway_id: String,
+        flow_id: String,
+        device_public_key: String,
+        rules: Vec<PortRule>,
+        session_digest: Option<String>,
     ) {
         let key = FlowKey {
             node_id,
@@ -510,8 +548,41 @@ impl FlowTable {
                 virtual_address: dialled.map(|dialled| dialled.gateway_address),
                 allocation: None,
                 served: None,
+                session_digest,
             },
         );
+    }
+
+    /// Ends every flow whose session is no longer live (TT-3770, spec §B.9 point 1): `is_live` gets
+    /// each flow's device key and session digest. Like a revoked entitlement, the flows are only
+    /// removed; unlike it, the caller writes a local audit entry of its own and queues no gateway-end
+    /// report (§B.18), since a session ending is not a withdrawal of access.
+    pub fn end_flows_without_live_session(
+        &mut self,
+        is_live: impl Fn(&str, Option<&str>) -> bool,
+    ) -> Vec<LeaseEndedFlow> {
+        let ended: Vec<(FlowKey, LeaseEndedFlow)> = self
+            .flows
+            .iter()
+            .filter(|(_, flow)| !is_live(&flow.device_public_key, flow.session_digest.as_deref()))
+            .map(|(key, flow)| {
+                (
+                    key.clone(),
+                    LeaseEndedFlow {
+                        gateway_id: flow.gateway_id.clone(),
+                        flow_id: flow.flow_id.clone(),
+                        device_public_key: flow.device_public_key.clone(),
+                    },
+                )
+            })
+            .collect();
+        ended
+            .into_iter()
+            .map(|(key, flow)| {
+                self.remove_flow(&key);
+                flow
+            })
+            .collect()
     }
 
     /// Removes one flow, freeing its allocated source port or its `nodes_by_port` entry; a no-op if
@@ -4038,5 +4109,49 @@ mod tests {
             Forwarding::Refused(ForwardOutcome::PortNotConfigured),
             "a port no rule opens is refused on the Portal address too"
         );
+    }
+
+    /// TT-3770: only the flows whose session is no longer live end, each reported with its gateway.
+    #[test]
+    fn end_flows_without_live_session_ends_only_the_flows_whose_session_ended() {
+        let mut table = FlowTable::new();
+        for (port, flow_id, key, digest) in [
+            (40001, "f-1", "dev-A", Some("live")),
+            (40002, "f-2", "dev-A", Some("ended")),
+            (40003, "f-3", "dev-B", None),
+        ] {
+            table.admit_session_flow(
+                "n-1".to_string(),
+                port,
+                None,
+                "gw-1".to_string(),
+                flow_id.to_string(),
+                key.to_string(),
+                vec![],
+                digest.map(ToString::to_string),
+            );
+        }
+
+        let mut ended = table.end_flows_without_live_session(|_, digest| digest == Some("live"));
+        ended.sort_by(|a, b| a.flow_id.cmp(&b.flow_id));
+
+        assert_eq!(
+            ended,
+            vec![
+                LeaseEndedFlow {
+                    gateway_id: "gw-1".to_string(),
+                    flow_id: "f-2".to_string(),
+                    device_public_key: "dev-A".to_string(),
+                },
+                LeaseEndedFlow {
+                    gateway_id: "gw-1".to_string(),
+                    flow_id: "f-3".to_string(),
+                    device_public_key: "dev-B".to_string(),
+                },
+            ]
+        );
+        assert_eq!(table.gateway_for("n-1", 40001), Some("gw-1"));
+        assert!(table.gateway_for("n-1", 40002).is_none());
+        assert!(table.gateway_for("n-1", 40003).is_none());
     }
 }

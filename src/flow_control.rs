@@ -18,11 +18,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
-use crate::access::{AccessDecision, decide_access_and_audit};
+use crate::access::{AccessDecision, decide_access, record_access_decision};
 use crate::audit::{AuditEvent, AuditLog};
 use crate::crypto;
 use crate::dto::PortRule;
 use crate::flow_table::{Dialled, FlowTable, Transport};
+use crate::live_sessions::{self, LeaseCheck};
 use crate::policy::PolicyStore;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +78,9 @@ enum Recorded {
     Admitted,
     AdmittedWithoutDialledIdentity,
     AlreadyReleased,
+    /// TT-3770: a heartbeat accepted a snapshot without this flow's session between its lease check
+    /// and here - that heartbeat's reconcile has already run, so admitting it now would outlive it.
+    SessionEnded,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -145,8 +149,137 @@ enum AdmissionOutcome {
     Allowed {
         device_public_key: String,
         rules: Vec<PortRule>,
+        /// TT-3770: the digest of the session token the signed data carried, if any.
+        session_digest: Option<String>,
     },
     Refused(&'static str),
+    /// TT-3770 (spec §B.9 point 1), DNS only: no decision - the session's digest did not turn up
+    /// within the DNS wait, or the kept snapshot is too old. Nothing is posted, so the node answers
+    /// SERVFAIL on its own timeout, which clients do not cache as "does not exist" (§B.13 points 4
+    /// and 5).
+    Undecided(&'static str),
+}
+
+/// Which admission the lease check is for: a flow waits up to `flow_wait` for a fresher snapshot, a
+/// DNS check up to the shorter `dns_wait`, below the node's DNS admission timeout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdmissionKind {
+    Flow,
+    Dns,
+}
+
+/// The lease binding's answer for a key the entitlement check allowed (TT-3770, spec §B.9 point 1).
+enum LeaseOutcome {
+    Admit,
+    Refuse(&'static str),
+    Undecided(&'static str),
+}
+
+/// TT-3770 (spec §B.9 point 1): the lease check, after the signature and entitlement checks. A digest
+/// not in the snapshot asks for one off-schedule heartbeat. A flow then waits, until `flow_wait` after
+/// it arrived, and is re-checked on every snapshot change: admitted once its digest is there, refused
+/// once a snapshot requested after it arrived still lacks it - with no second fetch. A DNS check waits
+/// the same way until `dns_wait` after it arrived, and gets no decision instead of a refusal. Either
+/// drops its admission `slot` while it waits, so waiting admissions never stall the node's other
+/// admissions and releases.
+async fn lease_decision(
+    policy_store: &PolicyStore,
+    device_public_key: &str,
+    digest: Option<&str>,
+    arrived: std::time::Instant,
+    kind: AdmissionKind,
+    slot: &mut Option<AdmissionSlot>,
+) -> LeaseOutcome {
+    let sessions = policy_store.live_sessions();
+    let wait = match kind {
+        AdmissionKind::Flow => sessions.settings().flow_wait,
+        AdmissionKind::Dns => sessions.settings().dns_wait,
+    };
+    let deadline = tokio::time::Instant::from_std(arrived + wait);
+    let mut changes = sessions.subscribe();
+    let mut asked = false;
+    loop {
+        // Read before the check: a change landing in between is seen on the next round.
+        let latest_requested_at = *changes.borrow_and_update();
+        match sessions.check(device_public_key, digest) {
+            LeaseCheck::Admit => return LeaseOutcome::Admit,
+            LeaseCheck::Refuse(reason)
+                if kind == AdmissionKind::Dns
+                    && reason == live_sessions::REASON_SNAPSHOT_TOO_OLD =>
+            {
+                return LeaseOutcome::Undecided(reason);
+            }
+            LeaseCheck::Refuse(reason) => return LeaseOutcome::Refuse(reason),
+            LeaseCheck::Unknown => {}
+        }
+        // Absent from a snapshot fetched after the admission arrived: decided, nothing to fetch.
+        if latest_requested_at.is_some_and(|requested_at| requested_at > arrived) {
+            return match kind {
+                AdmissionKind::Flow => LeaseOutcome::Refuse(live_sessions::REASON_NOT_IN_SNAPSHOT),
+                AdmissionKind::Dns => {
+                    LeaseOutcome::Undecided(live_sessions::REASON_NOT_IN_SNAPSHOT)
+                }
+            };
+        }
+        if !asked {
+            asked = true;
+            sessions.request_refresh();
+            if let Some(slot) = slot.as_mut() {
+                slot.release();
+            }
+        }
+        let changed = tokio::time::timeout_at(deadline, changes.changed()).await;
+        if !matches!(changed, Ok(Ok(()))) {
+            return match kind {
+                AdmissionKind::Flow => {
+                    LeaseOutcome::Refuse(live_sessions::REASON_NO_SNAPSHOT_IN_TIME)
+                }
+                AdmissionKind::Dns => {
+                    LeaseOutcome::Undecided(live_sessions::REASON_NO_SNAPSHOT_IN_TIME)
+                }
+            };
+        }
+    }
+}
+
+/// The node's admission slot an admission holds (`admission_poller`, TT-2298). A flow waiting for a
+/// fresher live-session snapshot gives it back while it waits and takes one again before it goes
+/// on, so waiting flows never stall the node's other admissions and releases (TT-3770).
+pub(crate) struct AdmissionSlot {
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl AdmissionSlot {
+    pub(crate) fn new(
+        semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            semaphore,
+            permit: Some(permit),
+        }
+    }
+
+    fn release(&mut self) {
+        self.permit = None;
+    }
+
+    async fn reacquire(&mut self) {
+        if self.permit.is_none() {
+            self.permit = self.semaphore.clone().acquire_owned().await.ok();
+        }
+    }
+}
+
+/// The fixed wire reason (TT-1732 contract) for a lease-binding refusal: a missing token is an
+/// authentication failure; a session whose lease is not live is an expired entitlement.
+fn lease_wire_reason(reason: &str) -> &'static str {
+    if reason == live_sessions::REASON_NO_TOKEN {
+        "invalid_signature"
+    } else {
+        "expired_entitlement"
+    }
 }
 
 /// Authentication and entitlement decision shared by `handle_flow_admission` and
@@ -154,6 +287,7 @@ enum AdmissionOutcome {
 /// describes, independent of what's being admitted (a flow's NAT'd port vs. a DNS answer).
 /// Extracted from `handle_flow_admission` (TT-2227) rather than duplicated, so the two admission
 /// paths can never drift on what counts as a valid signature or a matching entitlement.
+#[allow(clippy::too_many_arguments)]
 async fn authenticate_and_decide(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
@@ -161,7 +295,10 @@ async fn authenticate_and_decide(
     user_public_key: Option<String>,
     signature: Option<String>,
     signed_data: Option<String>,
+    kind: AdmissionKind,
+    slot: &mut Option<AdmissionSlot>,
 ) -> AdmissionOutcome {
+    let arrived = std::time::Instant::now();
     // TT-2145: a null signature triple is a normal, anticipated input (spec
     // §B.9), not a malformed request - handle it as a considered "no
     // signature presented -> refuse" decision, with its own audit entry,
@@ -248,12 +385,63 @@ async fn authenticate_and_decide(
     // the current entitlement list for the named gateway_id specifically -
     // this only removes a same-Connector restriction the spec never called
     // for.
-    match decide_access_and_audit(policy_store, audit_log, gateway_id, &user_public_key).await {
-        AccessDecision::Allowed { rules, .. } => AdmissionOutcome::Allowed {
-            device_public_key: user_public_key,
-            rules,
-        },
-        AccessDecision::Refused(reason) => AdmissionOutcome::Refused(reason.as_wire_str()),
+    let decision = decide_access(policy_store, gateway_id, &user_public_key);
+    let rules = match &decision {
+        AccessDecision::Allowed { rules, .. } => rules.clone(),
+        AccessDecision::Refused(reason) => {
+            let reason = *reason;
+            record_access_decision(
+                audit_log,
+                gateway_id,
+                &user_public_key,
+                &decision,
+                Some(reason.as_audit_str()),
+            )
+            .await;
+            return AdmissionOutcome::Refused(reason.as_wire_str());
+        }
+    };
+
+    // TT-3770 (spec §B.9 point 1): with the Zero Trust module on, the proof counts only while the
+    // lease of the session it was signed for lives. Checked after the entitlement, so an unknown
+    // digest only ever costs a heartbeat for a key that is entitled; audited once decided.
+    let session_digest = live_sessions::session_digest(&signed_message);
+    let lease = lease_decision(
+        policy_store,
+        &user_public_key,
+        session_digest.as_deref(),
+        arrived,
+        kind,
+        slot,
+    )
+    .await;
+    // An undecided DNS check posts nothing, so it needs no slot back.
+    if !matches!(lease, LeaseOutcome::Undecided(_))
+        && let Some(slot) = slot.as_mut()
+    {
+        slot.reacquire().await;
+    }
+    match lease {
+        LeaseOutcome::Admit => {
+            record_access_decision(audit_log, gateway_id, &user_public_key, &decision, None).await;
+            AdmissionOutcome::Allowed {
+                device_public_key: user_public_key,
+                rules,
+                session_digest,
+            }
+        }
+        LeaseOutcome::Refuse(reason) => {
+            record_access_decision(
+                audit_log,
+                gateway_id,
+                &user_public_key,
+                &decision,
+                Some(reason),
+            )
+            .await;
+            AdmissionOutcome::Refused(lease_wire_reason(reason))
+        }
+        LeaseOutcome::Undecided(reason) => AdmissionOutcome::Undecided(reason),
     }
 }
 
@@ -261,11 +449,24 @@ async fn authenticate_and_decide(
 /// own long-poll to Gatekeeper - previously invoked from an axum handler here directly (pre-TT-2144),
 /// now called from that module's own task after HTTP JSON extraction happens there instead. Public
 /// so it stays independently testable (as its own unit tests below do) without an HTTP round trip.
+#[cfg(test)]
 pub(crate) async fn handle_flow_admission(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
     flow_table: &Mutex<FlowTable>,
     request: FlowAdmissionRequest,
+) -> FlowAdmissionResponse {
+    handle_flow_admission_in_slot(policy_store, audit_log, flow_table, request, &mut None).await
+}
+
+/// `handle_flow_admission`, holding the node's admission `slot` (`admission_poller`), which it drops
+/// while it waits for a fresher live-session snapshot (TT-3770).
+pub(crate) async fn handle_flow_admission_in_slot(
+    policy_store: &PolicyStore,
+    audit_log: &AuditLog,
+    flow_table: &Mutex<FlowTable>,
+    request: FlowAdmissionRequest,
+    slot: &mut Option<AdmissionSlot>,
 ) -> FlowAdmissionResponse {
     let dialled = request.dialled();
     let outcome = authenticate_and_decide(
@@ -275,6 +476,8 @@ pub(crate) async fn handle_flow_admission(
         request.user_public_key,
         request.signature,
         request.signed_data,
+        AdmissionKind::Flow,
+        slot,
     )
     .await;
 
@@ -282,6 +485,7 @@ pub(crate) async fn handle_flow_admission(
         AdmissionOutcome::Allowed {
             device_public_key,
             rules,
+            session_digest,
         } => {
             // The real forwarding loops (`main`) only forward traffic for a
             // (node_id, port) pair present here, in both directions
@@ -317,10 +521,17 @@ pub(crate) async fn handle_flow_admission(
                     )
                     .map(ToString::to_string)
                 });
+                // TT-3770: under the lock `reconcile_lease_ends` also holds, so the flow is either
+                // inserted before that reconcile (which then ends it) or refused here.
                 let recorded = if table.was_recently_released(&request.flow_id) {
                     Recorded::AlreadyReleased
+                } else if !policy_store
+                    .live_sessions()
+                    .is_live(&device_public_key, session_digest.as_deref())
+                {
+                    Recorded::SessionEnded
                 } else {
-                    table.admit_flow(
+                    table.admit_session_flow(
                         request.node_id.clone(),
                         request.port,
                         dialled,
@@ -328,6 +539,7 @@ pub(crate) async fn handle_flow_admission(
                         request.flow_id.clone(),
                         device_public_key,
                         rules,
+                        session_digest,
                     );
                     match dialled {
                         Some(_) => Recorded::Admitted,
@@ -350,16 +562,16 @@ pub(crate) async fn handle_flow_admission(
                             .to_string(),
                     ),
                 ),
-                (Recorded::AlreadyReleased, _) => (None, None),
+                (Recorded::AlreadyReleased | Recorded::SessionEnded, _) => (None, None),
             };
-            if !matches!(recorded, Recorded::AlreadyReleased) {
+            if !matches!(recorded, Recorded::AlreadyReleased | Recorded::SessionEnded) {
                 // In the background (TT-2514 review): the admission's reply must not wait for a
                 // second disk write - the access decision above is already recorded.
                 let audit_log = audit_log.clone();
                 let event = AuditEvent::FlowAdmitted {
                     flow_id: request.flow_id.clone(),
                     gateway_id: request.gateway_id.clone(),
-                    device_public_key: admitted_device_key,
+                    device_public_key: admitted_device_key.clone(),
                     port_rule,
                     warning,
                 };
@@ -370,6 +582,25 @@ pub(crate) async fn handle_flow_admission(
                 });
             }
             match recorded {
+                Recorded::SessionEnded => {
+                    tracing::info!(flow_id = %request.flow_id, "the flow's session ended while it was being admitted - not admitting it");
+                    let audit_log = audit_log.clone();
+                    let event = AuditEvent::AccessRefused {
+                        gateway_id: request.gateway_id.clone(),
+                        device_public_key: admitted_device_key,
+                        reason: live_sessions::REASON_NOT_IN_SNAPSHOT.to_string(),
+                    };
+                    tokio::spawn(async move {
+                        if let Err(error) = audit_log.record(event).await {
+                            tracing::error!(%error, "failed to write session-ended audit entry");
+                        }
+                    });
+                    return FlowAdmissionResponse {
+                        flow_id: request.flow_id,
+                        decision: "refuse".to_string(),
+                        reason: Some("expired_entitlement".to_string()),
+                    };
+                }
                 Recorded::AlreadyReleased => {
                     tracing::warn!(flow_id = %request.flow_id, "flow was released before its admission finished - not admitting it");
                     return FlowAdmissionResponse {
@@ -408,6 +639,12 @@ pub(crate) async fn handle_flow_admission(
             decision: "refuse".to_string(),
             reason: Some(reason.to_string()),
         },
+        // Never for a flow (it waits and is then decided); fail closed all the same.
+        AdmissionOutcome::Undecided(_) => FlowAdmissionResponse {
+            flow_id: request.flow_id,
+            decision: "refuse".to_string(),
+            reason: Some("expired_entitlement".to_string()),
+        },
     }
 }
 
@@ -416,11 +653,26 @@ pub(crate) async fn handle_flow_admission(
 /// no flow to track, so nothing here touches `FlowTable`. Called by `admission_poller` when it
 /// receives a `dns_admission` message over the Connector-initiated long-poll channel (TT-2144),
 /// not from an inbound HTTP route.
+///
+/// `None` (TT-3770, spec §B.9 point 1) is no decision: nothing is posted back, so the node answers
+/// SERVFAIL on its own timeout rather than an NXDOMAIN a client would cache.
+#[cfg(test)]
 pub(crate) async fn handle_dns_admission(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
     request: DnsAdmissionRequest,
-) -> DnsAdmissionResponse {
+) -> Option<DnsAdmissionResponse> {
+    handle_dns_admission_in_slot(policy_store, audit_log, request, &mut None).await
+}
+
+/// `handle_dns_admission` holding the node's admission `slot`, which it gives back while it waits
+/// for a fresher live-session snapshot (TT-3770).
+pub(crate) async fn handle_dns_admission_in_slot(
+    policy_store: &PolicyStore,
+    audit_log: &AuditLog,
+    request: DnsAdmissionRequest,
+    slot: &mut Option<AdmissionSlot>,
+) -> Option<DnsAdmissionResponse> {
     let outcome = authenticate_and_decide(
         policy_store,
         audit_log,
@@ -428,23 +680,29 @@ pub(crate) async fn handle_dns_admission(
         request.user_public_key,
         request.signature,
         request.signed_data,
+        AdmissionKind::Dns,
+        slot,
     )
     .await;
 
     match outcome {
         AdmissionOutcome::Allowed { .. } => {
             tracing::info!(hostname = %request.hostname, gateway_id = %request.gateway_id, "DNS resolution admitted");
-            DnsAdmissionResponse {
+            Some(DnsAdmissionResponse {
                 decision: "admit".to_string(),
                 reason: None,
-            }
+            })
         }
         AdmissionOutcome::Refused(reason) => {
             tracing::info!(hostname = %request.hostname, gateway_id = %request.gateway_id, %reason, "DNS resolution refused");
-            DnsAdmissionResponse {
+            Some(DnsAdmissionResponse {
                 decision: "refuse".to_string(),
                 reason: Some(reason.to_string()),
-            }
+            })
+        }
+        AdmissionOutcome::Undecided(reason) => {
+            tracing::info!(hostname = %request.hostname, gateway_id = %request.gateway_id, %reason, "DNS resolution not decided - no live-session snapshot held the session in time");
+            None
         }
     }
 }
@@ -504,6 +762,8 @@ mod tests {
                     }],
                 }],
                 node_list: vec![],
+                zero_trust_enabled: None,
+                live_sessions: None,
             })
             .unwrap();
         store
@@ -575,10 +835,10 @@ mod tests {
 
         assert_eq!(
             response,
-            DnsAdmissionResponse {
+            Some(DnsAdmissionResponse {
                 decision: "admit".to_string(),
                 reason: None,
-            }
+            })
         );
     }
 
@@ -599,10 +859,10 @@ mod tests {
 
         assert_eq!(
             response,
-            DnsAdmissionResponse {
+            Some(DnsAdmissionResponse {
                 decision: "refuse".to_string(),
                 reason: Some("not_entitled".to_string()),
-            }
+            })
         );
     }
 
@@ -886,6 +1146,8 @@ mod tests {
                     },
                 ],
                 node_list: vec![],
+                zero_trust_enabled: None,
+                live_sessions: None,
             })
             .unwrap();
         let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
@@ -1318,5 +1580,555 @@ mod tests {
             },
         )
         .await;
+    }
+
+    // TT-3770 (spec §B.9 point 1): lease-bound admission.
+
+    const TOKEN: &str = "_iwW9JAVm5D-Hv0tZ_1Wp9B2tk5o4pdDSmJ8M040V3Q";
+
+    fn signed_request(token: Option<&str>) -> String {
+        match token {
+            Some(token) => format!(
+                r#"{{"device_id":"d-1","public_key":"k","protocol":"openvpn","provision_token":"{token}","gateway_id":"gw-1"}}"#
+            ),
+            None => {
+                r#"{"device_id":"d-1","public_key":"k","protocol":"openvpn","gateway_id":"gw-1"}"#
+                    .to_string()
+            }
+        }
+    }
+
+    fn lease_store(wait: std::time::Duration) -> PolicyStore {
+        PolicyStore::with_live_session_settings(crate::live_sessions::LiveSessionSettings {
+            flow_wait: wait,
+            dns_wait: wait,
+            ..Default::default()
+        })
+    }
+
+    /// Applies a package entitling `device_public_key` on gw-1, with the module on and a snapshot
+    /// holding `digests` for that key (or, with `zero_trust_enabled: false`, the module off).
+    fn apply_snapshot(
+        store: &PolicyStore,
+        device_public_key: &str,
+        zero_trust_enabled: bool,
+        digests: &[String],
+    ) {
+        store
+            .apply(ConnectorHeartbeatResponse {
+                connector_id: "c-1".to_string(),
+                connector_public_key: None,
+                connector_virtual_ip: Some("10.98.0.1".to_string()),
+                generated_at: "2026-08-27T10:00:00Z".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                nonce: "n1".to_string(),
+                policy_bundles: vec![PolicyBundle {
+                    gateway_id: "gw-1".to_string(),
+                    location: "Amsterdam".to_string(),
+                    hostname: "crm.internal.example.com".to_string(),
+                    access_mode: "SELECTED_USERS".to_string(),
+                    endpoints: vec![],
+                    port_rules: None,
+                    gateway_address: None,
+                    entitlement_list: vec![Entitlement {
+                        user_id: "u-1".to_string(),
+                        device_public_key: Some(device_public_key.to_string()),
+                    }],
+                }],
+                node_list: vec![],
+                zero_trust_enabled: Some(zero_trust_enabled),
+                live_sessions: zero_trust_enabled.then(|| {
+                    std::collections::HashMap::from([(
+                        device_public_key.to_string(),
+                        digests.to_vec(),
+                    )])
+                }),
+            })
+            .unwrap();
+    }
+
+    fn audit_reasons(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|entry| entry["event"] == "access_refused")
+            .map(|entry| entry["reason"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    async fn refresh_was_requested(store: &PolicyStore) -> bool {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            store.live_sessions().refresh_requested(),
+        )
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn admits_a_flow_whose_session_is_in_the_snapshot_and_remembers_its_session() {
+        let device = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_millis(300));
+        let digest = crate::live_sessions::token_digest(TOKEN);
+        apply_snapshot(
+            &store,
+            &device.public_key_hex,
+            true,
+            std::slice::from_ref(&digest),
+        );
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let table = flow_table();
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &table, request).await;
+
+        assert_eq!(response.decision, "admit");
+        assert!(!refresh_was_requested(&store).await);
+        let ended = table
+            .lock()
+            .unwrap()
+            .end_flows_without_live_session(|_, session| session != Some(digest.as_str()));
+        assert_eq!(
+            ended.len(),
+            1,
+            "the flow must remember its session's digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_session_asks_for_a_snapshot_and_is_admitted_when_it_brings_it() {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_secs(5)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let key = device.public_key_hex.clone();
+        let refresher = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store.live_sessions().refresh_requested().await;
+                store.live_sessions().clear_refresh_request();
+                apply_snapshot(
+                    &store,
+                    &key,
+                    true,
+                    &[crate::live_sessions::token_digest(TOKEN)],
+                );
+            })
+        };
+
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        refresher.await.unwrap();
+        assert_eq!(response.decision, "admit");
+    }
+
+    #[tokio::test]
+    async fn a_session_still_unknown_after_a_fresh_snapshot_is_refused_without_another_fetch() {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_secs(5)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let key = device.public_key_hex.clone();
+        let refresher = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store.live_sessions().refresh_requested().await;
+                store.live_sessions().clear_refresh_request();
+                apply_snapshot(&store, &key, true, &["another-session".to_string()]);
+            })
+        };
+
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        refresher.await.unwrap();
+        assert_eq!(response.decision, "refuse");
+        assert_eq!(response.reason.as_deref(), Some("expired_entitlement"));
+        assert!(!refresh_was_requested(&store).await);
+        assert_eq!(
+            audit_reasons(&dir.path().join("audit.log")),
+            vec![crate::live_sessions::REASON_NOT_IN_SNAPSHOT]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_session_with_no_snapshot_in_time_is_refused() {
+        let device = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_millis(50));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        assert_eq!(response.decision, "refuse");
+        assert_eq!(response.reason.as_deref(), Some("expired_entitlement"));
+        assert!(refresh_was_requested(&store).await);
+        assert_eq!(
+            audit_reasons(&dir.path().join("audit.log")),
+            vec![crate::live_sessions::REASON_NO_SNAPSHOT_IN_TIME]
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_data_without_a_session_token_is_refused_outright() {
+        let device = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_secs(5));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(None),
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        assert_eq!(response.decision, "refuse");
+        assert_eq!(response.reason.as_deref(), Some("invalid_signature"));
+        assert!(!refresh_was_requested(&store).await);
+        assert_eq!(
+            audit_reasons(&dir.path().join("audit.log")),
+            vec![crate::live_sessions::REASON_NO_TOKEN]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_entitlement_check_comes_first_and_an_unentitled_key_asks_for_nothing() {
+        let device = crypto::generate_keypair();
+        let stranger = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_secs(5));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = admission_request(
+            "gw-1",
+            &stranger.signing_key,
+            &stranger.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        assert_eq!(response.reason.as_deref(), Some("not_entitled"));
+        assert!(!refresh_was_requested(&store).await);
+    }
+
+    #[tokio::test]
+    async fn with_the_module_off_a_flow_is_admitted_on_its_signature_alone() {
+        let device = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_secs(5));
+        apply_snapshot(&store, &device.public_key_hex, false, &[]);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(None),
+        );
+
+        let response = handle_flow_admission(&store, &audit_log, &flow_table(), request).await;
+
+        assert_eq!(response.decision, "admit");
+    }
+
+    /// Review (TT-3770): a DNS check waits for the snapshot it asked for, up to its wait, and only
+    /// then gets no decision - never a refusal for an unknown session.
+    #[tokio::test]
+    async fn a_dns_check_for_an_unknown_session_asks_for_a_snapshot_and_gets_no_decision_if_none_comes_in_time()
+     {
+        let device = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_millis(100));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+
+        let response = handle_dns_admission(&store, &audit_log, request).await;
+
+        assert_eq!(response, None);
+        assert!(refresh_was_requested(&store).await);
+        assert!(audit_reasons(&dir.path().join("audit.log")).is_empty());
+    }
+
+    /// Review (TT-3770): a device that has just connected resolves its gateway hostname - the DNS
+    /// check waits for the snapshot that brings its session instead of leaving the node to answer
+    /// SERVFAIL.
+    #[tokio::test]
+    async fn a_dns_check_for_an_unknown_session_is_admitted_when_the_snapshot_it_asked_for_brings_it()
+     {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_secs(5)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let key = device.public_key_hex.clone();
+        let refresher = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store.live_sessions().refresh_requested().await;
+                store.live_sessions().clear_refresh_request();
+                apply_snapshot(
+                    &store,
+                    &key,
+                    true,
+                    &[crate::live_sessions::token_digest(TOKEN)],
+                );
+            })
+        };
+
+        let response = handle_dns_admission(&store, &audit_log, request).await;
+
+        refresher.await.unwrap();
+        assert_eq!(
+            response.map(|response| response.decision),
+            Some("admit".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dns_check_for_a_live_session_is_admitted() {
+        let device = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_secs(5));
+        apply_snapshot(
+            &store,
+            &device.public_key_hex,
+            true,
+            &[crate::live_sessions::token_digest(TOKEN)],
+        );
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+
+        let response = handle_dns_admission(&store, &audit_log, request).await;
+
+        assert_eq!(
+            response.map(|response| response.decision),
+            Some("admit".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dns_check_against_a_snapshot_too_old_gets_no_decision() {
+        let device = crypto::generate_keypair();
+        let store =
+            PolicyStore::with_live_session_settings(crate::live_sessions::LiveSessionSettings {
+                max_age: std::time::Duration::ZERO,
+                ..Default::default()
+            });
+        apply_snapshot(
+            &store,
+            &device.public_key_hex,
+            true,
+            &[crate::live_sessions::token_digest(TOKEN)],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+
+        let response = handle_dns_admission(&store, &audit_log, request).await;
+
+        assert_eq!(response, None);
+    }
+
+    /// Review (TT-3770): a heartbeat already in flight when the admission arrived may bring its
+    /// session; the flow is admitted on it instead of waiting out a refresh it cannot get yet.
+    #[tokio::test]
+    async fn a_flow_is_admitted_on_a_snapshot_requested_just_before_it_arrived() {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_secs(5)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let in_flight_since = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let admission = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let audit_log =
+                    AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+                handle_flow_admission(&store, &audit_log, &flow_table(), request).await
+            })
+        };
+        store.live_sessions().refresh_requested().await;
+
+        // The reply of the heartbeat requested before the admission arrived holds the session.
+        let mut response = apply_response(&device.public_key_hex);
+        response.live_sessions = Some(std::collections::HashMap::from([(
+            device.public_key_hex.clone(),
+            vec![crate::live_sessions::token_digest(TOKEN)],
+        )]));
+        store.apply_requested_at(response, in_flight_since).unwrap();
+
+        assert_eq!(admission.await.unwrap().decision, "admit");
+    }
+
+    /// Review (TT-3770): a flow gives its admission slot back while it waits, and holds one again
+    /// once decided.
+    #[tokio::test]
+    async fn a_waiting_flow_gives_its_admission_slot_back_while_it_waits() {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_millis(300)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let admission = {
+            let store = store.clone();
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let audit_log =
+                    AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+                let mut slot = Some(AdmissionSlot::new(semaphore.clone(), permit));
+                let response = handle_flow_admission_in_slot(
+                    &store,
+                    &audit_log,
+                    &flow_table(),
+                    request,
+                    &mut slot,
+                )
+                .await;
+                (response, semaphore.available_permits())
+            })
+        };
+        store.live_sessions().refresh_requested().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the slot is free while the flow waits"
+        );
+
+        let (response, available_after) = admission.await.unwrap();
+        assert_eq!(response.decision, "refuse");
+        assert_eq!(available_after, 0, "the slot is held again once decided");
+    }
+
+    /// Review (TT-3770): a DNS check gives its admission slot back while it waits too.
+    #[tokio::test]
+    async fn a_waiting_dns_check_gives_its_admission_slot_back_while_it_waits() {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_millis(300)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let admission = {
+            let store = store.clone();
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let audit_log =
+                    AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+                let mut slot = Some(AdmissionSlot::new(semaphore.clone(), permit));
+                let response =
+                    handle_dns_admission_in_slot(&store, &audit_log, request, &mut slot).await;
+                (response, semaphore.available_permits())
+            })
+        };
+        store.live_sessions().refresh_requested().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the slot is free while the DNS check waits"
+        );
+
+        let (response, available_after) = admission.await.unwrap();
+        assert_eq!(response, None);
+        assert_eq!(
+            available_after, 1,
+            "an undecided DNS check posts nothing, so it does not take a slot back"
+        );
+    }
+
+    /// The package `apply_snapshot` applies, with the module on and no snapshot.
+    fn apply_response(device_public_key: &str) -> ConnectorHeartbeatResponse {
+        ConnectorHeartbeatResponse {
+            connector_id: "c-1".to_string(),
+            connector_public_key: None,
+            connector_virtual_ip: Some("10.98.0.1".to_string()),
+            generated_at: "2026-08-27T10:00:00Z".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            nonce: "n1".to_string(),
+            policy_bundles: vec![PolicyBundle {
+                gateway_id: "gw-1".to_string(),
+                location: "Amsterdam".to_string(),
+                hostname: "crm.internal.example.com".to_string(),
+                access_mode: "SELECTED_USERS".to_string(),
+                endpoints: vec![],
+                port_rules: None,
+                gateway_address: None,
+                entitlement_list: vec![Entitlement {
+                    user_id: "u-1".to_string(),
+                    device_public_key: Some(device_public_key.to_string()),
+                }],
+            }],
+            node_list: vec![],
+            zero_trust_enabled: Some(true),
+            live_sessions: None,
+        }
     }
 }
