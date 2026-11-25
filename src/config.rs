@@ -61,7 +61,7 @@ pub struct Config {
     /// (`CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES`, default 20,000), how long a flow with an
     /// unknown session waits for a fresher snapshot (`CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS`,
     /// default 8, kept below Gatekeeper's 10-second flow-admission timeout), the shortest gap between
-    /// off-schedule heartbeats (`CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS`, default 20)
+    /// off-schedule heartbeats (`CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS`, default 5)
     /// and the kept snapshot's maximum age (three heartbeat intervals).
     pub live_sessions: LiveSessionSettings,
 }

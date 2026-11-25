@@ -34,7 +34,13 @@ pub struct LiveSessionSettings {
 
 pub const DEFAULT_MAX_ENTRIES: usize = 20_000;
 pub const DEFAULT_FLOW_WAIT: Duration = Duration::from_secs(8);
-pub const DEFAULT_OFF_SCHEDULE_MIN_INTERVAL: Duration = Duration::from_secs(20);
+/// Below `DEFAULT_FLOW_WAIT`, so a device that connects just after another one's off-schedule
+/// heartbeat has its own heartbeat start within its flow's wait; the snapshot arrives in time when
+/// that heartbeat takes under the wait minus this interval (3 s at the defaults). With the 60-second
+/// heartbeat that is
+/// at most 54 proven requests in the 241 seconds the Agent remembers each one, inside the Agent's
+/// default `max-proofs-per-connector` of 60.
+pub const DEFAULT_OFF_SCHEDULE_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// The kept snapshot's maximum age, in heartbeat intervals.
 pub const MAX_AGE_IN_HEARTBEAT_INTERVALS: u32 = 3;
 
@@ -476,6 +482,32 @@ mod tests {
         // No snapshot in the reply: nothing changes.
         sessions.update(None, None, Instant::now());
         assert!(!changes.has_changed().unwrap());
+    }
+
+    /// Worst case: a device connects just after another device's off-schedule heartbeat started. Its
+    /// own heartbeat starts within its flow's wait, leaving the wait minus the interval (3 s at the
+    /// defaults) for the round trip.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_connecting_just_after_another_has_its_heartbeat_start_within_the_flow_wait() {
+        let sessions = LiveSessions::new(settings());
+        let mut off_schedule =
+            OffSchedule::new(DEFAULT_OFF_SCHEDULE_MIN_INTERVAL, Duration::from_secs(60));
+
+        sessions.request_refresh();
+        off_schedule.ready(&sessions).await;
+        sessions.clear_refresh_request();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second_arrived = tokio::time::Instant::now();
+        off_schedule.ran(true);
+        sessions.request_refresh();
+        off_schedule.ready(&sessions).await;
+        let started_after = second_arrived.elapsed();
+        assert_eq!(
+            started_after,
+            DEFAULT_OFF_SCHEDULE_MIN_INTERVAL - Duration::from_millis(100)
+        );
+        assert!(DEFAULT_FLOW_WAIT - started_after >= Duration::from_secs(3));
     }
 
     #[tokio::test(start_paused = true)]

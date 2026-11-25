@@ -83,7 +83,7 @@ Requires these environment variables:
 | `CONNECTOR_CA_BUNDLE_PATH`       | no       | unset                                         |
 | `CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES` | no | `20000` |
 | `CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS` | no | `8` |
-| `CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS` | no | `20` |
+| `CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS` | no | `5` |
 
 **Lease-bound admission (TT-3770)** - with the Zero Trust module on, a flow is admitted only while
 the lease of the session its proof was signed for lives: every heartbeat reply carries the digests
@@ -93,8 +93,10 @@ caps that list; a larger one is refused whole, logged, and recorded in the audit
 intervals. A flow whose session is not in the list yet makes the Connector send one heartbeat off
 schedule (at most one every `CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS`) and waits up to
 `CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS` for it; keep that wait below Gatekeeper's 10-second flow
-admission timeout. Shortening the minimum interval needs a higher per-Connector proof limit on the
-Agent (`max-proofs-per-connector`).
+admission timeout, and keep the minimum interval below the wait, so a device that connects just
+after another one has its heartbeat start within the wait (the list then arrives in time when the
+heartbeat takes under the wait minus the interval, 3 s at the defaults). Shortening the minimum interval needs a higher
+per-Connector proof limit on the Agent (`max-proofs-per-connector`, default 60).
 
 **`AGENTS_JSON_URL`** - the environment's public `agents.json` list (e.g.
 `https://skipr-shared-test.s3.us-west-2.amazonaws.com/agents.json`), never one Agent's
