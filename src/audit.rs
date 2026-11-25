@@ -1,0 +1,349 @@
+//! Local audit trail (TT-1732 acceptance criteria: "Connector applies a
+//! package or makes an allow/deny decision... the action completes... a
+//! local audit entry is recorded"). Append-only JSON-lines file so entries
+//! survive a restart, mirroring `identity`'s pattern of a local file being
+//! the Connector's own durable state - there's no assumption of a database
+//! or remote log sink available on the enterprise network it runs in.
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AuditEvent {
+    PolicyApplied {
+        connector_id: String,
+        gateway_count: usize,
+        node_count: usize,
+    },
+    PolicyRejected {
+        reason: String,
+    },
+    /// TT-2520 (spec §B.10): the effective configuration one gateway's policy bundle carried took
+    /// effect - written when it is first applied or changes, so the entry's timestamp is when that
+    /// configuration came into force: its location, hostname and the port rules the Connector
+    /// forwards by (TT-2514) - for a bundle that predates them, its endpoints as TCP + UDP rules
+    /// with equal ports (`PolicyBundle::rules`).
+    PolicyBundleApplied {
+        gateway_id: String,
+        location: String,
+        hostname: String,
+        /// Each as transport, external port, internal host and internal port.
+        port_rules: Vec<crate::dto::PortRule>,
+        /// TT-2529 (spec §B.20.3): the gateway's address as the Portal holds it; left out when it
+        /// holds none, so such an entry reads as before.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gateway_address: Option<std::net::Ipv4Addr>,
+    },
+    /// TT-2520 (spec §B.10): one gateway's entitlement list as received on an accepted heartbeat -
+    /// written on every heartbeat, not only on change. Recorded as its entry count and a SHA-256
+    /// of the list (the spec allows a hash) rather than the list itself, which at the default 60 s
+    /// heartbeat would grow the log by the full list every minute.
+    EntitlementListReceived {
+        gateway_id: String,
+        entitlement_count: usize,
+        entitlement_list_sha256: String,
+    },
+    AccessAllowed {
+        gateway_id: String,
+        /// From the matched Entitlement row, never a caller-supplied value -
+        /// see `access::decide_access`'s doc comment.
+        user_id: String,
+        device_public_key: String,
+    },
+    AccessRefused {
+        gateway_id: String,
+        /// No trustworthy user_id exists for a refusal - either nothing
+        /// matched (so no user_id is known) or the check never got that far
+        /// (e.g. no policy applied yet). The presented device key is the one
+        /// thing that actually came from the caller.
+        device_public_key: String,
+        reason: String,
+    },
+    FlowReleased {
+        flow_id: String,
+        gateway_id: String,
+    },
+    /// TT-2519 (spec §B.10): an admitted flow and the port rule that serves it, e.g.
+    /// `TCP 443 -> 10.0.0.5:8443`. Without a single serving rule, `port_rule` is absent and
+    /// `warning` says why.
+    FlowAdmitted {
+        flow_id: String,
+        gateway_id: String,
+        device_public_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port_rule: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    /// TT-3449 (spec §B.8, §B.10): a heartbeat's rule refresh ended these flows of one gateway because
+    /// no port rule serves them any more. A configuration change, not a withdrawal of access, so no
+    /// gateway-end report is queued for them (spec §B.18).
+    FlowsEndedByRuleChange {
+        gateway_id: String,
+        flows_ended: usize,
+        /// Each as flow id and device key.
+        flows: Vec<EndedFlow>,
+    },
+    /// TT-3699 (spec §B.20.3, §B.10): a heartbeat changed one gateway's address and these open flows
+    /// to the old address were ended. `old_gateway_address` is `null` when the Portal held none
+    /// before - the nodes' pool addresses - and `gateway_address` is `null` when it holds none now.
+    /// A configuration change, not a withdrawal of access, so no gateway-end report is queued for
+    /// them (spec §B.18).
+    FlowsEndedByAddressChange {
+        gateway_id: String,
+        old_gateway_address: Option<std::net::Ipv4Addr>,
+        gateway_address: Option<std::net::Ipv4Addr>,
+        flows_ended: usize,
+        /// Each as flow id and device key.
+        flows: Vec<EndedFlow>,
+    },
+    /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
+    /// to this gateway, and a gateway-end report was queued for it.
+    FlowsEnded {
+        gateway_id: String,
+        user_id: String,
+        device_public_key: String,
+        flows_ended: usize,
+        report_id: String,
+    },
+}
+
+/// One flow in a `FlowsEndedByRuleChange` or `FlowsEndedByAddressChange` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EndedFlow {
+    pub flow_id: String,
+    pub device_public_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditRecord<'a> {
+    timestamp: String,
+    #[serde(flatten)]
+    event: &'a AuditEvent,
+}
+
+/// Cheap to clone: a clone writes to the same file under the same lock, so it can be moved into a
+/// task that records an entry in the background.
+#[derive(Clone)]
+pub struct AuditLog {
+    path: PathBuf,
+    // One log line is one write(); this only prevents this process's own
+    // concurrent record() calls from interleaving mid-line, it isn't a
+    // cross-process lock (each heartbeat/access decision opens in append
+    // mode, which is atomic for a single write() up to PIPE_BUF on unix).
+    // Arc'd so it - and `path` - can move into the `spawn_blocking` closure
+    // below, which requires 'static.
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl AuditLog {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Async so the actual (blocking) file I/O runs via `spawn_blocking`
+    /// rather than directly on a Tokio worker thread - `record` is called
+    /// from network-reachable axum handlers (`flow_control`'s admission/
+    /// release), where blocking the runtime thread on disk I/O would stall
+    /// unrelated in-flight requests sharing that worker (TT-1732 review,
+    /// Tasneem). `spawn_blocking`, not `block_in_place`: the latter only
+    /// works on the multi-threaded runtime - `main`'s does qualify, but
+    /// `#[tokio::test]` defaults to the *single-threaded* runtime, and this
+    /// method has no way to know which kind of runtime its caller is on.
+    pub async fn record(&self, event: AuditEvent) -> Result<()> {
+        self.record_at(event, Utc::now()).await
+    }
+
+    async fn record_at(&self, event: AuditEvent, now: DateTime<Utc>) -> Result<()> {
+        let record = AuditRecord {
+            timestamp: now.to_rfc3339(),
+            event: &event,
+        };
+        let line = serde_json::to_string(&record).context("failed to serialize audit record")?;
+
+        let path = self.path.clone();
+        let write_lock = self.write_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = write_lock.lock().expect("audit log lock poisoned");
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create audit log directory: {}", parent.display())
+                })?;
+            }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("failed to open audit log file: {}", path.display()))?;
+            writeln!(file, "{line}")
+                .with_context(|| format!("failed to write audit entry to {}", path.display()))?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("audit log write task panicked")??;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn read_lines(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn records_a_policy_applied_event_with_a_timestamp() {
+        let dir = tempdir().unwrap();
+        let log = AuditLog::new(dir.path().join("audit.log"));
+        let now = DateTime::parse_from_rfc3339("2026-08-27T10:00:00Z")
+            .unwrap()
+            .to_utc();
+
+        log.record_at(
+            AuditEvent::PolicyApplied {
+                connector_id: "c-1".to_string(),
+                gateway_count: 2,
+                node_count: 3,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+
+        let entries = read_lines(&dir.path().join("audit.log"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["timestamp"], "2026-08-27T10:00:00+00:00");
+        assert_eq!(entries[0]["event"], "policy_applied");
+        assert_eq!(entries[0]["connector_id"], "c-1");
+        assert_eq!(entries[0]["gateway_count"], 2);
+        assert_eq!(entries[0]["node_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn records_a_policy_rejected_event() {
+        let dir = tempdir().unwrap();
+        let log = AuditLog::new(dir.path().join("audit.log"));
+
+        log.record(AuditEvent::PolicyRejected {
+            reason: "heartbeat package expired".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let entries = read_lines(&dir.path().join("audit.log"));
+        assert_eq!(entries[0]["event"], "policy_rejected");
+        assert_eq!(entries[0]["reason"], "heartbeat package expired");
+    }
+
+    #[tokio::test]
+    async fn records_access_allowed_and_refused_events() {
+        let dir = tempdir().unwrap();
+        let log = AuditLog::new(dir.path().join("audit.log"));
+
+        log.record(AuditEvent::AccessAllowed {
+            gateway_id: "gw-1".to_string(),
+            user_id: "u-1".to_string(),
+            device_public_key: "device-key-1".to_string(),
+        })
+        .await
+        .unwrap();
+        log.record(AuditEvent::AccessRefused {
+            gateway_id: "gw-1".to_string(),
+            device_public_key: "device-key-ghost".to_string(),
+            reason: "not_entitled".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let entries = read_lines(&dir.path().join("audit.log"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["event"], "access_allowed");
+        assert_eq!(entries[1]["event"], "access_refused");
+        assert_eq!(entries[1]["reason"], "not_entitled");
+    }
+
+    #[tokio::test]
+    async fn records_a_flow_released_event() {
+        let dir = tempdir().unwrap();
+        let log = AuditLog::new(dir.path().join("audit.log"));
+
+        log.record(AuditEvent::FlowReleased {
+            flow_id: "flow-1".to_string(),
+            gateway_id: "gw-1".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let entries = read_lines(&dir.path().join("audit.log"));
+        assert_eq!(entries[0]["event"], "flow_released");
+        assert_eq!(entries[0]["flow_id"], "flow-1");
+    }
+
+    #[tokio::test]
+    async fn appends_across_multiple_record_calls_without_truncating() {
+        let dir = tempdir().unwrap();
+        let log = AuditLog::new(dir.path().join("audit.log"));
+
+        for index in 0..5 {
+            log.record(AuditEvent::AccessAllowed {
+                gateway_id: "gw-1".to_string(),
+                user_id: format!("u-{index}"),
+                device_public_key: format!("device-key-{index}"),
+            })
+            .await
+            .unwrap();
+        }
+
+        let entries = read_lines(&dir.path().join("audit.log"));
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[4]["user_id"], "u-4");
+    }
+
+    #[tokio::test]
+    async fn creates_missing_parent_directories() {
+        let dir = tempdir().unwrap();
+        let nested_path = dir.path().join("nested/deeper/audit.log");
+        let log = AuditLog::new(&nested_path);
+
+        log.record(AuditEvent::PolicyRejected {
+            reason: "test".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert!(nested_path.exists());
+    }
+
+    #[tokio::test]
+    async fn errors_when_the_path_has_no_writable_parent() {
+        let log = AuditLog::new("/this/path/does/not/exist/and/cannot/be/created/audit.log");
+
+        let result = log
+            .record(AuditEvent::PolicyRejected {
+                reason: "test".to_string(),
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+}

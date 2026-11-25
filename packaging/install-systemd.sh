@@ -1,0 +1,626 @@
+#!/usr/bin/env bash
+#
+# TT-2030: installs the already-built Connector binary as a systemd service, with
+# CAP_NET_ADMIN granted via AmbientCapabilities so it can create its TUN device
+# without ever running the whole process as root. Mirrors the same pattern
+# Agent's own systemd unit already uses in production for its one required
+# capability (CAP_NET_BIND_SERVICE) - see secure-connect-backend-agent's
+# agent.service.d/bind-port.conf.
+#
+# Run this after `cargo build --release` has already produced
+# target/release/secure_connect_connector - Portal's install command does both in one go. The repo
+# root is found from this script's own location, so it doesn't matter what directory you invoke it
+# from.
+#
+# TT-2210: the install command is the only thing an admin runs on this host. Portal fills in the
+# environment's constants, so the service starts straight away and heartbeats with nothing but its
+# own public key - pasting that key into Portal is the only step left:
+#   AGENTS_JSON_URL          the environment's agents.json list the Connector picks a live Agent from
+#   REGISTRY_BASE_URL        the environment's Registry, used to verify that Agent's signature
+#   CONNECTOR_CA_BUNDLE_URL  optional - a PEM to trust for an Agent without a publicly-issued
+#                            certificate, downloaded next to connector.env
+# Values passed here are written into connector.env; leaving one unset keeps whatever the file
+# already has, so a plain re-run after a rebuild changes nothing.
+#
+# Usage:
+#   sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... packaging/install-systemd.sh
+#                                               install (or update) and start the service. If an
+#                                               identity key already exists, an interactive run asks
+#                                               whether to keep it (the default) or generate a new
+#                                               one; a non-interactive run keeps it
+#   sudo AGENTS_JSON_URL=... REGISTRY_BASE_URL=... packaging/install-systemd.sh --regenerate-identity
+#                                               same, but always replace an existing identity key with
+#                                               a new one, without asking (for scripted installs)
+#   packaging/install-systemd.sh --uninstall   stop, disable, and remove the service, the binary
+#                                               and the identity key (connector.env is left in
+#                                               place), so the next install is a new Connector
+#   packaging/install-systemd.sh --uninstall --keep-identity
+#                                               same, but keep the identity key, so a later
+#                                               install comes back as the same Connector
+#   packaging/install-systemd.sh --decommission
+#                                               TT-2126: after an admin confirmed Decommission
+#                                               Connector in the Portal, deregister this Connector,
+#                                               then remove its service, binary, identity key,
+#                                               configuration and the forwarding/NAT this script
+#                                               added. Changes nothing until deregistration has
+#                                               succeeded; safe to run again. Keeps the audit log.
+#
+# TT-1875: every install keeps a root-owned copy of this script next to the binary, at
+# /usr/local/lib/secure-connect-connector/install-systemd.sh, so --uninstall and --decommission can
+# always be run from that one path - whichever folder the install came from, whoever ran it, and
+# whether or not that folder still exists:
+#   sudo /usr/local/lib/secure-connect-connector/install-systemd.sh --decommission
+# Neither of them deletes that copy: a partial, interrupted or completed run can always be run again
+# from the same path. Each prints how to remove it once it is no longer needed.
+set -euo pipefail
+
+SERVICE_NAME="secure-connect-connector"
+UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+ENV_DIR="/etc/skipr/connector"
+ENV_FILE="${ENV_DIR}/connector.env"
+INSTALLED_BINARY_PATH="/usr/local/bin/secure_connect_connector"
+INSTALLED_SCRIPT_DIR="/usr/local/lib/secure-connect-connector"
+INSTALLED_SCRIPT_PATH="${INSTALLED_SCRIPT_DIR}/install-systemd.sh"
+DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
+# TT-2126: every MASQUERADE rule this script (or the unit's ExecStartPre) adds carries this iptables
+# comment, so --decommission removes exactly those - on whatever interface they were added - and never a
+# rule something else on the host owns. No spaces: it is also written into the unit's ExecStartPre.
+NAT_RULE_COMMENT="skipr-connector-nat"
+
+usage_error() {
+  echo "error: $1" >&2
+  echo "usage: $0 [--regenerate-identity] | --uninstall [--keep-identity] | --decommission" >&2
+  exit 1
+}
+
+UNINSTALL=false
+KEEP_IDENTITY=false
+REGENERATE_IDENTITY=false
+DECOMMISSION=false
+for arg in "$@"; do
+  case "$arg" in
+    --uninstall) UNINSTALL=true ;;
+    --decommission) DECOMMISSION=true ;;
+    --keep-identity) KEEP_IDENTITY=true ;;
+    --regenerate-identity) REGENERATE_IDENTITY=true ;;
+    *) usage_error "unknown option '$arg'" ;;
+  esac
+done
+if [ "$KEEP_IDENTITY" = true ] && [ "$UNINSTALL" = false ]; then
+  usage_error "--keep-identity only applies to --uninstall"
+fi
+if [ "$REGENERATE_IDENTITY" = true ] && [ "$UNINSTALL" = true ]; then
+  usage_error "--regenerate-identity only applies to an install"
+fi
+if [ "$DECOMMISSION" = true ] && { [ "$UNINSTALL" = true ] || [ "$KEEP_IDENTITY" = true ] || [ "$REGENERATE_IDENTITY" = true ]; }; then
+  usage_error "--decommission takes no other option"
+fi
+
+# The identity key path the daemon actually uses: CONNECTOR_IDENTITY_KEY_PATH from $ENV_FILE as
+# systemd's EnvironmentFile parser reads it, or the default when it is unset or only commented
+# out. systemd strips surrounding whitespace, then a matching pair of leading/trailing quotes
+# (CONNECTOR_IDENTITY_KEY_PATH="/path" or ='/path') before the daemon ever sees the value - grep +
+# cut alone doesn't, so a quoted value (a natural thing to write) or a stray trailing space would
+# otherwise give a path that still has the quote characters (or the space) in it. Trim first, then
+# unquote - trimming first also handles a quoted value with trailing whitespace, which would
+# otherwise break the quote-stripping pattern and leave the quotes in place. Install and uninstall
+# both read the path through here (TT-2326), so they can never disagree on which file is the key.
+identity_key_path() {
+  env_file_value CONNECTOR_IDENTITY_KEY_PATH "$DEFAULT_IDENTITY_KEY_PATH"
+}
+
+# A value from $ENV_FILE as systemd reads it (see identity_key_path), or $2 when unset.
+env_file_value() {
+  local configured
+  configured="$(sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  configured="$(printf '%s' "$configured" |
+    sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
+  printf '%s' "${configured:-$2}"
+}
+
+# TT-2126 (spec §B.19 point 5): decommissioning, after an admin confirmed it in the Portal. Deregisters
+# first - through the installed binary, with the daemon's own environment and key - and changes nothing
+# on this host unless that succeeded (or the Connector is already gone from the Portal), so a run the
+# Portal refuses leaves a working Connector behind. Every step tolerates having already been done.
+if [ "$DECOMMISSION" = true ]; then
+  IDENTITY_KEY_PATH="$(identity_key_path)"
+  AUDIT_LOG_PATH="$(env_file_value CONNECTOR_AUDIT_LOG_PATH /var/skipr/connector/audit/audit.log)"
+  PENDING_REPORTS_PATH="$(dirname "$AUDIT_LOG_PATH")/pending-gateway-end-reports.json"
+
+  if sudo test -x "$INSTALLED_BINARY_PATH" && sudo test -f "$IDENTITY_KEY_PATH"; then
+    echo "Deregistering this Connector..."
+    # As root, so the service user's key and connector.env (mode 600) are readable; `set -a` exports
+    # every KEY=value in connector.env exactly as the daemon gets them.
+    set +e
+    sudo sh -c 'set -a; [ -f "$1" ] && . "$1"; set +a; exec "$2" --deregister' sh "$ENV_FILE" "$INSTALLED_BINARY_PATH"
+    DEREGISTER_STATUS=$?
+    set -e
+    case "$DEREGISTER_STATUS" in
+      0) ;;
+      2) echo "The Portal no longer has this Connector - completing the cleanup." ;;
+      3)
+        echo "error: this Connector is not being decommissioned. Confirm Decommission Connector in the" >&2
+        echo "       Portal first, then run this again. Nothing was changed on this host." >&2
+        exit 1
+        ;;
+      *)
+        echo "error: deregistration failed - nothing was changed on this host. Run this again. If the" >&2
+        echo "       Agent stays unreachable, the Portal shows the Connector as Unreachable and offers to" >&2
+        echo "       remove it; after that this command completes." >&2
+        exit 1
+        ;;
+    esac
+  elif ! sudo test -e "$INSTALLED_BINARY_PATH" && ! sudo test -f "$IDENTITY_KEY_PATH"; then
+    echo "The Connector binary and identity key are already gone - completing the cleanup."
+  else
+    echo "error: cannot deregister - the Connector binary ($INSTALLED_BINARY_PATH) or its identity key" >&2
+    echo "       ($IDENTITY_KEY_PATH) is missing. Nothing was changed. If only the binary is gone, re-run the" >&2
+    echo "       install (it keeps an existing key); otherwise remove the Connector in the Portal as" >&2
+    echo "       unreachable. Then run this again." >&2
+    exit 1
+  fi
+
+  sudo systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+  sudo rm -f "$UNIT_PATH"
+  sudo systemctl daemon-reload 2>/dev/null || true
+
+  # TT-3717: the Agents' key-agreement keys the request proof keeps next to the identity key, and any
+  # temporary file a write left behind (agent-x25519-keys.tmp.<pid>), so the key directory can go.
+  KEPT_AGENT_KEYS_PATH="$(dirname "$IDENTITY_KEY_PATH")/agent-x25519-keys"
+  sudo rm -f "$INSTALLED_BINARY_PATH" "$IDENTITY_KEY_PATH" "$PENDING_REPORTS_PATH" "$KEPT_AGENT_KEYS_PATH"
+  sudo sh -c 'rm -f "$1".tmp.*' sh "$KEPT_AGENT_KEYS_PATH"
+  sudo rmdir "$(dirname "$IDENTITY_KEY_PATH")" 2>/dev/null || true
+  sudo rm -rf "$ENV_DIR"
+
+  # The forwarding the install turned on: its sysctl file goes, and sysctl reloads from what is left,
+  # without forcing ip_forward off - other software on this host may need it. The running value
+  # follows the host's own configuration from the next reboot.
+  sudo rm -f /etc/sysctl.d/99-skipr-connector.conf
+  sudo sysctl --system > /dev/null 2>&1 || true
+  # Every rule tagged as ours, whatever interface it was added for (ExecStartPre adds one for the
+  # interface of the default route at each start, which can change); never an untagged one.
+  REMOVED_NAT_RULES=0
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    read -r -a rule_parts <<< "$rule"
+    # "-A POSTROUTING <match...>" -> "-D POSTROUTING <match...>"
+    if sudo iptables -t nat -D "${rule_parts[@]:1}"; then
+      REMOVED_NAT_RULES=$((REMOVED_NAT_RULES + 1))
+    fi
+  done <<< "$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -F -- "--comment $NAT_RULE_COMMENT" || true)"
+
+  echo "Decommissioned $SERVICE_NAME: service, binary, identity key and $ENV_DIR removed, the"
+  echo "forwarding sysctl file removed, and $REMOVED_NAT_RULES NAT rule(s) this script added removed."
+  # A host installed before the rule was tagged still has its untagged rule, even when a later update
+  # added (and this run removed) a tagged one - so look at what is left, not at how many were removed.
+  UNTAGGED_NAT_RULES="$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -- '-j MASQUERADE' | grep -vF -- "--comment $NAT_RULE_COMMENT" || true)"
+  if [ -n "$UNTAGGED_NAT_RULES" ]; then
+    echo "POSTROUTING still has untagged MASQUERADE rule(s) (sudo iptables -t nat -S POSTROUTING):"
+    while IFS= read -r rule; do echo "  $rule"; done <<< "$UNTAGGED_NAT_RULES"
+    echo "One may be this Connector's, added before its NAT rule was tagged. If nothing else on this host"
+    echo "needs it, remove it with:"
+    while IFS= read -r rule; do echo "  sudo iptables -t nat -D ${rule#-A }"; done <<< "$UNTAGGED_NAT_RULES"
+  fi
+  echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
+  echo "when it is no longer needed. The folder the Connector was installed from (and the Rust"
+  echo "toolchain, if it was built from source) can be removed too."
+  # TT-1875: kept, so this exact command can be run again whatever happened to this run. A host
+  # installed before that copy existed (run from its checkout instead) has none to mention.
+  if sudo test -f "$INSTALLED_SCRIPT_PATH"; then
+    echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
+    echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
+  fi
+  exit 0
+fi
+
+if [ "$UNINSTALL" = true ]; then
+  sudo systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+  sudo rm -f "$UNIT_PATH" "$INSTALLED_BINARY_PATH"
+  sudo systemctl daemon-reload
+  echo "Uninstalled $SERVICE_NAME - $ENV_FILE was left in place."
+  # TT-2326: the identity key used to survive an uninstall, so uninstalling and installing again
+  # silently brought back the same public key - and with it the same, possibly stale, registration
+  # in Portal. Uninstall now means "this Connector is gone"; --keep-identity is for an uninstall
+  # that is only temporary.
+  IDENTITY_KEY_PATH="$(identity_key_path)"
+  if [ "$KEEP_IDENTITY" = true ]; then
+    echo "Identity key kept at $IDENTITY_KEY_PATH - installing again brings back the same Connector."
+  elif sudo test -f "$IDENTITY_KEY_PATH"; then
+    sudo rm -f "$IDENTITY_KEY_PATH"
+    echo "Removed identity key $IDENTITY_KEY_PATH - installing again creates a new Connector"
+    echo "identity, whose public key has to be registered in Portal's Deploy Connector screen."
+  else
+    echo "No identity key found at $IDENTITY_KEY_PATH - nothing to remove."
+  fi
+  # TT-1875: kept, so this (or --decommission) can be run again from the same path; the next install
+  # replaces it.
+  if sudo test -f "$INSTALLED_SCRIPT_PATH"; then
+    echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
+    echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
+  fi
+  exit 0
+fi
+
+# TT-1875: this script's own absolute path. The copy at $INSTALLED_SCRIPT_PATH is only for
+# --uninstall and --decommission (handled above): it has no binary next to it to install, so an
+# install run from it would look for one under /usr/local and try to build it there.
+THIS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+if [ "$THIS_SCRIPT" = "$INSTALLED_SCRIPT_PATH" ]; then
+  echo "error: $INSTALLED_SCRIPT_PATH only uninstalls or decommissions (--uninstall, --decommission)." >&2
+  echo "       To install or upgrade, run install-systemd.sh from a release package or a checkout." >&2
+  exit 1
+fi
+
+# Derived from where this script itself lives, not the caller's working directory - "run this
+# from the repo root" was previously an unenforced convention, so a caller anywhere else silently
+# got a $(pwd)-relative path that happened to look plausible right up until it didn't exist.
+REPO_ROOT="$(cd "$(dirname "$THIS_SCRIPT")/.." && pwd)"
+BUILT_BINARY_PATH="${REPO_ROOT}/target/release/secure_connect_connector"
+
+# SUDO_USER is only set when this script is invoked *through* sudo - in a root shell (`sudo -i`,
+# cloud-init, a Dockerfile, Ansible's `become`, a CI runner) it's unset and `whoami` returns
+# `root`, which would silently generate a unit with `User=root` and quietly defeat the entire
+# point of this script (CAP_NET_ADMIN without running as root) with nothing in the output saying
+# so. Refuse outright instead - CONNECTOR_USER lets an admin who really is in one of those
+# environments say explicitly who the service should run as.
+RUN_AS_USER="${CONNECTOR_USER:-${SUDO_USER:-$(whoami)}}"
+if [ "$RUN_AS_USER" = "root" ]; then
+  echo "error: refusing to install a unit that runs as root - the point of this script is" >&2
+  echo "       CAP_NET_ADMIN without root. Re-run as 'sudo ./packaging/install-systemd.sh'" >&2
+  echo "       from your normal user, or set CONNECTOR_USER=<name>." >&2
+  exit 1
+fi
+
+# TT-1875: the install changes this host step by step (connector.env, the identity key, IP
+# forwarding, the NAT rule, the unit), and a command missing halfway used to stop it there - a
+# minimal Ubuntu has no iptables, so connector.env, an identity key and IP forwarding were left
+# behind with no service, and a public key that looked ready to register. Check everything the
+# install needs before changing anything: install what apt can provide, the same way a missing C
+# toolchain is recovered below, and otherwise stop with nothing changed. Looked up through sudo,
+# like every use below, so a command only on root's PATH (/usr/sbin) is found.
+host_has() {
+  sudo sh -c 'command -v "$1"' sh "$1" >/dev/null 2>&1
+}
+if [ ! -d /run/systemd/system ] || ! host_has systemctl; then
+  echo "error: systemd is not running on this host - the Connector is installed as a systemd" >&2
+  echo "       service. Nothing on this host was changed." >&2
+  exit 1
+fi
+# "command:package" - the commands the install runs, and the package that provides each one. curl
+# only when there is a CA bundle to download (a minimal host has no curl either).
+REQUIRED_COMMANDS=(iptables:iptables ip:iproute2 sysctl:procps)
+if [ -n "${CONNECTOR_CA_BUNDLE_URL:-}" ]; then
+  REQUIRED_COMMANDS+=(curl:curl)
+fi
+MISSING_PACKAGES=()
+for required in "${REQUIRED_COMMANDS[@]}"; do
+  host_has "${required%%:*}" || MISSING_PACKAGES+=("${required#*:}")
+done
+if [ "${#MISSING_PACKAGES[@]}" -gt 0 ]; then
+  if host_has apt-get; then
+    echo "Installing ${MISSING_PACKAGES[*]} (required to install the Connector)..."
+    { sudo apt-get update -qq && sudo apt-get install -y "${MISSING_PACKAGES[@]}"; } || true
+  fi
+  for required in "${REQUIRED_COMMANDS[@]}"; do
+    if ! host_has "${required%%:*}"; then
+      echo "error: '${required%%:*}' is required to install the Connector, and could not be installed." >&2
+      echo "       Install ${MISSING_PACKAGES[*]} with this host's package manager and run this" >&2
+      echo "       command again. No Connector configuration was written." >&2
+      exit 1
+    fi
+  done
+fi
+
+if [ ! -x "$BUILT_BINARY_PATH" ]; then
+  # TT-2030 follow-up: the Portal install command chains `cargo build --release && ...` with no
+  # C toolchain guaranteed on a fresh box - several dependencies (including BoringTun) need `cc`
+  # for their build scripts, so a bare rustup install fails here with a linker error long before
+  # this script ever runs. Recover instead of just erroring a second time: install the toolchain
+  # if it's missing, then build here so a plain re-run of this script alone is enough to finish
+  # what the first attempt couldn't.
+  if ! command -v cc >/dev/null 2>&1; then
+    echo "cc not found - installing build-essential (required to compile this crate's dependencies)..."
+    sudo apt-get update -qq
+    sudo apt-get install -y build-essential
+  fi
+  # Build as RUN_AS_USER, not as whoever this script process is (root, when invoked via
+  # `sudo ./packaging/install-systemd.sh` as the error above tells people to do) - cargo lives in
+  # RUN_AS_USER's own $HOME/.cargo/bin from their rustup install, never on root's PATH, so running
+  # this as root would just trade "cc not found" for an equally silent "cargo: command not found".
+  echo "Building the Connector (target/release/secure_connect_connector not found)..."
+  sudo -u "$RUN_AS_USER" bash -lc "source \"\$HOME/.cargo/env\" 2>/dev/null || true; cd '$REPO_ROOT' && cargo build --release"
+  if [ ! -x "$BUILT_BINARY_PATH" ]; then
+    echo "error: build finished but $BUILT_BINARY_PATH still missing/not executable." >&2
+    exit 1
+  fi
+fi
+
+sudo mkdir -p "$ENV_DIR"
+sudo install -d -o "$RUN_AS_USER" -m 750 /var/skipr/connector/audit /var/skipr/connector/.keys
+if [ ! -f "$ENV_FILE" ]; then
+  sudo tee "$ENV_FILE" > /dev/null <<'EOF'
+# Written by install-systemd.sh - see the README's "Running the Connector daemon"
+# table for what each of these means. AGENTS_JSON_URL and REGISTRY_BASE_URL come
+# from the install command Portal gives you; the identity is generated for you at
+# CONNECTOR_IDENTITY_KEY_PATH's default (or whatever you set it to below, if you
+# re-run this script after changing it).
+#
+# Leave a line commented out to use its documented default. systemd parses an
+# uncommented `VAR=` as VAR being *set* to an empty string, not unset - which
+# defeats both the defaults below and the required-variable check, so don't
+# just erase the value, uncomment the line and fill it in.
+#AGENTS_JSON_URL=
+#REGISTRY_BASE_URL=
+# CONNECTOR_IDENTITY_KEY_PATH must be an ABSOLUTE path - systemd does not expand
+# $HOME or ~ in this file, and the unit's working directory is /, so a value
+# copied verbatim from the README's `export` line will NOT resolve.
+#CONNECTOR_IDENTITY_KEY_PATH=
+
+# Optional - each of these already has the documented default shown below and only needs
+# uncommenting if you want something other than that.
+#CONNECTOR_AUDIT_LOG_PATH=/var/skipr/connector/audit/audit.log
+# TT-2144: the flow-admission/release channel is Connector-initiated (the Connector polls out to
+# each paired Node's Gatekeeper) - no inbound port is opened for it, so there is nothing to open in
+# this host's own firewall for it. Only needs setting if a Gatekeeper deployment ever changes its
+# HTTP port away from the default below.
+#CONNECTOR_GATEKEEPER_HTTP_PORT=4000
+#CONNECTOR_TUN_NETMASK=255.255.255.0
+#HEARTBEAT_INTERVAL_SECONDS=60
+
+# Log level for the daemon. Without this only ERROR-level lines reach the
+# journal, including the fresh-identity warning above.
+RUST_LOG=info
+EOF
+  sudo chmod 600 "$ENV_FILE"
+  echo "Created $ENV_FILE"
+fi
+
+# Sets KEY=VALUE in $ENV_FILE, replacing the first existing line for KEY (commented or not) or
+# appending one if there is none - always canonical and unquoted, so this script and systemd's own
+# EnvironmentFile parser never have to agree on how to read quoting or whitespace back. awk rather
+# than sed so VALUE is written out literally, with no backslash/ampersand/delimiter escaping to get
+# right (URLs are full of characters sed treats specially). Passed through the environment rather
+# than `awk -v`, which interprets backslash escapes in the value and would silently drop them.
+set_env_value() {
+  sudo env SET_ENV_KEY="$1" SET_ENV_VAL="$2" awk '
+    BEGIN { done = 0; key = ENVIRON["SET_ENV_KEY"]; val = ENVIRON["SET_ENV_VAL"] }
+    $0 ~ ("^[[:space:]]*#?[[:space:]]*" key "=") {
+      if (!done) { print key "=" val; done = 1; next }
+    }
+    { print }
+    END { if (!done) print key "=" val }
+  ' "$ENV_FILE" | sudo tee "${ENV_FILE}.new" > /dev/null
+  sudo chmod 600 "${ENV_FILE}.new"
+  sudo mv "${ENV_FILE}.new" "$ENV_FILE"
+}
+
+# KEY's current value in $ENV_FILE - empty if it is unset or only commented out.
+env_value() {
+  sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true
+}
+
+# TT-2210: the environment's constants, as Portal's install command passes them. Only written when
+# actually given, so re-running this script bare after a rebuild keeps what connector.env has.
+if [ -n "${AGENTS_JSON_URL:-}" ]; then
+  set_env_value AGENTS_JSON_URL "$AGENTS_JSON_URL"
+fi
+if [ -n "${REGISTRY_BASE_URL:-}" ]; then
+  set_env_value REGISTRY_BASE_URL "$REGISTRY_BASE_URL"
+fi
+if [ -n "${CONNECTOR_CA_BUNDLE_URL:-}" ]; then
+  CA_BUNDLE_PATH="${ENV_DIR}/ca-bundle.pem"
+  echo "Downloading the CA bundle to trust from $CONNECTOR_CA_BUNDLE_URL..."
+  # TT-1875: downloaded to a temporary file and put in place only once complete - piping curl into
+  # tee left an empty ca-bundle.pem behind whenever the download failed.
+  CA_BUNDLE_DOWNLOAD="$(mktemp)"
+  if ! curl -fsS "$CONNECTOR_CA_BUNDLE_URL" -o "$CA_BUNDLE_DOWNLOAD"; then
+    rm -f "$CA_BUNDLE_DOWNLOAD"
+    echo "error: could not download the CA bundle from $CONNECTOR_CA_BUNDLE_URL." >&2
+    exit 1
+  fi
+  sudo install -m 644 "$CA_BUNDLE_DOWNLOAD" "$CA_BUNDLE_PATH"
+  rm -f "$CA_BUNDLE_DOWNLOAD"
+  set_env_value CONNECTOR_CA_BUNDLE_PATH "$CA_BUNDLE_PATH"
+fi
+
+# Generate the identity against the exact path the daemon will load - not a separate,
+# admin-run `--generate-identity` step against whatever path their shell happens to have
+# exported. Now that .keys/ above is writable by RUN_AS_USER, leaving
+# CONNECTOR_IDENTITY_KEY_PATH unset would otherwise let the daemon silently generate its own,
+# unregistered identity at first start instead of failing - generating it here first means the
+# right file already exists by the time that happens, for both the default path and a custom
+# one the admin already uncommented in $ENV_FILE. load_or_generate loads an existing key file
+# rather than overwriting it, so an existing key is only replaced when the admin asks for that below.
+IDENTITY_KEY_PATH="$(identity_key_path)"
+sudo install -d -o "$RUN_AS_USER" -m 750 "$(dirname "$IDENTITY_KEY_PATH")"
+
+generate_identity() {
+  sudo -u "$RUN_AS_USER" env CONNECTOR_IDENTITY_KEY_PATH="$IDENTITY_KEY_PATH" "$BUILT_BINARY_PATH" --generate-identity
+}
+
+# TT-2326: re-running the install after a first attempt that failed or was abandoned used to keep
+# that attempt's key silently, so the redo came back with a public key that may already have been
+# pasted (or half-registered) somewhere. An existing key is now a choice: keep it - the default, so
+# an upgrade or a re-run after a rebuild keeps the same Connector - or replace it with a new one.
+# --regenerate-identity makes that choice without a prompt, for scripted installs.
+if sudo test -f "$IDENTITY_KEY_PATH"; then
+  REPLACE_IDENTITY="$REGENERATE_IDENTITY"
+  if [ "$REPLACE_IDENTITY" = false ] && [ -t 0 ]; then
+    echo "An identity key already exists at $IDENTITY_KEY_PATH, with public key:"
+    echo "  $(generate_identity)"
+    echo "Keep it if this host is already registered in Portal with that key (an upgrade or re-run)."
+    echo "Generate a new one if a previous install here failed or should not be reused."
+    read -r -p "Keep the existing identity? [Y/n] " IDENTITY_ANSWER
+    case "$IDENTITY_ANSWER" in
+      [nN]|[nN][oO]) REPLACE_IDENTITY=true ;;
+    esac
+  elif [ "$REPLACE_IDENTITY" = false ]; then
+    echo "Keeping the existing identity key at $IDENTITY_KEY_PATH (no terminal to ask);"
+    echo "re-run with --regenerate-identity to replace it with a new one."
+  fi
+  if [ "$REPLACE_IDENTITY" = true ]; then
+    sudo rm -f "$IDENTITY_KEY_PATH"
+    echo "Removed the existing identity key - generating a new one. Register the new public key"
+    echo "below in Portal's Deploy Connector screen; the old key no longer identifies this host."
+  fi
+fi
+IDENTITY_PUBLIC_KEY="$(generate_identity)"
+
+# Write the exact path just used back into $ENV_FILE, canonical and unquoted, replacing whatever
+# commented/quoted/spaced form the admin had (or adding the line if it was never there). This is
+# deliberate, not cosmetic: it stops this script and systemd's own parser from ever having to
+# agree on how to re-derive the same value from the admin's original text a second time - each
+# quoting/whitespace variant systemd accepts is one more way the two parsers could disagree, and
+# every prior fix here was another variant found the hard way. After this, $ENV_FILE always holds
+# the one plain, unambiguous string both readers already agree on byte-for-byte.
+set_env_value CONNECTOR_IDENTITY_KEY_PATH "$IDENTITY_KEY_PATH"
+
+echo "Connector identity ready at $IDENTITY_KEY_PATH"
+echo "Public key (register this in Portal's Deploy Connector screen if you haven't already):"
+echo "  $IDENTITY_PUBLIC_KEY"
+
+# Without this, the Connector receives and admits a flow correctly but the reply never makes it
+# back: an admitted packet is forwarded toward the real backend with its tunnel-internal source
+# address left unrewritten (e.g. 10.66.66.x), which isn't routable from the backend's side, so the
+# backend (or the cloud network fabric in front of it) has nowhere to send its response - the
+# client just sees the connection hang and eventually time out or abort, with nothing wrong in any
+# admission/entitlement/Security-Group log to explain why. Confirmed live via a packet capture on
+# a Connector that was missing exactly this - packets left its outbound interface unmodified and
+# no reply ever came back, on a box otherwise identical (same binary, same policy) to one that had
+# this configured and worked.
+#
+# Two separate things, and both matter: forwarding must be turned on at all (ip_forward), and the
+# forwarded packet's source must be rewritten to an address the backend can actually reply to
+# (MASQUERADE). Neither was ever part of this script - previously a manual, undocumented step run
+# by hand on working boxes and silently missing on every other one.
+echo "Configuring IP forwarding and NAT for the Connector's outbound interface..."
+
+# Persisted the same way the rest of this box's Skipr-specific sysctl settings are (a dedicated
+# file under /etc/sysctl.d/), not just `sysctl -w` - that alone only affects the running kernel and
+# silently reverts on the next reboot, which is exactly the kind of gap this script exists to close.
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-skipr-connector.conf > /dev/null
+sudo sysctl -p /etc/sysctl.d/99-skipr-connector.conf > /dev/null
+
+# The interface name is instance/AMI-specific (ens5, eth0, enX1, ...) - never hardcode it. Derived
+# from the box's own default route rather than assumed, so this works unmodified on whatever
+# interface this particular instance actually uses.
+NAT_INTERFACE="$(ip route show default | awk '{print $5; exit}')"
+if [ -z "$NAT_INTERFACE" ]; then
+  echo "warning: could not determine the default outbound interface (no default route yet?) -" >&2
+  echo "         skipping NAT setup. Re-run this script once the box has one, or add the rule" >&2
+  echo "         yourself: sudo iptables -t nat -A POSTROUTING -o <interface> -m comment --comment $NAT_RULE_COMMENT -j MASQUERADE" >&2
+else
+  # Checked before added (`-C` ... `|| ... -A`), not appended unconditionally - this script is
+  # documented as safe to re-run (after a rebuild, a config change), and an unconditional -A would
+  # silently stack up a duplicate MASQUERADE rule on every re-run instead of staying a no-op.
+  if ! sudo iptables -t nat -C POSTROUTING -o "$NAT_INTERFACE" -m comment --comment "$NAT_RULE_COMMENT" -j MASQUERADE 2>/dev/null; then
+    sudo iptables -t nat -A POSTROUTING -o "$NAT_INTERFACE" -m comment --comment "$NAT_RULE_COMMENT" -j MASQUERADE
+  fi
+  echo "NAT configured on interface $NAT_INTERFACE"
+fi
+
+# Copied out of the checkout rather than exec'd from target/release directly: a permanent service
+# shouldn't depend on the build tree still existing at that exact path - `cargo clean`, moving the
+# repo, or a `git worktree` prune would otherwise leave a unit that fails at next boot with a
+# confusing 203/EXEC. The trade-off is deliberate: a rebuild now requires re-running this script
+# rather than silently changing what the running service execs on its next restart, which is the
+# one an admin can actually reason about from `systemctl status`.
+sudo install -m 755 "$BUILT_BINARY_PATH" "$INSTALLED_BINARY_PATH"
+# TT-1875: and this script with it, root-owned at a fixed path, replaced on every install so it always
+# matches the binary - --uninstall and --decommission then never depend on the folder this ran from.
+sudo install -d -m 755 -o root -g root "$INSTALLED_SCRIPT_DIR"
+sudo install -m 755 -o root -g root "$THIS_SCRIPT" "$INSTALLED_SCRIPT_PATH"
+
+sudo tee "$UNIT_PATH" > /dev/null <<EOF
+[Unit]
+Description=Skipr Private Gateway Connector
+After=network-online.target
+Wants=network-online.target
+# [Unit], not [Service] - a unit-wide rate limit governing how often systemd will (re)start this
+# unit at all, not a property of the service process itself, so systemd only recognizes it here
+# (silently ignored in [Service] - no error, it just never takes effect). Paired with
+# Restart=on-failure below: a genuine runtime crash still gets retried, but a config typo or other
+# immediate, permanent failure trips this limit and leaves the unit in \`failed\` after a minute
+# instead of grinding on forever - 5-in-25s from Restart/RestartSec alone never reaches systemd's
+# default 5-in-10s limit, so without this it would just crash-loop indefinitely with the useful
+# first error scrolled out of the journal.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=${RUN_AS_USER}
+EnvironmentFile=${ENV_FILE}
+# The NAT rule this install added is only ever in the running kernel's netfilter table - unlike
+# the ip_forward sysctl (persisted via /etc/sysctl.d/99-skipr-connector.conf), a bare \`iptables -A\`
+# has no on-disk form of its own to survive a reboot, and this box may not have iptables-persistent
+# (or an equivalent) installed at all. Reapplying it here ties it to the one thing that already
+# reliably runs on every boot - this unit starting - instead of a second, separate persistence
+# mechanism. The \`+\` prefix runs this one command as root regardless of User= above (the
+# CAP_NET_ADMIN this service itself gets isn't sufficient for iptables' own netfilter access); the
+# check-then-add is the same idempotent pattern the install script uses, since ExecStartPre runs on
+# every restart, not just the first.
+#
+# Deliberately not an awk one-liner here (unlike the plain NAT_INTERFACE line above, where that's
+# fine): inside this doubly-quoted /bin/sh -c wrapper, an awk script written in double quotes has
+# /bin/sh itself expand its field-number variable as ITS OWN (empty) positional parameter before
+# awk ever sees the script text - silently turning "print field five" into "print the whole line",
+# which prints the entire "ip route show default" output instead of just the interface name. That
+# then fails the iptables call (name too long) with no failure visible anywhere but this
+# ExecStartPre's own stderr. set-- positional-parameter extraction below has no such nested-dollar-
+# in-double-quotes ambiguity. Verified live: an awk version here produced a real
+# "interface name ... must be shorter than 16 characters" iptables error on a test box; this
+# version doesn't.
+ExecStartPre=+/bin/sh -c 'set -- \$(ip route show default); IFACE=\$5; [ -n "\$IFACE" ] && { iptables -t nat -C POSTROUTING -o "\$IFACE" -m comment --comment ${NAT_RULE_COMMENT} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "\$IFACE" -m comment --comment ${NAT_RULE_COMMENT} -j MASQUERADE; } || true'
+ExecStart=${INSTALLED_BINARY_PATH}
+Restart=on-failure
+RestartSec=5
+
+# The one capability this daemon actually needs (creating its TUN device) -
+# granted directly to the process, never by running it as root.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+
+# TT-2210: started here, not left for a second admin step - the Connector heartbeats with just its
+# public key and is told "not registered" until the admin pastes that key into Portal, then picks
+# up its policy on the very next heartbeat, with no restart. restart rather than start so a re-run
+# after a rebuild or config change also takes effect immediately.
+if [ -n "$(env_value AGENTS_JSON_URL)" ] && [ -n "$(env_value REGISTRY_BASE_URL)" ]; then
+  sudo systemctl enable --quiet "$SERVICE_NAME"
+  sudo systemctl restart "$SERVICE_NAME"
+  echo ""
+  echo "Installed and running."
+  echo ""
+  echo "Last step: paste this public key into Portal's Deploy Connector screen:"
+  echo "  $IDENTITY_PUBLIC_KEY"
+  echo "The Connector activates on its next heartbeat - nothing else to run here."
+  echo "  journalctl -u $SERVICE_NAME -f   # to watch it"
+else
+  echo "" >&2
+  echo "warning: AGENTS_JSON_URL and/or REGISTRY_BASE_URL are missing from $ENV_FILE, so the" >&2
+  echo "         service was NOT (re)started. Re-run the install command from Portal's Deploy" >&2
+  echo "         Connector screen, from the same directory - it passes both - or set them in" >&2
+  echo "         that file and run: sudo systemctl enable --now $SERVICE_NAME" >&2
+  # An install from before TT-2210 (CONNECTOR_ID/AGENT_BASE_URL in connector.env) may still be
+  # running: its old process keeps going, but the binary just copied into place refuses to start
+  # without AGENTS_JSON_URL - so the next restart or reboot would take it down. Say so now, not then.
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    echo "warning: $SERVICE_NAME is still running the PREVIOUS binary. The new one needs these" >&2
+    echo "         values and will fail on its next restart or reboot until they are set." >&2
+  fi
+fi
+echo ""
+echo "To uninstall: $INSTALLED_SCRIPT_PATH --uninstall (also deletes the identity key;"
+echo "  add --keep-identity to keep it, so a later install comes back as the same Connector)"
+echo "To decommission, after confirming it in Portal: sudo $INSTALLED_SCRIPT_PATH --decommission"
+echo "To reinstall with a new identity: re-run with --regenerate-identity"
