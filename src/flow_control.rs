@@ -153,13 +153,15 @@ enum AdmissionOutcome {
         session_digest: Option<String>,
     },
     Refused(&'static str),
-    /// TT-3770 (spec §B.9 point 1), DNS only: no decision yet - the session's digest is not in the
-    /// snapshot yet, or the kept snapshot is too old. Nothing is posted, so the node answers SERVFAIL
-    /// on its own timeout, which clients do not cache as "does not exist" (§B.13 points 4 and 5).
+    /// TT-3770 (spec §B.9 point 1), DNS only: no decision - the session's digest did not turn up
+    /// within the DNS wait, or the kept snapshot is too old. Nothing is posted, so the node answers
+    /// SERVFAIL on its own timeout, which clients do not cache as "does not exist" (§B.13 points 4
+    /// and 5).
     Undecided(&'static str),
 }
 
-/// Which admission the lease check is for: a flow waits for a fresher snapshot, a DNS check does not.
+/// Which admission the lease check is for: a flow waits up to `flow_wait` for a fresher snapshot, a
+/// DNS check up to the shorter `dns_wait`, below the node's DNS admission timeout.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdmissionKind {
     Flow,
@@ -176,9 +178,10 @@ enum LeaseOutcome {
 /// TT-3770 (spec §B.9 point 1): the lease check, after the signature and entitlement checks. A digest
 /// not in the snapshot asks for one off-schedule heartbeat. A flow then waits, until `flow_wait` after
 /// it arrived, and is re-checked on every snapshot change: admitted once its digest is there, refused
-/// once a snapshot requested after it arrived still lacks it - with no second fetch. A DNS check gets
-/// no decision instead of waiting. A flow drops its admission `slot` while it waits, so waiting flows
-/// never stall the node's other admissions and releases.
+/// once a snapshot requested after it arrived still lacks it - with no second fetch. A DNS check waits
+/// the same way until `dns_wait` after it arrived, and gets no decision instead of a refusal. Either
+/// drops its admission `slot` while it waits, so waiting admissions never stall the node's other
+/// admissions and releases.
 async fn lease_decision(
     policy_store: &PolicyStore,
     device_public_key: &str,
@@ -188,7 +191,11 @@ async fn lease_decision(
     slot: &mut Option<AdmissionSlot>,
 ) -> LeaseOutcome {
     let sessions = policy_store.live_sessions();
-    let deadline = tokio::time::Instant::from_std(arrived + sessions.settings().flow_wait);
+    let wait = match kind {
+        AdmissionKind::Flow => sessions.settings().flow_wait,
+        AdmissionKind::Dns => sessions.settings().dns_wait,
+    };
+    let deadline = tokio::time::Instant::from_std(arrived + wait);
     let mut changes = sessions.subscribe();
     let mut asked = false;
     loop {
@@ -217,16 +224,20 @@ async fn lease_decision(
         if !asked {
             asked = true;
             sessions.request_refresh();
-            if kind == AdmissionKind::Dns {
-                return LeaseOutcome::Undecided(live_sessions::REASON_NOT_IN_SNAPSHOT);
-            }
             if let Some(slot) = slot.as_mut() {
                 slot.release();
             }
         }
         let changed = tokio::time::timeout_at(deadline, changes.changed()).await;
         if !matches!(changed, Ok(Ok(()))) {
-            return LeaseOutcome::Refuse(live_sessions::REASON_NO_SNAPSHOT_IN_TIME);
+            return match kind {
+                AdmissionKind::Flow => {
+                    LeaseOutcome::Refuse(live_sessions::REASON_NO_SNAPSHOT_IN_TIME)
+                }
+                AdmissionKind::Dns => {
+                    LeaseOutcome::Undecided(live_sessions::REASON_NO_SNAPSHOT_IN_TIME)
+                }
+            };
         }
     }
 }
@@ -404,7 +415,10 @@ async fn authenticate_and_decide(
         slot,
     )
     .await;
-    if let Some(slot) = slot.as_mut() {
+    // An undecided DNS check posts nothing, so it needs no slot back.
+    if !matches!(lease, LeaseOutcome::Undecided(_))
+        && let Some(slot) = slot.as_mut()
+    {
         slot.reacquire().await;
     }
     match lease {
@@ -642,10 +656,22 @@ pub(crate) async fn handle_flow_admission_in_slot(
 ///
 /// `None` (TT-3770, spec §B.9 point 1) is no decision: nothing is posted back, so the node answers
 /// SERVFAIL on its own timeout rather than an NXDOMAIN a client would cache.
+#[cfg(test)]
 pub(crate) async fn handle_dns_admission(
     policy_store: &PolicyStore,
     audit_log: &AuditLog,
     request: DnsAdmissionRequest,
+) -> Option<DnsAdmissionResponse> {
+    handle_dns_admission_in_slot(policy_store, audit_log, request, &mut None).await
+}
+
+/// `handle_dns_admission` holding the node's admission `slot`, which it gives back while it waits
+/// for a fresher live-session snapshot (TT-3770).
+pub(crate) async fn handle_dns_admission_in_slot(
+    policy_store: &PolicyStore,
+    audit_log: &AuditLog,
+    request: DnsAdmissionRequest,
+    slot: &mut Option<AdmissionSlot>,
 ) -> Option<DnsAdmissionResponse> {
     let outcome = authenticate_and_decide(
         policy_store,
@@ -655,7 +681,7 @@ pub(crate) async fn handle_dns_admission(
         request.signature,
         request.signed_data,
         AdmissionKind::Dns,
-        &mut None,
+        slot,
     )
     .await;
 
@@ -675,7 +701,7 @@ pub(crate) async fn handle_dns_admission(
             })
         }
         AdmissionOutcome::Undecided(reason) => {
-            tracing::info!(hostname = %request.hostname, gateway_id = %request.gateway_id, %reason, "DNS resolution not decided - waiting for a fresher live-session snapshot");
+            tracing::info!(hostname = %request.hostname, gateway_id = %request.gateway_id, %reason, "DNS resolution not decided - no live-session snapshot held the session in time");
             None
         }
     }
@@ -1575,6 +1601,7 @@ mod tests {
     fn lease_store(wait: std::time::Duration) -> PolicyStore {
         PolicyStore::with_live_session_settings(crate::live_sessions::LiveSessionSettings {
             flow_wait: wait,
+            dns_wait: wait,
             ..Default::default()
         })
     }
@@ -1830,10 +1857,13 @@ mod tests {
         assert_eq!(response.decision, "admit");
     }
 
+    /// Review (TT-3770): a DNS check waits for the snapshot it asked for, up to its wait, and only
+    /// then gets no decision - never a refusal for an unknown session.
     #[tokio::test]
-    async fn a_dns_check_for_an_unknown_session_gets_no_decision_and_asks_for_a_snapshot() {
+    async fn a_dns_check_for_an_unknown_session_asks_for_a_snapshot_and_gets_no_decision_if_none_comes_in_time()
+     {
         let device = crypto::generate_keypair();
-        let store = lease_store(std::time::Duration::from_secs(5));
+        let store = lease_store(std::time::Duration::from_millis(100));
         apply_snapshot(&store, &device.public_key_hex, true, &[]);
         let dir = tempfile::tempdir().unwrap();
         let audit_log = AuditLog::new(dir.path().join("audit.log"));
@@ -1850,6 +1880,47 @@ mod tests {
         assert_eq!(response, None);
         assert!(refresh_was_requested(&store).await);
         assert!(audit_reasons(&dir.path().join("audit.log")).is_empty());
+    }
+
+    /// Review (TT-3770): a device that has just connected resolves its gateway hostname - the DNS
+    /// check waits for the snapshot that brings its session instead of leaving the node to answer
+    /// SERVFAIL.
+    #[tokio::test]
+    async fn a_dns_check_for_an_unknown_session_is_admitted_when_the_snapshot_it_asked_for_brings_it()
+     {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_secs(5)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let key = device.public_key_hex.clone();
+        let refresher = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store.live_sessions().refresh_requested().await;
+                store.live_sessions().clear_refresh_request();
+                apply_snapshot(
+                    &store,
+                    &key,
+                    true,
+                    &[crate::live_sessions::token_digest(TOKEN)],
+                );
+            })
+        };
+
+        let response = handle_dns_admission(&store, &audit_log, request).await;
+
+        refresher.await.unwrap();
+        assert_eq!(
+            response.map(|response| response.decision),
+            Some("admit".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1988,6 +2059,49 @@ mod tests {
         let (response, available_after) = admission.await.unwrap();
         assert_eq!(response.decision, "refuse");
         assert_eq!(available_after, 0, "the slot is held again once decided");
+    }
+
+    /// Review (TT-3770): a DNS check gives its admission slot back while it waits too.
+    #[tokio::test]
+    async fn a_waiting_dns_check_gives_its_admission_slot_back_while_it_waits() {
+        let device = crypto::generate_keypair();
+        let store = std::sync::Arc::new(lease_store(std::time::Duration::from_millis(300)));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(Some(TOKEN)),
+        );
+        let admission = {
+            let store = store.clone();
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                let audit_log =
+                    AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
+                let mut slot = Some(AdmissionSlot::new(semaphore.clone(), permit));
+                let response =
+                    handle_dns_admission_in_slot(&store, &audit_log, request, &mut slot).await;
+                (response, semaphore.available_permits())
+            })
+        };
+        store.live_sessions().refresh_requested().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "the slot is free while the DNS check waits"
+        );
+
+        let (response, available_after) = admission.await.unwrap();
+        assert_eq!(response, None);
+        assert_eq!(
+            available_after, 1,
+            "an undecided DNS check posts nothing, so it does not take a slot back"
+        );
     }
 
     /// The package `apply_snapshot` applies, with the module on and no snapshot.

@@ -28,12 +28,18 @@ pub struct LiveSessionSettings {
     /// How long a flow with an unknown digest waits for a fresh snapshot - below Gatekeeper's
     /// flow-admission timeout (10 s).
     pub flow_wait: Duration,
+    /// How long a DNS check with an unknown digest waits for a fresh snapshot - below the node's
+    /// DNS admission timeout (2 s), so a session that turns up in time still gets its answer.
+    pub dns_wait: Duration,
     /// Shortest gap between two off-schedule heartbeats.
     pub off_schedule_min_interval: Duration,
 }
 
 pub const DEFAULT_MAX_ENTRIES: usize = 20_000;
 pub const DEFAULT_FLOW_WAIT: Duration = Duration::from_secs(8);
+/// Half a second below the node's 2-second DNS admission timeout, which starts before the check
+/// reaches the Connector.
+pub const DEFAULT_DNS_WAIT: Duration = Duration::from_millis(1500);
 /// Below `DEFAULT_FLOW_WAIT`, so a device that connects just after another one's off-schedule
 /// heartbeat has its own heartbeat start within its flow's wait; the snapshot arrives in time when
 /// that heartbeat takes under the wait minus this interval (3 s at the defaults). With the 60-second
@@ -50,6 +56,7 @@ impl Default for LiveSessionSettings {
             max_entries: DEFAULT_MAX_ENTRIES,
             max_age: Duration::from_secs(60) * MAX_AGE_IN_HEARTBEAT_INTERVALS,
             flow_wait: DEFAULT_FLOW_WAIT,
+            dns_wait: DEFAULT_DNS_WAIT,
             off_schedule_min_interval: DEFAULT_OFF_SCHEDULE_MIN_INTERVAL,
         }
     }
@@ -308,6 +315,7 @@ mod tests {
             max_entries: 3,
             max_age: Duration::from_secs(180),
             flow_wait: Duration::from_millis(200),
+            dns_wait: Duration::from_millis(100),
             off_schedule_min_interval: Duration::from_secs(20),
         }
     }

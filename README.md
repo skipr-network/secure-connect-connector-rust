@@ -83,6 +83,7 @@ Requires these environment variables:
 | `CONNECTOR_CA_BUNDLE_PATH`       | no       | unset                                         |
 | `CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES` | no | `20000` |
 | `CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS` | no | `8` |
+| `CONNECTOR_LIVE_SESSION_DNS_WAIT_MILLIS` | no | `1500` |
 | `CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS` | no | `5` |
 
 **Lease-bound admission (TT-3770)** - with the Zero Trust module on, a flow is admitted only while
@@ -95,8 +96,15 @@ schedule (at most one every `CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECON
 `CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS` for it; keep that wait below Gatekeeper's 10-second flow
 admission timeout, and keep the minimum interval below the wait, so a device that connects just
 after another one has its heartbeat start within the wait (the list then arrives in time when the
-heartbeat takes under the wait minus the interval, 3 s at the defaults). Shortening the minimum interval needs a higher
-per-Connector proof limit on the Agent (`max-proofs-per-connector`, default 60).
+heartbeat takes under the wait minus the interval, 3 s at the defaults). A DNS check for such a
+session asks for the same heartbeat and waits up to `CONNECTOR_LIVE_SESSION_DNS_WAIT_MILLIS`; keep
+that below the node's 2-second DNS admission timeout. If the list has not come by then, the
+Connector gives no decision and the node answers SERVFAIL, which clients do not cache. Because the
+DNS wait is shorter than the minimum interval, a lookup that arrives within that interval of another
+device's off-schedule heartbeat still gets SERVFAIL; the device's next lookup is answered once the
+list has arrived. Shortening
+the minimum interval needs higher per-Connector and per-address proof limits on the Agent
+(`max-proofs-per-connector`, default 60; `max-requests-per-address-per-minute`, default 1300).
 
 **`AGENTS_JSON_URL`** - the environment's public `agents.json` list (e.g.
 `https://skipr-shared-test.s3.us-west-2.amazonaws.com/agents.json`), never one Agent's

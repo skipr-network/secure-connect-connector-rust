@@ -60,7 +60,9 @@ pub struct Config {
     /// TT-3770 (spec §B.9 point 1): the lease binding's settings - the snapshot size limit
     /// (`CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES`, default 20,000), how long a flow with an
     /// unknown session waits for a fresher snapshot (`CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS`,
-    /// default 8, kept below Gatekeeper's 10-second flow-admission timeout), the shortest gap between
+    /// default 8, kept below Gatekeeper's 10-second flow-admission timeout), how long a DNS check with
+    /// one waits (`CONNECTOR_LIVE_SESSION_DNS_WAIT_MILLIS`, default 1500, kept below the node's
+    /// 2-second DNS admission timeout), the shortest gap between
     /// off-schedule heartbeats (`CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS`, default 5)
     /// and the kept snapshot's maximum age (three heartbeat intervals).
     pub live_sessions: LiveSessionSettings,
@@ -144,6 +146,16 @@ fn parse_live_session_settings(heartbeat_interval: Duration) -> LiveSessionSetti
             "CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS is not below Gatekeeper's 10-second flow-admission timeout - a flow waiting that long is refused by the node before the Connector decides"
         );
     }
+    let dns_wait = Duration::from_millis(positive_env(
+        "CONNECTOR_LIVE_SESSION_DNS_WAIT_MILLIS",
+        live_sessions::DEFAULT_DNS_WAIT.as_millis() as u64,
+    ));
+    if dns_wait >= GATEKEEPER_DNS_ADMISSION_TIMEOUT {
+        tracing::warn!(
+            dns_wait_millis = dns_wait.as_millis() as u64,
+            "CONNECTOR_LIVE_SESSION_DNS_WAIT_MILLIS is not below the node's 2-second DNS admission timeout - the node answers SERVFAIL before the Connector decides"
+        );
+    }
     LiveSessionSettings {
         max_entries: positive_env(
             "CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES",
@@ -151,6 +163,7 @@ fn parse_live_session_settings(heartbeat_interval: Duration) -> LiveSessionSetti
         ) as usize,
         max_age: heartbeat_interval * live_sessions::MAX_AGE_IN_HEARTBEAT_INTERVALS,
         flow_wait,
+        dns_wait,
         off_schedule_min_interval: Duration::from_secs(positive_env(
             "CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS",
             live_sessions::DEFAULT_OFF_SCHEDULE_MIN_INTERVAL.as_secs(),
@@ -160,6 +173,10 @@ fn parse_live_session_settings(heartbeat_interval: Duration) -> LiveSessionSetti
 
 /// Gatekeeper's own default flow-admission timeout (`admission-result-timeout-ms`).
 const GATEKEEPER_FLOW_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The node's own default DNS admission timeout (`gatekeeper.dns.admission-timeout-ms`): with no
+/// decision by then it answers SERVFAIL.
+const GATEKEEPER_DNS_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn require_env(name: &str) -> Result<String> {
     // A systemd EnvironmentFile line like `VAR=` sets VAR to the empty string, not unset - an
@@ -226,6 +243,7 @@ mod tests {
             "CONNECTOR_CA_BUNDLE_PATH",
             "CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES",
             "CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS",
+            "CONNECTOR_LIVE_SESSION_DNS_WAIT_MILLIS",
             "CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS",
         ] {
             unsafe { env::remove_var(key) };

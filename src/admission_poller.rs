@@ -88,8 +88,8 @@ use tracing::{error, info, warn};
 use crate::dto::HeartbeatNode;
 use crate::flow_control::{
     AdmissionSlot, ControlPlaneState, DnsAdmissionRequest, DnsAdmissionResponse,
-    FlowAdmissionRequest, FlowReleaseRequest, handle_dns_admission, handle_flow_admission_in_slot,
-    handle_flow_release,
+    FlowAdmissionRequest, FlowReleaseRequest, handle_dns_admission_in_slot,
+    handle_flow_admission_in_slot, handle_flow_release,
 };
 
 /// Backoff between poll attempts after a transport failure (connection refused, timeout, non-2xx
@@ -499,6 +499,7 @@ async fn handle_message(
                 connector_id,
                 state,
                 message.dns_admission,
+                slot,
             )
             .await
         }
@@ -599,7 +600,7 @@ async fn handle_admission(
 
 /// TT-2227: DNS admission — received as `type=dns_admission` over the Connector-initiated
 /// long-poll channel (same channel as `type=admission`/`type=release`). Calls
-/// `handle_dns_admission` from `flow_control` and posts the decision back to Gatekeeper over the
+/// `handle_dns_admission_in_slot` from `flow_control` and posts the decision back to Gatekeeper over the
 /// same admission-result endpoint, keyed by a correlation id Gatekeeper supplied in the request.
 async fn handle_dns(
     node_id: &str,
@@ -608,6 +609,7 @@ async fn handle_dns(
     connector_id: &str,
     state: &ControlPlaneState,
     request: Option<DnsAdmissionRequest>,
+    mut slot: Option<AdmissionSlot>,
 ) {
     let Some(request) = request else {
         error!(%node_id, "poll response claimed type=dns_admission but carried no dns_admission body - ignoring");
@@ -616,7 +618,8 @@ async fn handle_dns(
     let correlation_id = request.correlation_id.clone();
     // TT-3770: no decision yet - post nothing, so the node answers SERVFAIL on its own timeout.
     let Some(response): Option<DnsAdmissionResponse> =
-        handle_dns_admission(&state.policy_store, &state.audit_log, request).await
+        handle_dns_admission_in_slot(&state.policy_store, &state.audit_log, request, &mut slot)
+            .await
     else {
         return;
     };

@@ -336,6 +336,7 @@ if [ ! -f "$ENV_FILE" ]; then
 # Lease-bound admission (TT-3770): see the README before changing these.
 #CONNECTOR_LIVE_SESSION_SNAPSHOT_MAX_ENTRIES=20000
 #CONNECTOR_LIVE_SESSION_FLOW_WAIT_SECONDS=8
+#CONNECTOR_LIVE_SESSION_DNS_WAIT_MILLIS=1500
 #CONNECTOR_OFF_SCHEDULE_HEARTBEAT_MIN_INTERVAL_SECONDS=5
 
 # Log level for the daemon. Without this only ERROR-level lines reach the
