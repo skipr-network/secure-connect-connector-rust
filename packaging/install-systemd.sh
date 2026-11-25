@@ -50,6 +50,8 @@
 # always be run from that one path - whichever folder the install came from, whoever ran it, and
 # whether or not that folder still exists:
 #   sudo /usr/local/lib/secure-connect-connector/install-systemd.sh --decommission
+# Neither of them deletes that copy: a partial, interrupted or completed run can always be run again
+# from the same path. Each prints how to remove it once it is no longer needed.
 set -euo pipefail
 
 SERVICE_NAME="secure-connect-connector"
@@ -169,10 +171,6 @@ if [ "$DECOMMISSION" = true ]; then
   sudo sh -c 'rm -f "$1".tmp.*' sh "$KEPT_AGENT_KEYS_PATH"
   sudo rmdir "$(dirname "$IDENTITY_KEY_PATH")" 2>/dev/null || true
   sudo rm -rf "$ENV_DIR"
-  # TT-1875: the copy kept at the fixed path, often the very file running now - removing it is safe,
-  # bash keeps reading the open file.
-  sudo rm -f "$INSTALLED_SCRIPT_PATH"
-  sudo rmdir "$INSTALLED_SCRIPT_DIR" 2>/dev/null || true
 
   # The forwarding the install turned on: its sysctl file goes, and sysctl reloads from what is left,
   # without forcing ip_forward off - other software on this host may need it. The running value
@@ -191,9 +189,8 @@ if [ "$DECOMMISSION" = true ]; then
     fi
   done <<< "$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -F -- "--comment $NAT_RULE_COMMENT" || true)"
 
-  echo "Decommissioned $SERVICE_NAME: service, binary, identity key, $ENV_DIR and the copy of this"
-  echo "script in $INSTALLED_SCRIPT_DIR removed, the forwarding sysctl file removed, and"
-  echo "$REMOVED_NAT_RULES NAT rule(s) this script added removed."
+  echo "Decommissioned $SERVICE_NAME: service, binary, identity key and $ENV_DIR removed, the"
+  echo "forwarding sysctl file removed, and $REMOVED_NAT_RULES NAT rule(s) this script added removed."
   # A host installed before the rule was tagged still has its untagged rule, even when a later update
   # added (and this run removed) a tagged one - so look at what is left, not at how many were removed.
   UNTAGGED_NAT_RULES="$(sudo iptables -t nat -S POSTROUTING 2>/dev/null | grep -- '-j MASQUERADE' | grep -vF -- "--comment $NAT_RULE_COMMENT" || true)"
@@ -207,14 +204,15 @@ if [ "$DECOMMISSION" = true ]; then
   echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
   echo "when it is no longer needed. The folder the Connector was installed from (and the Rust"
   echo "toolchain, if it was built from source) can be removed too."
+  # TT-1875: kept, so this exact command can be run again whatever happened to this run.
+  echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
+  echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
   exit 0
 fi
 
 if [ "$UNINSTALL" = true ]; then
   sudo systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
-  # TT-1875: the copy of this script at the fixed path goes with the binary; an install puts it back.
-  sudo rm -f "$UNIT_PATH" "$INSTALLED_BINARY_PATH" "$INSTALLED_SCRIPT_PATH"
-  sudo rmdir "$INSTALLED_SCRIPT_DIR" 2>/dev/null || true
+  sudo rm -f "$UNIT_PATH" "$INSTALLED_BINARY_PATH"
   sudo systemctl daemon-reload
   echo "Uninstalled $SERVICE_NAME - $ENV_FILE was left in place."
   # TT-2326: the identity key used to survive an uninstall, so uninstalling and installing again
@@ -230,6 +228,12 @@ if [ "$UNINSTALL" = true ]; then
     echo "identity, whose public key has to be registered in Portal's Deploy Connector screen."
   else
     echo "No identity key found at $IDENTITY_KEY_PATH - nothing to remove."
+  fi
+  # TT-1875: kept, so this (or --decommission) can be run again from the same path; the next install
+  # replaces it.
+  if sudo test -f "$INSTALLED_SCRIPT_PATH"; then
+    echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
+    echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
   fi
   exit 0
 fi
@@ -247,7 +251,7 @@ fi
 # Derived from where this script itself lives, not the caller's working directory - "run this
 # from the repo root" was previously an unenforced convention, so a caller anywhere else silently
 # got a $(pwd)-relative path that happened to look plausible right up until it didn't exist.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$THIS_SCRIPT")/.." && pwd)"
 BUILT_BINARY_PATH="${REPO_ROOT}/target/release/secure_connect_connector"
 
 # SUDO_USER is only set when this script is invoked *through* sudo - in a root shell (`sudo -i`,

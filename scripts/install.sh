@@ -18,7 +18,8 @@
 #   CONNECTOR_RELEASES_URL  where releases are downloaded from. Default: this repository's GitHub
 #                           releases. Set it to a mirror for hosts without access to GitHub.
 #   CONNECTOR_INSTALL_DIR   where the package is unpacked and kept. Default: ~/secure-connect-connector.
-#                           Run ./packaging/install-systemd.sh --uninstall or --decommission from there.
+#                           Uninstall and decommission do not need it: the install keeps a copy of
+#                           install-systemd.sh at /usr/local/lib/secure-connect-connector/ for that.
 #
 # Options after `sh -s --` go to install-systemd.sh, e.g. `... | sh -s -- --regenerate-identity`.
 #
@@ -110,8 +111,9 @@ main() {
     fail "$package.tar.gz does not contain the expected files - not installing it."
   fi
 
-  # Kept, not deleted after the install: --uninstall and --decommission are run from here later.
-  # Replaced as a whole, so nothing of an older version is left next to the new one - but only an
+  # Kept, not deleted after the install: the release that was installed stays on the host, to re-run
+  # the install from or check (--uninstall and --decommission run from the copy install-systemd.sh
+  # keeps at /usr/local/lib/secure-connect-connector/, not from here). Replaced as a whole, so nothing of an older version is left next to the new one - but only an
   # empty folder or an earlier install: a CONNECTOR_INSTALL_DIR pointing anywhere else is refused,
   # never deleted.
   if [ -e "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ] && [ ! -f "$INSTALL_DIR/packaging/install-systemd.sh" ]; then

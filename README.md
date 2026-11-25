@@ -176,12 +176,17 @@ Its identity key, and so its registration in Portal, carry over unchanged. Re-ru
 warns that the still-running old process will not survive its next restart. The old lines can be
 deleted from `connector.env`; they are ignored.
 
+Every install keeps a root-owned copy of `install-systemd.sh` at
+`/usr/local/lib/secure-connect-connector/install-systemd.sh` (TT-1875), so uninstalling and
+decommissioning work from that one path - whichever folder the Connector was installed from, whoever
+installed it, and whether or not that folder still exists. Neither of them deletes that copy, so
+either can be run again from the same path; each says how to remove it once it is no longer needed.
+
 To **decommission** the Connector for good (TT-2126), first select **Decommission Connector** on
-its details page in Portal, then run the command Portal shows on this host - from the checkout it
-was installed from:
+its details page in Portal, then run the command Portal shows on this host:
 
 ```sh
-sudo ./packaging/install-systemd.sh --decommission
+sudo /usr/local/lib/secure-connect-connector/install-systemd.sh --decommission
 ```
 
 It deregisters the Connector (`secure_connect_connector --deregister`, using the daemon's own
@@ -191,14 +196,14 @@ service, the binary, the identity key, `/etc/skipr/connector` and the pending ga
 and removes the IP-forwarding sysctl file and every NAT rule the install tagged as its own (an
 `iptables` comment, `skipr-connector-nat`), on whichever interface it was added. It lists any
 untagged `MASQUERADE` rule still left (a host installed before the tag may have one) for you to
-check. The local audit log is kept. It is safe to run again. If this host cannot reach an Agent,
+check. The local audit log and the copy of the script are kept. It is safe to run again. If this host cannot reach an Agent,
 Portal shows the Connector as Unreachable and offers to remove it; after that, this command completes.
 
 To remove the service without decommissioning, for a reinstall on the same host (`connector.env` is
 left in place):
 
 ```sh
-./packaging/install-systemd.sh --uninstall
+/usr/local/lib/secure-connect-connector/install-systemd.sh --uninstall
 ```
 
 This also deletes the identity key, so installing again later creates a new Connector identity
@@ -206,7 +211,7 @@ whose public key has to be registered in Portal. To keep the key, so a later ins
 the same Connector, add `--keep-identity`:
 
 ```sh
-./packaging/install-systemd.sh --uninstall --keep-identity
+/usr/local/lib/secure-connect-connector/install-systemd.sh --uninstall --keep-identity
 ```
 
 Re-running the install command without uninstalling, when an identity key already exists, asks
