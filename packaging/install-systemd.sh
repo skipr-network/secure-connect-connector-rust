@@ -44,6 +44,14 @@
 #                                               configuration and the forwarding/NAT this script
 #                                               added. Changes nothing until deregistration has
 #                                               succeeded; safe to run again. Keeps the audit log.
+#
+# TT-1875: every install keeps a root-owned copy of this script next to the binary, at
+# /usr/local/lib/secure-connect-connector/install-systemd.sh, so --uninstall and --decommission can
+# always be run from that one path - whichever folder the install came from, whoever ran it, and
+# whether or not that folder still exists:
+#   sudo /usr/local/lib/secure-connect-connector/install-systemd.sh --decommission
+# Neither of them deletes that copy: a partial, interrupted or completed run can always be run again
+# from the same path. Each prints how to remove it once it is no longer needed.
 set -euo pipefail
 
 SERVICE_NAME="secure-connect-connector"
@@ -51,6 +59,8 @@ UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_DIR="/etc/skipr/connector"
 ENV_FILE="${ENV_DIR}/connector.env"
 INSTALLED_BINARY_PATH="/usr/local/bin/secure_connect_connector"
+INSTALLED_SCRIPT_DIR="/usr/local/lib/secure-connect-connector"
+INSTALLED_SCRIPT_PATH="${INSTALLED_SCRIPT_DIR}/install-systemd.sh"
 DEFAULT_IDENTITY_KEY_PATH="/var/skipr/connector/.keys/identity.key"
 # TT-2126: every MASQUERADE rule this script (or the unit's ExecStartPre) adds carries this iptables
 # comment, so --decommission removes exactly those - on whatever interface they were added - and never a
@@ -192,7 +202,14 @@ if [ "$DECOMMISSION" = true ]; then
     while IFS= read -r rule; do echo "  sudo iptables -t nat -D ${rule#-A }"; done <<< "$UNTAGGED_NAT_RULES"
   fi
   echo "Kept the local audit log at $AUDIT_LOG_PATH - the record of what this Connector did. Delete it"
-  echo "when it is no longer needed. This checkout and the Rust toolchain can be removed too."
+  echo "when it is no longer needed. The folder the Connector was installed from (and the Rust"
+  echo "toolchain, if it was built from source) can be removed too."
+  # TT-1875: kept, so this exact command can be run again whatever happened to this run. A host
+  # installed before that copy existed (run from its checkout instead) has none to mention.
+  if sudo test -f "$INSTALLED_SCRIPT_PATH"; then
+    echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
+    echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
+  fi
   exit 0
 fi
 
@@ -215,13 +232,29 @@ if [ "$UNINSTALL" = true ]; then
   else
     echo "No identity key found at $IDENTITY_KEY_PATH - nothing to remove."
   fi
+  # TT-1875: kept, so this (or --decommission) can be run again from the same path; the next install
+  # replaces it.
+  if sudo test -f "$INSTALLED_SCRIPT_PATH"; then
+    echo "Kept this script at $INSTALLED_SCRIPT_PATH so this command can be run again. Remove it when it"
+    echo "is no longer needed: sudo rm -r $INSTALLED_SCRIPT_DIR"
+  fi
   exit 0
+fi
+
+# TT-1875: this script's own absolute path. The copy at $INSTALLED_SCRIPT_PATH is only for
+# --uninstall and --decommission (handled above): it has no binary next to it to install, so an
+# install run from it would look for one under /usr/local and try to build it there.
+THIS_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+if [ "$THIS_SCRIPT" = "$INSTALLED_SCRIPT_PATH" ]; then
+  echo "error: $INSTALLED_SCRIPT_PATH only uninstalls or decommissions (--uninstall, --decommission)." >&2
+  echo "       To install or upgrade, run install-systemd.sh from a release package or a checkout." >&2
+  exit 1
 fi
 
 # Derived from where this script itself lives, not the caller's working directory - "run this
 # from the repo root" was previously an unenforced convention, so a caller anywhere else silently
 # got a $(pwd)-relative path that happened to look plausible right up until it didn't exist.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$THIS_SCRIPT")/.." && pwd)"
 BUILT_BINARY_PATH="${REPO_ROOT}/target/release/secure_connect_connector"
 
 # SUDO_USER is only set when this script is invoked *through* sudo - in a root shell (`sudo -i`,
@@ -493,6 +526,10 @@ fi
 # rather than silently changing what the running service execs on its next restart, which is the
 # one an admin can actually reason about from `systemctl status`.
 sudo install -m 755 "$BUILT_BINARY_PATH" "$INSTALLED_BINARY_PATH"
+# TT-1875: and this script with it, root-owned at a fixed path, replaced on every install so it always
+# matches the binary - --uninstall and --decommission then never depend on the folder this ran from.
+sudo install -d -m 755 -o root -g root "$INSTALLED_SCRIPT_DIR"
+sudo install -m 755 -o root -g root "$THIS_SCRIPT" "$INSTALLED_SCRIPT_PATH"
 
 sudo tee "$UNIT_PATH" > /dev/null <<EOF
 [Unit]
@@ -583,6 +620,7 @@ else
   fi
 fi
 echo ""
-echo "To uninstall: packaging/install-systemd.sh --uninstall (also deletes the identity key;"
+echo "To uninstall: $INSTALLED_SCRIPT_PATH --uninstall (also deletes the identity key;"
 echo "  add --keep-identity to keep it, so a later install comes back as the same Connector)"
+echo "To decommission, after confirming it in Portal: sudo $INSTALLED_SCRIPT_PATH --decommission"
 echo "To reinstall with a new identity: re-run with --regenerate-identity"
