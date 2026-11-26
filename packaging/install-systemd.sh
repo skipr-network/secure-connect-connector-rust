@@ -126,6 +126,9 @@ if [ "$DECOMMISSION" = true ]; then
   IDENTITY_KEY_PATH="$(identity_key_path)"
   AUDIT_LOG_PATH="$(env_file_value CONNECTOR_AUDIT_LOG_PATH /var/skipr/connector/audit/audit.log)"
   PENDING_REPORTS_PATH="$(dirname "$AUDIT_LOG_PATH")/pending-gateway-end-reports.json"
+  # TT-2250: the connection-event state (open connections, queued events) - user ids and device
+  # keys that can never be sent once the Connector is deregistered.
+  CONNECTION_EVENTS_PATH="$(dirname "$AUDIT_LOG_PATH")/connection-events.json"
 
   if sudo test -x "$INSTALLED_BINARY_PATH" && sudo test -f "$IDENTITY_KEY_PATH"; then
     echo "Deregistering this Connector..."
@@ -167,7 +170,7 @@ if [ "$DECOMMISSION" = true ]; then
   # TT-3717: the Agents' key-agreement keys the request proof keeps next to the identity key, and any
   # temporary file a write left behind (agent-x25519-keys.tmp.<pid>), so the key directory can go.
   KEPT_AGENT_KEYS_PATH="$(dirname "$IDENTITY_KEY_PATH")/agent-x25519-keys"
-  sudo rm -f "$INSTALLED_BINARY_PATH" "$IDENTITY_KEY_PATH" "$PENDING_REPORTS_PATH" "$KEPT_AGENT_KEYS_PATH"
+  sudo rm -f "$INSTALLED_BINARY_PATH" "$IDENTITY_KEY_PATH" "$PENDING_REPORTS_PATH" "$CONNECTION_EVENTS_PATH" "${CONNECTION_EVENTS_PATH%.json}.tmp" "$KEPT_AGENT_KEYS_PATH"
   sudo sh -c 'rm -f "$1".tmp.*' sh "$KEPT_AGENT_KEYS_PATH"
   sudo rmdir "$(dirname "$IDENTITY_KEY_PATH")" 2>/dev/null || true
   sudo rm -rf "$ENV_DIR"

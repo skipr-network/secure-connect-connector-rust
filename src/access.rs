@@ -208,6 +208,7 @@ mod tests {
             node_list: vec![],
             zero_trust_enabled: None,
             live_sessions: None,
+            connection_event_results: None,
         }
     }
 

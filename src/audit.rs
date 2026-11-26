@@ -122,6 +122,34 @@ pub enum AuditEvent {
     /// TT-3770: a heartbeat carried no live-session snapshot after one had been accepted; the last
     /// accepted one stays in use, up to its maximum age.
     LiveSessionSnapshotMissing,
+    /// TT-2250 (spec §B.22 point 4): the node of these flows left the node list, so they ended.
+    FlowsEndedByNodeRemoval {
+        node_id: String,
+        flows_ended: usize,
+    },
+    /// TT-2250: a connection opened and its `established` event was queued.
+    ConnectionEstablished {
+        connection_id: String,
+        gateway_id: String,
+        device_public_key: String,
+    },
+    /// TT-2250: a connection ended; `report_id` is the event queued for it, `None` when an
+    /// unreported connection ended without one.
+    ConnectionEnded {
+        connection_id: String,
+        gateway_id: String,
+        device_public_key: String,
+        observation: String,
+        report_id: Option<String>,
+    },
+    /// TT-2250: connection events dropped unsent (retention or the queue limit), now counted as lost.
+    ConnectionEventsDropped {
+        count: u64,
+    },
+    /// TT-2250: the Portal rejected this connection event; it is not sent again.
+    ConnectionEventRejected {
+        report_id: String,
+    },
     /// TT-2464 (spec §B.10): an entitlement refresh ended this device's active admitted flow(s)
     /// to this gateway, and a gateway-end report was queued for it.
     FlowsEnded {

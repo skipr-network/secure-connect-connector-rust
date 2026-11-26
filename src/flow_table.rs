@@ -640,8 +640,9 @@ impl FlowTable {
     /// the now-gone node_id, so it'll just never match again), but a real problem
     /// for `node_for_port`'s collision check - a stale entry can make a *different*,
     /// currently-live node's use of that same port look ambiguous forever.
-    pub fn evict_node(&mut self, node_id: &str) {
-        self.remove_flows_where(|key, _| key.node_id == node_id);
+    /// Returns how many flows ended (TT-2250: the local audit log records them).
+    pub fn evict_node(&mut self, node_id: &str) -> usize {
+        let ended = self.remove_flows_where(|key, _| key.node_id == node_id);
         self.dialled_nodes.remove(node_id);
         // TT-2297: a departed node's control-channel ports route to a tunnel that no longer
         // exists - left in place, a packet matching one is dropped instead of reaching the node
@@ -656,6 +657,7 @@ impl FlowTable {
             &mut self.outbound_control_channel_port_order,
             node_id,
         );
+        ended
     }
 
     fn forget_node_ports(map: &mut HashMap<u16, String>, order: &mut VecDeque<u16>, node_id: &str) {

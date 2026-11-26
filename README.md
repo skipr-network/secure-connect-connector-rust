@@ -134,7 +134,10 @@ occasional ancient or malformed entry always has been).
 **`CONNECTOR_AUDIT_LOG_PATH`** - the local, append-only audit log. The Connector also keeps
 `pending-gateway-end-reports.json` in the same directory: the gateway-end reports (TT-2464)
 waiting for a successful heartbeat, so a revoked user's **Access removed** notice still arrives
-after a Connector restart. The directory must stay writable by the service user.
+after a Connector restart, and `connection-events.json`: the Private Gateway connection events
+(TT-2250) - open connections, events waiting for the Portal's result and open denial windows. Both
+survive a restart and are removed on decommissioning. The directory must stay writable by the service
+user.
 
 **`CONNECTOR_IDENTITY_KEY_PATH`** - the Connector's identity key. The Connector also keeps
 `agent-x25519-keys` in the same directory (mode 600): the last key-agreement key fetched for each
