@@ -14,13 +14,19 @@
 //! Portal's result for it (`accepted` or `rejected`); anything else is sent again.
 //!
 //! The pure bookkeeping is in [`State`], which takes the time as an argument so it can be tested
-//! without a clock; [`ConnectionEvents`] wraps it with the lock and the file.
+//! without a clock; [`ConnectionEvents`] wraps it with the lock and the file. Callers change memory
+//! only and never wait for the disk: an admission's reply must not wait for a disk write (TT-2514).
+//! A background writer ([`ConnectionEvents::run_writer`]) saves one consistent snapshot of the whole
+//! state, taken under the lock and written after it is released, whenever a [`State`] method reports
+//! a change.
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use tokio::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::gateway_end::new_report_id;
@@ -39,9 +45,23 @@ pub const MAX_HELD_DENIALS: usize = 1_000;
 pub const DENIAL_QUIET_MS: i64 = 10 * 60 * 1000;
 /// ...or this long after its first refusal at the latest (TT-2250 comment 71741).
 pub const DENIAL_MAX_MS: i64 = 60 * 60 * 1000;
-/// A repeat of a held denial only updates memory; such updates reach the file at most this often,
-/// so a crash loses at most those repeat counts (§B.22 point 5).
-pub const REPEAT_FLUSH_MS: i64 = 10_000;
+/// A repeat of a held denial only updates memory; such updates reach the file within this long, so
+/// a crash loses at most those repeat counts (§B.22 point 5). Also the retry delay after a failed
+/// write.
+pub const REPEAT_FLUSH: Duration = Duration::from_secs(10);
+
+/// How soon a change of the state must reach the file (§B.22 point 5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Change {
+    #[default]
+    None,
+    /// Memory only for now, written within [`REPEAT_FLUSH`]: a repeat of a held denial, or the node
+    /// of a connection's latest flow.
+    Deferred,
+    /// Written at once: a connection opened or ended, a denial window opened or closed, a report
+    /// queued or removed, the lost counter changed.
+    Prompt,
+}
 
 /// The kind of a report; field values are part of the heartbeat contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,9 +247,21 @@ pub struct State {
     /// Drops not yet written to the local audit log (`connection_events_dropped`).
     #[serde(default)]
     unlogged_drops: u64,
+    /// The strongest change since the wrapper last asked; never saved. Every mutator sets it, so
+    /// the file is written only when something changed (TT-2250 review).
+    #[serde(skip)]
+    change: Change,
 }
 
 impl State {
+    fn mark(&mut self, change: Change) {
+        self.change = self.change.max(change);
+    }
+
+    fn take_change(&mut self) -> Change {
+        std::mem::take(&mut self.change)
+    }
+
     #[cfg(test)]
     pub fn open_connections(&self) -> &[OpenConnection] {
         &self.open
@@ -263,7 +295,10 @@ impl State {
                 && c.device_public_key == device_public_key
                 && c.session_digest.as_deref() == session_digest
         }) {
-            open.node_id = node_id.to_string();
+            if open.node_id != node_id {
+                open.node_id = node_id.to_string();
+                self.mark(Change::Deferred);
+            }
             return None;
         }
         let connection_id = new_report_id();
@@ -324,6 +359,7 @@ impl State {
         }) {
             held.repeats += 1;
             held.last_at = now_ms;
+            self.mark(Change::Deferred);
             return false;
         }
         if self.held.len() >= MAX_HELD_DENIALS {
@@ -375,29 +411,65 @@ impl State {
 
     /// Ends every open connection `observe` gives an observation for, with that observation and
     /// the number of flows the end closed, and queues what each one reports (§B.22 points 2 and 5).
+    ///
+    /// The open list stays in place while the ends are queued (TT-2250 review): queueing an end
+    /// can overflow the queue and drop an establishment, and `unreport` must then find that
+    /// connection - ending in this heartbeat or not - to mark it unreported.
     pub fn end_connections(
         &mut self,
         at_ms: i64,
         mut observe: impl FnMut(&OpenConnection) -> Option<(Observation, usize)>,
     ) -> Vec<EndedConnection> {
-        let mut ended = Vec::new();
-        let mut kept = Vec::with_capacity(self.open.len());
-        for connection in std::mem::take(&mut self.open) {
-            match observe(&connection) {
-                Some((observation, flows_ended)) => {
-                    let report_id = self.queue_end(&connection, observation, flows_ended, at_ms);
-                    ended.push(EndedConnection {
-                        connection_id: connection.connection_id,
-                        gateway_id: connection.gateway_id,
-                        device_public_key: connection.device_public_key,
-                        observation,
-                        report_id,
-                    });
-                }
-                None => kept.push(connection),
+        let observed: Vec<(String, Observation, usize)> = self
+            .open
+            .iter()
+            .filter_map(|connection| {
+                observe(connection).map(|(observation, flows_ended)| {
+                    (connection.connection_id.clone(), observation, flows_ended)
+                })
+            })
+            .collect();
+        if observed.is_empty() {
+            return Vec::new();
+        }
+        let mut ended = Vec::with_capacity(observed.len());
+        for (connection_id, observation, flows_ended) in observed {
+            // Read afresh: an earlier end in this loop may have left it unreported.
+            let Some(connection) = self
+                .open
+                .iter()
+                .find(|c| c.connection_id == connection_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let report_id = self.queue_end(&connection, observation, flows_ended, at_ms);
+            ended.push(EndedConnection {
+                connection_id: connection.connection_id,
+                gateway_id: connection.gateway_id,
+                device_public_key: connection.device_public_key,
+                observation,
+                report_id,
+            });
+        }
+        let ended_ids: HashSet<&str> = ended.iter().map(|c| c.connection_id.as_str()).collect();
+        self.open
+            .retain(|c| !ended_ids.contains(c.connection_id.as_str()));
+        // A later end's overflow may have dropped an end queued here or made it notice-only under
+        // a new id; the local audit log names the report actually queued.
+        for connection in &mut ended {
+            if connection.report_id.is_some() {
+                connection.report_id = self
+                    .queue
+                    .iter()
+                    .find(|e| {
+                        e.kind == Kind::Ended
+                            && e.connection_id.as_deref() == Some(connection.connection_id.as_str())
+                    })
+                    .map(|e| e.report_id.clone());
             }
         }
-        self.open = kept;
+        self.mark(Change::Prompt);
         ended
     }
 
@@ -451,6 +523,7 @@ impl State {
                 first_at: lost.first_at,
                 last_at: lost.last_at,
             });
+            self.mark(Change::Prompt);
         }
 
         let establishment_index: HashMap<&str, usize> = self
@@ -585,6 +658,7 @@ impl State {
                 continue;
             };
             let event = self.queue.remove(index);
+            self.mark(Change::Prompt);
             if !accepted {
                 applied.rejected.push(event.report_id.clone());
             }
@@ -612,12 +686,14 @@ impl State {
             )
         {
             self.frozen_lost = None;
+            self.mark(Change::Prompt);
         }
         applied
     }
 
     /// A closed window with repeats gets its follow-up row; one without repeats needs none.
     fn close_window(&mut self, held: HeldDenial, now_ms: i64) {
+        self.mark(Change::Prompt);
         if held.repeats == 0 {
             return;
         }
@@ -686,6 +762,7 @@ impl State {
         {
             open.establishment = Establishment::Unreported;
         }
+        self.mark(Change::Prompt);
         let mut dropped = 0;
         self.queue.retain_mut(|event| {
             if event.kind != Kind::Ended || event.connection_id.as_deref() != Some(connection_id) {
@@ -710,6 +787,7 @@ impl State {
     }
 
     fn push(&mut self, event: ConnectionEvent, now_ms: i64) {
+        self.mark(Change::Prompt);
         self.queue.push(event);
         while self.queue.len() > MAX_QUEUED {
             self.drop_one_for_room(now_ms);
@@ -769,6 +847,16 @@ impl State {
         lost.count += count;
         lost.last_at = now_ms;
         self.unlogged_drops += count;
+        self.mark(Change::Prompt);
+    }
+
+    /// The drops not yet written to the local audit log, now taken.
+    fn take_unlogged_drops(&mut self) -> u64 {
+        let drops = std::mem::take(&mut self.unlogged_drops);
+        if drops > 0 {
+            self.mark(Change::Prompt);
+        }
+        drops
     }
 }
 
@@ -802,16 +890,27 @@ fn event(
     }
 }
 
-/// [`State`] behind a lock, kept in its file.
+/// [`State`] behind a lock, kept in its file by a background writer.
 pub struct ConnectionEvents {
     path: PathBuf,
+    // A std mutex, never held across an await: every caller only changes memory under it.
     inner: Mutex<Inner>,
+    /// Wakes the writer: a prompt change, or a new deadline for a deferred one.
+    wake: Notify,
+    /// One file write at a time. A snapshot is taken only once this is held, so the file is never
+    /// replaced by an older snapshot than the one it holds.
+    writing: tokio::sync::Mutex<()>,
 }
 
 struct Inner {
     state: State,
-    /// When a repeat of a held denial first went unsaved; `None` when the file is current.
-    unsaved_since: Option<i64>,
+    /// Bumped by every change; `saved` is the generation the file holds.
+    generation: u64,
+    saved: u64,
+    /// A change the writer must save at once.
+    prompt: bool,
+    /// When unsaved deferred changes (or a failed write) must be written at the latest.
+    due: Option<Instant>,
 }
 
 impl ConnectionEvents {
@@ -834,19 +933,25 @@ impl ConnectionEvents {
             path,
             inner: Mutex::new(Inner {
                 state,
-                unsaved_since: None,
+                generation: 0,
+                saved: 0,
+                prompt: false,
+                due: None,
             }),
+            wake: Notify::new(),
+            writing: tokio::sync::Mutex::new(()),
         }
     }
 
     /// See [`State::restart`]; called once at start.
-    pub async fn restart(&self, now_ms: i64) -> Vec<EndedConnection> {
-        self.write(|state| state.restart(now_ms)).await
+    pub fn restart(&self, now_ms: i64) -> Vec<EndedConnection> {
+        self.update(|state| state.restart(now_ms))
     }
 
-    /// See [`State::flow_admitted`].
+    /// See [`State::flow_admitted`]. Memory only: the writer saves a new connection at once, in
+    /// the background, so the admission's reply never waits for the disk (TT-2514).
     #[allow(clippy::too_many_arguments)]
-    pub async fn flow_admitted(
+    pub fn flow_admitted(
         &self,
         gateway_id: &str,
         device_public_key: &str,
@@ -855,24 +960,21 @@ impl ConnectionEvents {
         node_id: &str,
         now_ms: i64,
     ) -> Option<String> {
-        let mut inner = self.inner.lock().await;
-        let opened = inner.state.flow_admitted(
-            gateway_id,
-            device_public_key,
-            session_digest,
-            user_id,
-            node_id,
-            now_ms,
-        );
-        if opened.is_some() {
-            self.save(&mut inner).await;
-        }
-        opened
+        self.update(|state| {
+            state.flow_admitted(
+                gateway_id,
+                device_public_key,
+                session_digest,
+                user_id,
+                node_id,
+                now_ms,
+            )
+        })
     }
 
-    /// See [`State::denied`]. A repeat is saved with the next write, or after
-    /// [`REPEAT_FLUSH_MS`] at the latest.
-    pub async fn denied(
+    /// See [`State::denied`]. Memory only: the writer saves a first denial at once and a repeat
+    /// within [`REPEAT_FLUSH`] (§B.22 point 5).
+    pub fn denied(
         &self,
         gateway_id: &str,
         device_public_key: &str,
@@ -880,25 +982,19 @@ impl ConnectionEvents {
         reason: &str,
         now_ms: i64,
     ) {
-        let mut inner = self.inner.lock().await;
-        if inner.state.denied(
-            gateway_id,
-            device_public_key,
-            session_digest,
-            reason,
-            now_ms,
-        ) || inner
-            .unsaved_since
-            .is_some_and(|since| now_ms - since >= REPEAT_FLUSH_MS)
-        {
-            self.save(&mut inner).await;
-        } else if inner.unsaved_since.is_none() {
-            inner.unsaved_since = Some(now_ms);
-        }
+        self.update(|state| {
+            state.denied(
+                gateway_id,
+                device_public_key,
+                session_digest,
+                reason,
+                now_ms,
+            )
+        });
     }
 
     /// See [`State::notice_only_end`].
-    pub async fn notice_only_end(
+    pub fn notice_only_end(
         &self,
         gateway_id: &str,
         device_public_key: &str,
@@ -907,7 +1003,7 @@ impl ConnectionEvents {
         flows_ended: usize,
         at_ms: i64,
     ) -> String {
-        self.write(|state| {
+        self.update(|state| {
             state.notice_only_end(
                 gateway_id,
                 device_public_key,
@@ -917,84 +1013,146 @@ impl ConnectionEvents {
                 at_ms,
             )
         })
-        .await
     }
 
     /// See [`State::end_connections`].
-    pub async fn end_connections(
+    pub fn end_connections(
         &self,
         at_ms: i64,
         observe: impl FnMut(&OpenConnection) -> Option<(Observation, usize)>,
     ) -> Vec<EndedConnection> {
-        self.write(|state| state.end_connections(at_ms, observe))
-            .await
+        self.update(|state| state.end_connections(at_ms, observe))
     }
 
     /// Closes due denials, then returns what the next heartbeat sends.
-    pub async fn batch(&self, now_ms: i64) -> Batch {
-        self.write(|state| {
+    pub fn batch(&self, now_ms: i64) -> Batch {
+        self.update(|state| {
             state.close_due_denials(now_ms);
             state.batch(now_ms)
         })
-        .await
     }
 
     /// The drops since the last call, for the local audit log.
-    pub async fn take_unlogged_drops(&self) -> u64 {
-        let mut inner = self.inner.lock().await;
-        let drops = std::mem::take(&mut inner.state.unlogged_drops);
-        if drops > 0 {
-            self.save(&mut inner).await;
-        }
-        drops
+    pub fn take_unlogged_drops(&self) -> u64 {
+        self.update(State::take_unlogged_drops)
     }
 
     /// See [`State::apply_results`].
-    pub async fn apply_results(
-        &self,
-        sent: &Batch,
-        results: &HashMap<String, String>,
-    ) -> ResultsApplied {
-        self.write(|state| state.apply_results(sent, results)).await
+    pub fn apply_results(&self, sent: &Batch, results: &HashMap<String, String>) -> ResultsApplied {
+        self.update(|state| state.apply_results(sent, results))
     }
 
-    async fn write<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
-        // Saves every time instead of cloning and comparing the whole state: these calls run a few
-        // times per heartbeat, so one serialisation is the cheaper side.
-        let mut inner = self.inner.lock().await;
-        let result = change(&mut inner.state);
-        self.save(&mut inner).await;
-        result
+    /// Saves whatever is not saved yet and returns once it is written; for a graceful shutdown.
+    pub async fn flush(&self) {
+        self.save().await;
     }
 
-    async fn save(&self, inner: &mut Inner) {
-        match persist(&self.path, &inner.state).await {
-            Ok(()) => inner.unsaved_since = None,
-            Err(error) => {
-                warn!(%error, "failed to save the connection-event state - kept in memory only")
+    /// The background writer: saves a prompt change at once and deferred changes once due. Runs
+    /// for the life of the process.
+    pub async fn run_writer(&self) {
+        loop {
+            let (ready, due) = {
+                let inner = self.lock();
+                (
+                    inner.prompt || inner.due.is_some_and(|due| due <= Instant::now()),
+                    inner.due,
+                )
+            };
+            if ready {
+                self.save().await;
+                continue;
+            }
+            // A wake that comes between the check above and this wait is kept by `Notify`.
+            match due {
+                Some(due) => {
+                    tokio::select! {
+                        _ = self.wake.notified() => {}
+                        _ = tokio::time::sleep_until(due) => {}
+                    }
+                }
+                None => self.wake.notified().await,
             }
         }
     }
-}
 
-/// Writes to a temporary file and renames it over the state file, so a crash mid-write never
-/// leaves a truncated file behind.
-async fn persist(path: &Path, state: &State) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    /// Applies `change` to the state in memory and tells the writer what it changed.
+    fn update<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
+        let mut inner = self.lock();
+        let result = change(&mut inner.state);
+        let wake = match inner.state.take_change() {
+            Change::None => false,
+            Change::Deferred => {
+                inner.generation += 1;
+                // Only a new deadline needs the writer's attention; an existing one stands.
+                let new_deadline = inner.due.is_none();
+                if new_deadline {
+                    inner.due = Some(Instant::now() + REPEAT_FLUSH);
+                }
+                new_deadline
+            }
+            Change::Prompt => {
+                inner.generation += 1;
+                inner.prompt = true;
+                true
+            }
+        };
+        drop(inner);
+        if wake {
+            self.wake.notify_one();
+        }
+        result
     }
-    let bytes =
-        serde_json::to_vec(state).context("failed to serialize the connection-event state")?;
-    let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, bytes)
-        .await
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+
+    /// Writes one consistent snapshot of the whole state, serialised under the lock and written
+    /// after it is released, so an establishment and the queue never get out of step in the file
+    /// (§B.22 point 5) and no caller waits for the disk.
+    ///
+    /// The whole state is serialised under the lock: with a full queue (10,000 reports, a few MB)
+    /// that holds admissions for milliseconds per save, which is bounded (one save at a time) and
+    /// far less than the disk write the admission used to wait for.
+    async fn save(&self) {
+        let _writing = self.writing.lock().await;
+        let (bytes, generation) = {
+            let mut inner = self.lock();
+            inner.prompt = false;
+            if inner.generation == inner.saved {
+                inner.due = None;
+                return;
+            }
+            match serde_json::to_vec(&inner.state) {
+                Ok(bytes) => (bytes, inner.generation),
+                Err(error) => {
+                    warn!(%error, "failed to serialize the connection-event state - kept in memory only");
+                    inner.due = Some(Instant::now() + REPEAT_FLUSH);
+                    return;
+                }
+            }
+        };
+        let written = crate::state_file::write_atomically(&self.path, &bytes).await;
+        let mut inner = self.lock();
+        match written {
+            Ok(()) => {
+                inner.saved = generation;
+                // Changes made while this was written keep their own deadline or wake.
+                if inner.generation == generation {
+                    inner.due = None;
+                }
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "failed to save the connection-event state - kept in memory, retrying");
+                let retry = Instant::now() + REPEAT_FLUSH;
+                inner.due = Some(inner.due.map_or(retry, |due| due.min(retry)));
+            }
+        }
+    }
+
+    /// The state is plain data, so a panic elsewhere while the lock was held leaves nothing half
+    /// done that matters more than keeping admissions answered: a poisoned lock is taken as is.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[cfg(test)]
@@ -1502,20 +1660,146 @@ mod tests {
         assert_eq!(json["kind"], "established");
     }
 
+    /// TT-2250 review: two ends in one heartbeat on a full queue. Each end drops the oldest queued
+    /// establishment; the connections those belong to must be marked unreported even while the
+    /// ends are being queued, so their later removal ends go notice-only instead of being sent
+    /// without an establishment the Portal could place.
+    #[test]
+    fn ends_that_overflow_a_full_queue_leave_the_dropped_establishments_connections_unreported() {
+        let mut state = State::default();
+        for i in 0..MAX_QUEUED {
+            admit(&mut state, "gw-1", &format!("dev-{i}"), None, T0 + i as i64);
+        }
+        assert_eq!(state.queued().len(), MAX_QUEUED);
+        let last = MAX_QUEUED - 1;
+        let ending = [format!("dev-{}", last - 1), format!("dev-{last}")];
+        let ended = state.end_connections(T0 + 20_000, |c| {
+            ending
+                .contains(&c.device_public_key)
+                .then_some((Observation::SessionEnded, 0))
+        });
+        assert_eq!(ended.len(), 2);
+        assert_eq!(state.queued().len(), MAX_QUEUED);
+        for device in ["dev-0", "dev-1"] {
+            let open = state
+                .open_connections()
+                .iter()
+                .find(|c| c.device_public_key == device)
+                .unwrap();
+            assert_eq!(
+                open.establishment,
+                Establishment::Unreported,
+                "{device}'s establishment was dropped for room"
+            );
+        }
+        assert_eq!(state.lost_count(), 2);
+
+        // Their later removal ends are sent notice-only, so the device still gets its notice.
+        state.end_connections(T0 + 30_000, |c| {
+            ["dev-0", "dev-1"]
+                .contains(&c.device_public_key.as_str())
+                .then_some((Observation::EntitlementRemoved, 1))
+        });
+        let removal_ends: Vec<&ConnectionEvent> = state
+            .queued()
+            .iter()
+            .filter(|e| e.is_removal_end())
+            .collect();
+        assert_eq!(removal_ends.len(), 2);
+        assert!(removal_ends.iter().all(|e| e.notice_only == Some(true)));
+    }
+
+    /// An end queued in a heartbeat whose own establishment a later end of that heartbeat drops is
+    /// dropped too, and the local audit log is told no report was queued for it.
+    #[test]
+    fn an_end_whose_establishment_a_later_end_drops_is_dropped_with_it() {
+        let mut state = State::default();
+        for i in 0..MAX_QUEUED {
+            admit(&mut state, "gw-1", &format!("dev-{i}"), None, T0 + i as i64);
+        }
+        let last = format!("dev-{}", MAX_QUEUED - 1);
+        let ended = state.end_connections(T0 + 20_000, |c| {
+            (c.device_public_key == "dev-0" || c.device_public_key == last)
+                .then_some((Observation::SessionEnded, 0))
+        });
+        let dev_0 = ended
+            .iter()
+            .find(|c| c.device_public_key == "dev-0")
+            .unwrap();
+        assert_eq!(dev_0.report_id, None);
+        assert!(
+            !state
+                .queued()
+                .iter()
+                .any(|e| e.device_public_key == "dev-0")
+        );
+    }
+
+    /// TT-2250 review: the file is written only when a method reports a change; a heartbeat with
+    /// nothing new changes nothing, and a repeat or a node update is only a deferred change.
+    #[test]
+    fn only_a_real_change_asks_for_a_save() {
+        let mut state = State::default();
+        admit(&mut state, "gw-1", "dev-A", None, T0);
+        assert_eq!(state.take_change(), Change::Prompt);
+        assert_eq!(state.take_change(), Change::None);
+
+        state.close_due_denials(T0 + 1);
+        let batch = state.batch(T0 + 1);
+        state.apply_results(&batch, &HashMap::new());
+        state.end_connections(T0 + 1, |_| None);
+        assert_eq!(state.take_unlogged_drops(), 0);
+        assert!(admit(&mut state, "gw-1", "dev-A", None, T0 + 2).is_none());
+        assert_eq!(state.take_change(), Change::None, "nothing changed");
+
+        state.flow_admitted("gw-1", "dev-A", None, "user-1", "node-2", T0 + 3);
+        assert_eq!(state.take_change(), Change::Deferred, "the node only");
+
+        state.denied("gw-1", "dev-B", None, "not_entitled", T0 + 4);
+        assert_eq!(state.take_change(), Change::Prompt, "a first denial");
+        state.denied("gw-1", "dev-B", None, "not_entitled", T0 + 5);
+        assert_eq!(state.take_change(), Change::Deferred, "a repeat");
+
+        state.apply_results(
+            &batch,
+            &results(&[(&batch.events[0].report_id, "accepted")]),
+        );
+        assert_eq!(state.take_change(), Change::Prompt, "a report removed");
+    }
+
+    fn on_disk(path: &std::path::Path) -> Option<State> {
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Lets the writer run until the file holds every change made so far.
+    async fn settle(events: &ConnectionEvents) {
+        for _ in 0..1_000 {
+            {
+                let inner = events.lock();
+                if inner.generation == inner.saved {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the writer did not save the state");
+    }
+
     #[tokio::test]
     async fn the_state_survives_a_restart_and_the_restart_ends_open_connections() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection-events.json");
         let events = ConnectionEvents::load(&path).await;
-        events
-            .flow_admitted("gw-1", "dev-A", Some("d1"), "user-1", "node-1", T0)
-            .await;
+        events.flow_admitted("gw-1", "dev-A", Some("d1"), "user-1", "node-1", T0);
+        events.flush().await;
         drop(events);
 
         let events = ConnectionEvents::load(&path).await;
-        let ended = events.restart(T0 + 50).await;
+        let ended = events.restart(T0 + 50);
         assert_eq!(ended.len(), 1);
-        let batch = events.batch(T0 + 51).await;
+        let batch = events.batch(T0 + 51);
         let kinds: Vec<Kind> = batch.events.iter().map(|e| e.kind).collect();
         assert_eq!(kinds, vec![Kind::Established, Kind::Ended]);
     }
@@ -1526,42 +1810,70 @@ mod tests {
         let path = dir.path().join("connection-events.json");
         tokio::fs::write(&path, b"{not json").await.unwrap();
         let events = ConnectionEvents::load(&path).await;
-        assert!(
-            events
-                .inner
-                .lock()
-                .await
-                .state
-                .open_connections()
-                .is_empty()
+        assert!(events.lock().state.open_connections().is_empty());
+    }
+
+    /// TT-2514 rule (TT-2250 review): an admission changes memory only; the background writer
+    /// saves the new connection, with its establishment, promptly and in one snapshot.
+    #[tokio::test]
+    async fn an_admission_changes_memory_only_and_the_writer_saves_it_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connection-events.json");
+        let events = std::sync::Arc::new(ConnectionEvents::load(&path).await);
+        events.flow_admitted("gw-1", "dev-A", None, "user-1", "node-1", T0);
+        assert!(on_disk(&path).is_none(), "no write on the admission path");
+
+        let writer = tokio::spawn({
+            let events = events.clone();
+            async move { events.run_writer().await }
+        });
+        settle(&events).await;
+        let saved = on_disk(&path).unwrap();
+        assert_eq!(saved.open_connections().len(), 1);
+        assert_eq!(
+            saved.queued().len(),
+            1,
+            "the establishment with its connection"
         );
+        writer.abort();
+    }
+
+    /// TT-2250 review (§B.22 point 5): a single repeat of a held denial followed by silence still
+    /// reaches the file within 10 seconds, with no later denial or heartbeat to carry it.
+    #[tokio::test(start_paused = true)]
+    async fn a_single_repeat_followed_by_silence_is_saved_within_ten_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connection-events.json");
+        let events = std::sync::Arc::new(ConnectionEvents::load(&path).await);
+        let writer = tokio::spawn({
+            let events = events.clone();
+            async move { events.run_writer().await }
+        });
+        events.denied("gw-1", "dev-A", None, "not_entitled", T0);
+        settle(&events).await;
+        assert_eq!(on_disk(&path).unwrap().held[0].repeats, 0);
+
+        events.denied("gw-1", "dev-A", None, "not_entitled", T0 + 1);
+        tokio::time::sleep(REPEAT_FLUSH - Duration::from_secs(1)).await;
+        assert_eq!(
+            on_disk(&path).unwrap().held[0].repeats,
+            0,
+            "a repeat waits, memory only"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        settle(&events).await;
+        assert_eq!(on_disk(&path).unwrap().held[0].repeats, 1);
+        writer.abort();
     }
 
     #[tokio::test]
-    async fn a_repeat_of_a_held_denial_is_saved_with_the_next_write() {
+    async fn flush_saves_what_the_writer_has_not_saved_yet() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("connection-events.json");
         let events = ConnectionEvents::load(&path).await;
-        events
-            .denied("gw-1", "dev-A", None, "not_entitled", T0)
-            .await;
-        events
-            .denied("gw-1", "dev-A", None, "not_entitled", T0 + 1)
-            .await; // memory only
-        let on_disk: State =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        assert_eq!(on_disk.held[0].repeats, 0);
-        events
-            .denied(
-                "gw-1",
-                "dev-A",
-                None,
-                "not_entitled",
-                T0 + REPEAT_FLUSH_MS + 1,
-            )
-            .await;
-        let on_disk: State =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        assert_eq!(on_disk.held[0].repeats, 2);
+        events.denied("gw-1", "dev-A", None, "not_entitled", T0);
+        events.denied("gw-1", "dev-A", None, "not_entitled", T0 + 1);
+        events.flush().await;
+        assert_eq!(on_disk(&path).unwrap().held[0].repeats, 1);
     }
 }

@@ -7,6 +7,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The Agent refuses a heartbeat body larger than this (`ConnectorHeartbeatBodySizeFilter`,
+/// 256 KiB) - the whole heartbeat, policy and live-session refresh included (spec §B.22 point 5).
+pub const AGENT_HEARTBEAT_BODY_LIMIT_BYTES: usize = 256 * 1024;
+/// What the Connector lets a heartbeat body reach: the Agent's limit less a margin, so a request
+/// sized here stays clear of it (TT-2250 review).
+pub const HEARTBEAT_BODY_BUDGET_BYTES: usize = AGENT_HEARTBEAT_BODY_LIMIT_BYTES - 16 * 1024;
+/// The most `unresolved_endpoint_hosts` one heartbeat carries - the Agent's own cap
+/// (`MAX_UNRESOLVED_ENDPOINT_HOSTS`), which the heartbeat's size budget counts on (spec §B.22
+/// point 5).
+pub const MAX_UNRESOLVED_ENDPOINT_HOSTS: usize = 500;
+/// The longest unresolved host name the Agent keeps (a DNS name is at most 255 characters).
+pub const MAX_UNRESOLVED_ENDPOINT_HOST_LENGTH: usize = 255;
+
 /// The heartbeat request body (TT-2069) - previously an empty `POST`, now carrying this
 /// Connector's own identity and observed state back to Agent/Portal. Unsigned, same as the rest of
 /// this request: the endpoint has never had per-request authentication (see `heartbeat`'s module

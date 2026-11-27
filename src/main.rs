@@ -17,6 +17,7 @@ mod live_sessions;
 mod policy;
 mod registry_client;
 mod request_proof;
+mod state_file;
 mod tun_device;
 mod tunnel;
 
@@ -170,10 +171,29 @@ async fn main() -> anyhow::Result<()> {
         )
         .await,
     );
+    // TT-2250 review: callers change the state in memory only; this task writes it to the file,
+    // and a graceful stop flushes what it has not written yet.
+    tokio::spawn({
+        let connection_events = connection_events.clone();
+        async move { connection_events.run_writer().await }
+    });
+    tokio::spawn({
+        let connection_events = connection_events.clone();
+        async move {
+            shutdown_signal().await;
+            info!("stopping - saving the connection-event state");
+            // Bounded, so a hanging disk cannot hold the stop until systemd's own timeout.
+            if tokio::time::timeout(std::time::Duration::from_secs(5), connection_events.flush())
+                .await
+                .is_err()
+            {
+                warn!("stopping without saving the connection-event state: the save took too long");
+            }
+            std::process::exit(0);
+        }
+    });
     record_connection_ends(
-        &connection_events
-            .restart(chrono::Utc::now().timestamp_millis())
-            .await,
+        &connection_events.restart(chrono::Utc::now().timestamp_millis()),
         &audit_log,
     )
     .await;
@@ -363,6 +383,30 @@ async fn main() -> anyhow::Result<()> {
                 log_heartbeat_failure(&error, &connector_public_key, "heartbeat cycle failed")
             }
         }
+    }
+}
+
+/// Resolves on SIGTERM (systemd's stop) or Ctrl-C. Without a handler either would end the process
+/// before the connection-event writer saved its last changes (TT-2250 review).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(error) => {
+                warn!(%error, "cannot listen for SIGTERM - only Ctrl-C saves the connection-event state before stopping");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -583,25 +627,23 @@ async fn record_flows_ended(
         let report_id = match matched {
             Some(report_id) => report_id,
             None => {
-                events
-                    .notice_only_end(
-                        &removal.gateway_id,
-                        &removal.device_public_key,
-                        &removal.user_id,
-                        // The whole gateway left the bundles (deleted, disabled, moved, blocked):
-                        // the Portal decides from that whether a notice is due (§B.22 point 7).
-                        if new_bundles
-                            .iter()
-                            .any(|b| b.gateway_id == removal.gateway_id)
-                        {
-                            connection_events::Observation::EntitlementRemoved
-                        } else {
-                            connection_events::Observation::GatewayRemoved
-                        },
-                        removal.flows_ended,
-                        removal.ended_at,
-                    )
-                    .await
+                events.notice_only_end(
+                    &removal.gateway_id,
+                    &removal.device_public_key,
+                    &removal.user_id,
+                    // The whole gateway left the bundles (deleted, disabled, moved, blocked):
+                    // the Portal decides from that whether a notice is due (§B.22 point 7).
+                    if new_bundles
+                        .iter()
+                        .any(|b| b.gateway_id == removal.gateway_id)
+                    {
+                        connection_events::Observation::EntitlementRemoved
+                    } else {
+                        connection_events::Observation::GatewayRemoved
+                    },
+                    removal.flows_ended,
+                    removal.ended_at,
+                )
             }
         };
         let event = AuditEvent::FlowsEnded {
@@ -670,36 +712,46 @@ async fn run_heartbeat(
         .collect();
     // TT-2250 (spec §B.22 point 5): after an upgrade, gateway-end reports still queued go first, and
     // this heartbeat carries no connection events until that old queue is empty.
-    let connection_batch = match &connection_events {
-        Some(turn) if turn.carry && ended_flows.is_empty() => Some(
-            turn.events
-                .batch(chrono::Utc::now().timestamp_millis())
-                .await,
-        ),
+    let mut connection_batch = match &connection_events {
+        Some(turn) if turn.carry && ended_flows.is_empty() => {
+            Some(turn.events.batch(chrono::Utc::now().timestamp_millis()))
+        }
         _ => None,
     };
+    let mut request = dto::ConnectorHeartbeatRequest {
+        connector_public_key: connector_public_key.to_string(),
+        unresolved_endpoint_hosts,
+        ended_flows,
+        connection_events: Vec::new(),
+        connection_events_lost: connection_batch
+            .as_ref()
+            .and_then(|batch| batch.lost.clone()),
+    };
+    // TT-2250 review (spec §B.22 point 5): only the events that fit the Agent's body limit go;
+    // the rest stay queued for the next heartbeat, and only those sent get results applied.
+    if let Some(batch) = connection_batch.as_mut() {
+        let fitting = connection_events_within_body_limit(
+            &request,
+            &batch.events,
+            dto::HEARTBEAT_BODY_BUDGET_BYTES,
+        );
+        if fitting < batch.events.len() {
+            warn!(
+                sent = fitting,
+                held = batch.events.len() - fitting,
+                "connection events over the heartbeat body limit - the rest go on the next heartbeat"
+            );
+            batch.events.truncate(fitting);
+        }
+        request.connection_events = batch.events.clone();
+    }
 
     // TT-3770: this heartbeat's reply answers every off-schedule request made before it is sent, and
     // its snapshot counts for every admission that arrived before then.
     policy_store.live_sessions().clear_refresh_request();
     let requested_at = std::time::Instant::now();
     let response = agent_directory
-        .heartbeat(
-            registry_client,
-            heartbeat_client,
-            &dto::ConnectorHeartbeatRequest {
-                connector_public_key: connector_public_key.to_string(),
-                unresolved_endpoint_hosts,
-                ended_flows,
-                connection_events: connection_batch
-                    .as_ref()
-                    .map(|batch| batch.events.clone())
-                    .unwrap_or_default(),
-                connection_events_lost: connection_batch
-                    .as_ref()
-                    .and_then(|batch| batch.lost.clone()),
-            },
-        )
+        .heartbeat(registry_client, heartbeat_client, &request)
         .await?;
 
     // A verified response means Agent relayed the request to Portal, which processed it: the
@@ -715,7 +767,7 @@ async fn run_heartbeat(
             .connection_event_results
             .clone()
             .unwrap_or_default();
-        let applied = turn.events.apply_results(batch, &results).await;
+        let applied = turn.events.apply_results(batch, &results);
         for report_id in applied.rejected {
             warn!(%report_id, "Portal rejected a connection event - not sending it again");
             if let Err(error) = audit_log
@@ -857,18 +909,17 @@ async fn run_heartbeat(
             .iter()
             .map(|(node_id, _)| node_id.as_str())
             .collect();
-        let ended = turn
-            .events
-            .end_connections(chrono::Utc::now().timestamp_millis(), |connection| {
-                observe_connection_end(
-                    connection,
-                    &new_bundles,
-                    &removal_flows,
-                    snapshot_accepted.then_some(policy_store.live_sessions()),
-                    &dropped,
-                )
-            })
-            .await;
+        let ended =
+            turn.events
+                .end_connections(chrono::Utc::now().timestamp_millis(), |connection| {
+                    observe_connection_end(
+                        connection,
+                        &new_bundles,
+                        &removal_flows,
+                        snapshot_accepted.then_some(policy_store.live_sessions()),
+                        &dropped,
+                    )
+                });
         record_flows_ended(
             &removal_reports,
             &ended,
@@ -878,7 +929,7 @@ async fn run_heartbeat(
         )
         .await;
         record_connection_ends(&ended, audit_log).await;
-        let dropped_events = turn.events.take_unlogged_drops().await;
+        let dropped_events = turn.events.take_unlogged_drops();
         if dropped_events > 0 {
             warn!(
                 dropped_events,
@@ -927,12 +978,51 @@ fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
 /// all. Deduplicated and sorted *before* the cache lookups (review finding #5) - the same
 /// unresolved host commonly appears on more than one gateway's endpoint list, and there is no
 /// reason to take `dns_cache`'s lock more than once per distinct host.
+///
+/// Capped at the first `MAX_UNRESOLVED_ENDPOINT_HOSTS` in that sorted order, as the Agent caps it
+/// (TT-2250 review, spec §B.22 point 5): the heartbeat's size budget counts on it.
 fn unresolved_hosts_in(bundles: &[PolicyBundle], dns_cache: &dns_cache::DnsCache) -> Vec<String> {
     let mut hosts = collect_endpoint_hosts(bundles);
+    // As the Agent cleans the list before its cap: no blank names, none over 255 characters.
+    hosts.retain(|host| {
+        !host.trim().is_empty() && host.len() <= dto::MAX_UNRESOLVED_ENDPOINT_HOST_LENGTH
+    });
     hosts.sort();
     hosts.dedup();
     hosts.retain(|host| dns_cache.resolve(host).is_none());
+    hosts.truncate(dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
     hosts
+}
+
+/// TT-2250 review (spec §B.22 point 5): how many of `events`, from the front, fit `request` within
+/// `budget` bytes once serialised - the whole request, unresolved hosts and lost report included.
+/// Without this, 200 events and a long host list could exceed the Agent's body limit, which refuses
+/// the whole heartbeat, its policy and snapshot refresh included, and the same batch would be sent
+/// again on every heartbeat. A prefix keeps the batch's order rules: every end stays right after
+/// its establishment and every follow-up after its first denial.
+fn connection_events_within_body_limit(
+    request: &dto::ConnectorHeartbeatRequest,
+    events: &[connection_events::ConnectionEvent],
+    budget: usize,
+) -> usize {
+    debug_assert!(request.connection_events.is_empty());
+    let Ok(base) = serde_json::to_vec(request) else {
+        return 0;
+    };
+    // `,"connection_events":[]` around the events, and a comma between two.
+    let mut size = base.len() + r#","connection_events":[]"#.len();
+    let mut fitting = 0;
+    for (index, event) in events.iter().enumerate() {
+        let Ok(bytes) = serde_json::to_vec(event) else {
+            break;
+        };
+        size += bytes.len() + usize::from(index > 0);
+        if size > budget {
+            break;
+        }
+        fitting += 1;
+    }
+    fitting
 }
 
 /// Tears down every already-admitted flow whose device dropped out of its gateway's entitlement
@@ -4067,16 +4157,14 @@ mod tests {
             "dev-A".to_string(),
             vec![],
         );
-        events
-            .flow_admitted(
-                "gw-1",
-                "dev-A",
-                None,
-                "u-7",
-                "n-1",
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .await;
+        events.flow_admitted(
+            "gw-1",
+            "dev-A",
+            None,
+            "u-7",
+            "n-1",
+            chrono::Utc::now().timestamp_millis(),
+        );
 
         heartbeat!(false); // off schedule: carries nothing
         heartbeat!(true); // carries the establishment (accepted), and the revoke ends the connection
@@ -4115,7 +4203,7 @@ mod tests {
         assert!(audit.iter().any(|e| e["event"] == "connection_ended"));
 
         assert!(
-            events.batch(i64::MAX / 2).await.events.is_empty(),
+            events.batch(i64::MAX / 2).events.is_empty(),
             "every event was accepted"
         );
     }
@@ -4166,16 +4254,14 @@ mod tests {
         let events =
             connection_events::ConnectionEvents::load(dir.path().join("connection-events.json"))
                 .await;
-        events
-            .flow_admitted(
-                "gw-1",
-                "dev-A",
-                None,
-                "u-7",
-                "n-1",
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .await;
+        events.flow_admitted(
+            "gw-1",
+            "dev-A",
+            None,
+            "u-7",
+            "n-1",
+            chrono::Utc::now().timestamp_millis(),
+        );
         let tunnel_manager = Mutex::new(TunnelManager::new(
             boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
         ));
@@ -5609,5 +5695,229 @@ mod tests {
         assert_eq!(gw_1_applied.len(), 3, "heartbeats 1, 2 and 4 changed it");
         assert!(gw_1_applied[0].get("gateway_address").is_none());
         assert_eq!(gw_1_applied[2]["gateway_address"], "100.64.5.11");
+    }
+
+    /// TT-2250 review (spec §B.22 point 5): the list is capped at the Agent's 500 names, the first
+    /// in sorted order after deduplication.
+    #[test]
+    fn unresolved_endpoint_hosts_are_capped_at_the_agents_limit_in_sorted_order() {
+        let hosts: Vec<String> = (0..dto::MAX_UNRESOLVED_ENDPOINT_HOSTS + 100)
+            .rev()
+            .map(|i| format!("host-{i:04}.internal.example.com"))
+            .collect();
+        let host_refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
+        let bundles = vec![
+            bundle_with_endpoints("gw-1", &host_refs),
+            bundle_with_endpoints("gw-2", &host_refs),
+        ];
+        let unresolved = unresolved_hosts_in(&bundles, &dns_cache::DnsCache::new());
+        assert_eq!(unresolved.len(), dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
+        assert_eq!(unresolved[0], "host-0000.internal.example.com");
+        assert_eq!(
+            unresolved.last().unwrap(),
+            &format!(
+                "host-{:04}.internal.example.com",
+                dto::MAX_UNRESOLVED_ENDPOINT_HOSTS - 1
+            )
+        );
+        assert!(unresolved.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn blank_and_overlong_host_names_are_dropped_before_the_cap_as_the_agent_does() {
+        let too_long = format!("{}.example.com", "a".repeat(250));
+        let bundles = vec![bundle_with_endpoints(
+            "gw-1",
+            &["  ", too_long.as_str(), "erp.internal.example.com"],
+        )];
+        assert_eq!(
+            unresolved_hosts_in(&bundles, &dns_cache::DnsCache::new()),
+            vec!["erp.internal.example.com".to_string()]
+        );
+    }
+
+    fn heartbeat_request_with_hosts(count: usize) -> dto::ConnectorHeartbeatRequest {
+        dto::ConnectorHeartbeatRequest {
+            connector_public_key: "pk-1".to_string(),
+            // The longest names the Agent accepts (255 characters).
+            unresolved_endpoint_hosts: Some(
+                (0..count)
+                    .map(|i| format!("{i:05}{}", "h".repeat(250)))
+                    .collect(),
+            ),
+            ended_flows: Vec::new(),
+            connection_events: Vec::new(),
+            connection_events_lost: Some(connection_events::LostReport {
+                report_id: gateway_end::new_report_id(),
+                count: 7,
+                first_at: 1,
+                last_at: 2,
+            }),
+        }
+    }
+
+    fn queued_establishments(
+        count: usize,
+        key_len: usize,
+    ) -> Vec<connection_events::ConnectionEvent> {
+        let mut state = connection_events::State::default();
+        for i in 0..count {
+            state.flow_admitted(
+                "0b0c6f1e-5d1a-4c55-9a39-6f3b2a7d9e10",
+                &format!("{i:05}{}", "k".repeat(key_len)),
+                Some(&live_sessions::token_digest("token")),
+                "6c1b8f7e-2a3d-4e5f-8a9b-0c1d2e3f4a5b",
+                "node-1",
+                1_700_000_000_000,
+            );
+        }
+        state.batch(1_700_000_000_001).events
+    }
+
+    /// TT-2250 review (spec §B.22 point 5): with the longest host list, 200 ordinary connection
+    /// events fit the Agent's body limit, as the spec sizes it.
+    #[test]
+    fn a_full_batch_fits_beside_the_longest_unresolved_host_list() {
+        let mut request = heartbeat_request_with_hosts(dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
+        let events = queued_establishments(connection_events::MAX_PER_HEARTBEAT, 44);
+        assert_eq!(events.len(), connection_events::MAX_PER_HEARTBEAT);
+        let fitting = connection_events_within_body_limit(
+            &request,
+            &events,
+            dto::HEARTBEAT_BODY_BUDGET_BYTES,
+        );
+        assert_eq!(fitting, events.len());
+        request.connection_events = events;
+        assert!(serde_json::to_vec(&request).unwrap().len() <= dto::HEARTBEAT_BODY_BUDGET_BYTES);
+    }
+
+    /// TT-2250 review: events that would take the request over the limit stay queued; the request
+    /// sent, lost report included, stays under it.
+    #[test]
+    fn connection_events_over_the_body_limit_are_held_for_the_next_heartbeat() {
+        let mut request = heartbeat_request_with_hosts(dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
+        // Unusually long keys: 200 of these would not fit.
+        let events = queued_establishments(connection_events::MAX_PER_HEARTBEAT, 1_000);
+        let fitting = connection_events_within_body_limit(
+            &request,
+            &events,
+            dto::HEARTBEAT_BODY_BUDGET_BYTES,
+        );
+        assert!(fitting > 0 && fitting < events.len(), "{fitting}");
+        request.connection_events = events[..fitting].to_vec();
+        let size = serde_json::to_vec(&request).unwrap().len();
+        assert!(size <= dto::HEARTBEAT_BODY_BUDGET_BYTES, "{size}");
+        request.connection_events = events[..=fitting].to_vec();
+        assert!(
+            serde_json::to_vec(&request).unwrap().len() > dto::HEARTBEAT_BODY_BUDGET_BYTES,
+            "the count is exact: one more does not fit"
+        );
+    }
+
+    fn open_connection(node_id: &str, digest: Option<&str>) -> connection_events::OpenConnection {
+        let mut state = connection_events::State::default();
+        state.flow_admitted("gw-1", "dev-A", digest, "u-1", node_id, 1);
+        state.open_connections()[0].clone()
+    }
+
+    fn snapshot(digests: &[&str]) -> live_sessions::LiveSessions {
+        let sessions = live_sessions::LiveSessions::new(Default::default());
+        sessions.update(
+            Some(true),
+            Some(std::collections::HashMap::from([(
+                "dev-A".to_string(),
+                digests.iter().map(ToString::to_string).collect(),
+            )])),
+            std::time::Instant::now(),
+        );
+        sessions
+    }
+
+    /// TT-2250 review (spec §B.22 point 2): `session_ended` when the accepted snapshot no longer
+    /// holds the connection's session; nothing while it does, or when no snapshot was accepted.
+    #[test]
+    fn a_connection_whose_session_left_the_snapshot_ends_as_session_ended() {
+        use connection_events::Observation;
+        let connection = open_connection("n-1", Some("d1"));
+        let bundles = vec![bundle("gw-1", &["dev-A"])];
+        let no_removals = std::collections::HashMap::new();
+        let no_drops = std::collections::HashSet::new();
+        let live = snapshot(&["d1"]);
+        let gone = snapshot(&["d2"]);
+        assert_eq!(
+            observe_connection_end(&connection, &bundles, &no_removals, Some(&live), &no_drops),
+            None
+        );
+        assert_eq!(
+            observe_connection_end(&connection, &bundles, &no_removals, None, &no_drops),
+            None,
+            "no snapshot accepted this heartbeat"
+        );
+        assert_eq!(
+            observe_connection_end(&connection, &bundles, &no_removals, Some(&gone), &no_drops),
+            Some((Observation::SessionEnded, 0))
+        );
+    }
+
+    /// TT-2250 review (spec §B.22 point 2): `node_removed` when the node of the connection's last
+    /// admitted flow left the node list; another node leaving ends nothing.
+    #[test]
+    fn a_connection_whose_node_left_the_node_list_ends_as_node_removed() {
+        use connection_events::Observation;
+        let connection = open_connection("n-1", Some("d1"));
+        let bundles = vec![bundle("gw-1", &["dev-A"])];
+        let no_removals = std::collections::HashMap::new();
+        let live = snapshot(&["d1"]);
+        assert_eq!(
+            observe_connection_end(
+                &connection,
+                &bundles,
+                &no_removals,
+                Some(&live),
+                &std::collections::HashSet::from(["n-2"])
+            ),
+            None
+        );
+        assert_eq!(
+            observe_connection_end(
+                &connection,
+                &bundles,
+                &no_removals,
+                Some(&live),
+                &std::collections::HashSet::from(["n-1"])
+            ),
+            Some((Observation::NodeRemoved, 0))
+        );
+    }
+
+    /// TT-2250 review (spec §B.22 point 2): when one heartbeat gives a connection several
+    /// observations, the first of gateway_removed > entitlement_removed > session_ended >
+    /// node_removed counts; a removal carries the flows the refresh ended.
+    #[test]
+    fn the_first_observation_in_the_specs_order_counts() {
+        use connection_events::Observation;
+        let connection = open_connection("n-1", Some("d1"));
+        let removals =
+            std::collections::HashMap::from([(("gw-1".to_string(), "dev-A".to_string()), 3)]);
+        let gone = snapshot(&["d2"]);
+        let node_gone = std::collections::HashSet::from(["n-1"]);
+        let observe = |bundles: &[PolicyBundle]| {
+            observe_connection_end(&connection, bundles, &removals, Some(&gone), &node_gone)
+        };
+        assert_eq!(
+            observe(&[bundle("gw-2", &["dev-A"])]),
+            Some((Observation::GatewayRemoved, 3)),
+            "all four apply"
+        );
+        assert_eq!(
+            observe(&[bundle("gw-1", &["dev-B"])]),
+            Some((Observation::EntitlementRemoved, 3)),
+            "all but the gateway removal apply"
+        );
+        assert_eq!(
+            observe(&[bundle("gw-1", &["dev-A"])]),
+            Some((Observation::SessionEnded, 0)),
+            "session and node apply"
+        );
     }
 }
