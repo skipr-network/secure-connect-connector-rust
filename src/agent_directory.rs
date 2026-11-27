@@ -353,6 +353,8 @@ mod tests {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: None,
             ended_flows: vec![],
+            connection_events: Vec::new(),
+            connection_events_lost: None,
         }
     }
 
@@ -965,6 +967,8 @@ mod proof_tests {
                         connector_public_key: self.connector_public_key.clone(),
                         unresolved_endpoint_hosts: None,
                         ended_flows: vec![],
+                        connection_events: Vec::new(),
+                        connection_events_lost: None,
                     },
                 )
                 .await

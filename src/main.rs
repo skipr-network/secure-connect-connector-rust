@@ -4,6 +4,7 @@ mod agent_directory;
 mod audit;
 mod ca_trust;
 mod config;
+mod connection_events;
 mod crypto;
 mod dns_cache;
 mod dto;
@@ -16,6 +17,7 @@ mod live_sessions;
 mod policy;
 mod registry_client;
 mod request_proof;
+mod state_file;
 mod tun_device;
 mod tunnel;
 
@@ -159,6 +161,42 @@ async fn main() -> anyhow::Result<()> {
             .with_file_name("pending-gateway-end-reports.json"),
     )
     .await;
+    // TT-2250 (spec §B.22 point 5): one state file next to the audit log. Connections a previous
+    // run left open end now, as `connector_restart`, and its open denial windows close.
+    let connection_events = Arc::new(
+        connection_events::ConnectionEvents::load(
+            config
+                .audit_log_path
+                .with_file_name("connection-events.json"),
+        )
+        .await,
+    );
+    // TT-2250 review: callers change the state in memory only; this task writes it to the file,
+    // and a graceful stop flushes what it has not written yet.
+    tokio::spawn({
+        let connection_events = connection_events.clone();
+        async move { connection_events.run_writer().await }
+    });
+    tokio::spawn({
+        let connection_events = connection_events.clone();
+        async move {
+            shutdown_signal().await;
+            info!("stopping - saving the connection-event state");
+            // Bounded, so a hanging disk cannot hold the stop until systemd's own timeout.
+            if tokio::time::timeout(std::time::Duration::from_secs(5), connection_events.flush())
+                .await
+                .is_err()
+            {
+                warn!("stopping without saving the connection-event state: the save took too long");
+            }
+            std::process::exit(0);
+        }
+    });
+    record_connection_ends(
+        &connection_events.restart(chrono::Utc::now().timestamp_millis()),
+        &audit_log,
+    )
+    .await;
     // Moves connector_identity.secret - nothing else needs the identity after
     // the "ready" log line above.
     let tunnel_manager = Arc::new(Mutex::new(TunnelManager::new(connector_identity.secret)));
@@ -196,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
             audit_log: audit_log.clone(),
             flow_table: flow_table.clone(),
             recovered_packet_tx,
+            connection_events: Some(connection_events.clone()),
         },
     );
 
@@ -220,6 +259,10 @@ async fn main() -> anyhow::Result<()> {
             &dns_cache,
             &mut admission_pollers,
             &gateway_end_queue,
+            Some(ConnectionEventsTurn {
+                events: &connection_events,
+                carry: true,
+            }),
         )
         .await
         {
@@ -312,6 +355,12 @@ async fn main() -> anyhow::Result<()> {
             &dns_cache,
             &mut admission_pollers,
             &gateway_end_queue,
+            // TT-2250 (spec §B.22 point 5): an off-schedule heartbeat carries no connection events,
+            // so it stays quick; it still ends the connections it observes.
+            Some(ConnectionEventsTurn {
+                events: &connection_events,
+                carry: !off_schedule_run,
+            }),
         )
         .await;
         // A successful heartbeat of either kind ends any backoff; a failed off-schedule one extends it.
@@ -334,6 +383,30 @@ async fn main() -> anyhow::Result<()> {
                 log_heartbeat_failure(&error, &connector_public_key, "heartbeat cycle failed")
             }
         }
+    }
+}
+
+/// Resolves on SIGTERM (systemd's stop) or Ctrl-C. Without a handler either would end the process
+/// before the connection-event writer saved its last changes (TT-2250 review).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(error) => {
+                warn!(%error, "cannot listen for SIGTERM - only Ctrl-C saves the connection-event state before stopping");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -456,6 +529,136 @@ fn generate_identity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// TT-2250: what one heartbeat does with the connection events - `carry` false on an off-schedule
+/// heartbeat, which sends none but still ends the connections it observes (spec §B.22 point 5).
+struct ConnectionEventsTurn<'a> {
+    events: &'a connection_events::ConnectionEvents,
+    carry: bool,
+}
+
+/// TT-2250 (spec §B.22 point 2): what this heartbeat observed ending `connection`, the first that
+/// applies in this order: its gateway left the bundles, its device left the gateway's list, its
+/// session's digest left the accepted snapshot, its node left the node list. With the number of flows
+/// a removal closed.
+fn observe_connection_end(
+    connection: &connection_events::OpenConnection,
+    new_bundles: &[PolicyBundle],
+    removal_flows: &std::collections::HashMap<(String, String), usize>,
+    accepted_snapshot: Option<&live_sessions::LiveSessions>,
+    dropped_nodes: &std::collections::HashSet<&str>,
+) -> Option<(connection_events::Observation, usize)> {
+    use connection_events::Observation;
+    let flows = || {
+        removal_flows
+            .get(&(
+                connection.gateway_id.clone(),
+                connection.device_public_key.clone(),
+            ))
+            .copied()
+            .unwrap_or(0)
+    };
+    let Some(bundle) = new_bundles
+        .iter()
+        .find(|bundle| bundle.gateway_id == connection.gateway_id)
+    else {
+        return Some((Observation::GatewayRemoved, flows()));
+    };
+    let entitled = bundle
+        .entitlement_list
+        .iter()
+        .any(|e| e.device_public_key.as_deref() == Some(connection.device_public_key.as_str()));
+    if !entitled {
+        return Some((Observation::EntitlementRemoved, flows()));
+    }
+    if let Some(sessions) = accepted_snapshot
+        && !sessions.is_live(
+            &connection.device_public_key,
+            connection.session_digest.as_deref(),
+        )
+    {
+        return Some((Observation::SessionEnded, 0));
+    }
+    if dropped_nodes.contains(connection.node_id.as_str()) {
+        return Some((Observation::NodeRemoved, 0));
+    }
+    None
+}
+
+/// TT-2250 (spec §B.10, §B.22 point 4): one `connection_ended` entry per connection that ended.
+async fn record_connection_ends(
+    ended: &[connection_events::EndedConnection],
+    audit_log: &AuditLog,
+) {
+    for connection in ended {
+        let event = AuditEvent::ConnectionEnded {
+            connection_id: connection.connection_id.clone(),
+            gateway_id: connection.gateway_id.clone(),
+            device_public_key: connection.device_public_key.clone(),
+            observation: connection.observation.as_str().to_string(),
+            report_id: connection.report_id.clone(),
+        };
+        if let Err(error) = audit_log.record(event).await {
+            error!(%error, "failed to write connection-ended audit entry");
+        }
+    }
+}
+
+/// TT-2250 (spec §B.22 point 4): with connection events, the `FlowsEnded` entry of an entitlement
+/// refresh carries the `report_id` of the connection's removal end instead of a gateway-end report's.
+/// A device with no open connection keeps the refresh's own id, as no event is sent for it.
+async fn record_flows_ended(
+    removals: &[gateway_end::GatewayEndReport],
+    ended: &[connection_events::EndedConnection],
+    new_bundles: &[PolicyBundle],
+    events: &connection_events::ConnectionEvents,
+    audit_log: &AuditLog,
+) {
+    for removal in removals {
+        let matched = ended
+            .iter()
+            .filter(|c| c.observation.is_removal())
+            .find(|c| {
+                c.gateway_id == removal.gateway_id
+                    && c.device_public_key == removal.device_public_key
+            })
+            .and_then(|c| c.report_id.clone());
+        // No open connection took this removal (its flow was admitted while the connection was
+        // still being opened): the notice still needs an end, so a notice-only one is queued.
+        let report_id = match matched {
+            Some(report_id) => report_id,
+            None => {
+                events.notice_only_end(
+                    &removal.gateway_id,
+                    &removal.device_public_key,
+                    &removal.user_id,
+                    // The whole gateway left the bundles (deleted, disabled, moved, blocked):
+                    // the Portal decides from that whether a notice is due (§B.22 point 7).
+                    if new_bundles
+                        .iter()
+                        .any(|b| b.gateway_id == removal.gateway_id)
+                    {
+                        connection_events::Observation::EntitlementRemoved
+                    } else {
+                        connection_events::Observation::GatewayRemoved
+                    },
+                    removal.flows_ended,
+                    removal.ended_at,
+                )
+            }
+        };
+        let event = AuditEvent::FlowsEnded {
+            gateway_id: removal.gateway_id.clone(),
+            user_id: removal.user_id.clone(),
+            device_public_key: removal.device_public_key.clone(),
+            flows_ended: removal.flows_ended,
+            report_id,
+        };
+        if let Err(error) = audit_log.record(event).await {
+            error!(%error, "failed to write flows-ended audit entry");
+        }
+    }
+}
+
 /// Returns the Connector's own control-channel address if this heartbeat carried one - `main`
 /// uses the very first successful heartbeat's value to create the TUN device (TT-1838), since
 /// nothing local can guess it anymore (Portal is the sole source of truth). `None` means Portal
@@ -478,6 +681,7 @@ async fn run_heartbeat(
     dns_cache: &dns_cache::DnsCache,
     admission_pollers: &mut AdmissionPollers,
     gateway_end_queue: &gateway_end::GatewayEndQueue,
+    connection_events: Option<ConnectionEventsTurn<'_>>,
 ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
     // Snapshotted before `policy_store.apply(response)` replaces it and before `response` is moved
     // (TT-1640): the entitlement lists this Connector had *before* this heartbeat, diffed after a
@@ -506,21 +710,48 @@ async fn run_heartbeat(
         .iter()
         .map(|report| report.report_id.clone())
         .collect();
+    // TT-2250 (spec §B.22 point 5): after an upgrade, gateway-end reports still queued go first, and
+    // this heartbeat carries no connection events until that old queue is empty.
+    let mut connection_batch = match &connection_events {
+        Some(turn) if turn.carry && ended_flows.is_empty() => {
+            Some(turn.events.batch(chrono::Utc::now().timestamp_millis()))
+        }
+        _ => None,
+    };
+    let mut request = dto::ConnectorHeartbeatRequest {
+        connector_public_key: connector_public_key.to_string(),
+        unresolved_endpoint_hosts,
+        ended_flows,
+        connection_events: Vec::new(),
+        connection_events_lost: connection_batch
+            .as_ref()
+            .and_then(|batch| batch.lost.clone()),
+    };
+    // TT-2250 review (spec §B.22 point 5): only the events that fit the Agent's body limit go;
+    // the rest stay queued for the next heartbeat, and only those sent get results applied.
+    if let Some(batch) = connection_batch.as_mut() {
+        let fitting = connection_events_within_body_limit(
+            &request,
+            &batch.events,
+            dto::HEARTBEAT_BODY_BUDGET_BYTES,
+        );
+        if fitting < batch.events.len() {
+            warn!(
+                sent = fitting,
+                held = batch.events.len() - fitting,
+                "connection events over the heartbeat body limit - the rest go on the next heartbeat"
+            );
+            batch.events.truncate(fitting);
+        }
+        request.connection_events = batch.events.clone();
+    }
 
     // TT-3770: this heartbeat's reply answers every off-schedule request made before it is sent, and
     // its snapshot counts for every admission that arrived before then.
     policy_store.live_sessions().clear_refresh_request();
     let requested_at = std::time::Instant::now();
     let response = agent_directory
-        .heartbeat(
-            registry_client,
-            heartbeat_client,
-            &dto::ConnectorHeartbeatRequest {
-                connector_public_key: connector_public_key.to_string(),
-                unresolved_endpoint_hosts,
-                ended_flows,
-            },
-        )
+        .heartbeat(registry_client, heartbeat_client, &request)
         .await?;
 
     // A verified response means Agent relayed the request to Portal, which processed it: the
@@ -528,6 +759,24 @@ async fn run_heartbeat(
     // report_id once, so a resend after a failed write here is harmless.
     if let Err(error) = gateway_end_queue.acknowledge(&sent_report_ids).await {
         warn!(%error, "failed to save the gateway-end report queue after delivery");
+    }
+    // TT-2250 (spec §B.22 point 6): only the Portal's result removes a connection event; a reply
+    // without results keeps every one, as `retry`.
+    if let (Some(turn), Some(batch)) = (&connection_events, &connection_batch) {
+        let results = response
+            .connection_event_results
+            .clone()
+            .unwrap_or_default();
+        let applied = turn.events.apply_results(batch, &results);
+        for report_id in applied.rejected {
+            warn!(%report_id, "Portal rejected a connection event - not sending it again");
+            if let Err(error) = audit_log
+                .record(AuditEvent::ConnectionEventRejected { report_id })
+                .await
+            {
+                error!(%error, "failed to write connection-event-rejected audit entry");
+            }
+        }
     }
 
     let connector_id = response.connector_id.clone();
@@ -590,9 +839,23 @@ async fn run_heartbeat(
         );
     }
 
-    dial_new_nodes(tunnel_manager, wg_socket, &node_list, flow_table).await;
+    let dropped_nodes = dial_new_nodes(tunnel_manager, wg_socket, &node_list, flow_table).await;
+    for (node_id, flows_ended) in dropped_nodes.iter().filter(|(_, ended)| *ended > 0) {
+        if let Err(error) = audit_log
+            .record(AuditEvent::FlowsEndedByNodeRemoval {
+                node_id: node_id.clone(),
+                flows_ended: *flows_ended,
+            })
+            .await
+        {
+            error!(%error, "failed to write node-removal flows-ended audit entry");
+        }
+    }
     // TT-2144: independent of WireGuard tunnel state - see admission_poller's module doc for why.
     admission_pollers.sync(&connector_id, &node_list);
+    let mut removal_flows: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    let mut removal_reports: Vec<gateway_end::GatewayEndReport> = Vec::new();
     if let Some(old_bundles) = old_bundles {
         let reports = reconcile_dropped_entitlements(
             flow_table,
@@ -600,7 +863,19 @@ async fn run_heartbeat(
             &new_bundles,
             chrono::Utc::now().timestamp_millis(),
         );
-        queue_gateway_end_reports(reports, audit_log, gateway_end_queue).await;
+        if connection_events.is_some() {
+            // TT-2250 (spec §B.22 point 5): the removal ends of the connection events are these
+            // reports now; they are queued below, as connections end.
+            for report in &reports {
+                removal_flows.insert(
+                    (report.gateway_id.clone(), report.device_public_key.clone()),
+                    report.flows_ended,
+                );
+            }
+            removal_reports = reports;
+        } else {
+            queue_gateway_end_reports(reports, audit_log, gateway_end_queue).await;
+        }
         for event in reconcile_gateway_address_changes(flow_table, &old_bundles, &new_bundles) {
             if let Err(error) = audit_log.record(event).await {
                 error!(%error, "failed to write address-change flows-ended audit entry");
@@ -623,6 +898,51 @@ async fn run_heartbeat(
     for event in reconcile_endpoint_changes(flow_table, &new_bundles) {
         if let Err(error) = audit_log.record(event).await {
             error!(%error, "failed to write rule-change flows-ended audit entry");
+        }
+    }
+    if let Some(turn) = &connection_events {
+        let snapshot_accepted = matches!(
+            snapshot_update,
+            live_sessions::SnapshotUpdate::Accepted { .. }
+        );
+        let dropped: std::collections::HashSet<&str> = dropped_nodes
+            .iter()
+            .map(|(node_id, _)| node_id.as_str())
+            .collect();
+        let ended =
+            turn.events
+                .end_connections(chrono::Utc::now().timestamp_millis(), |connection| {
+                    observe_connection_end(
+                        connection,
+                        &new_bundles,
+                        &removal_flows,
+                        snapshot_accepted.then_some(policy_store.live_sessions()),
+                        &dropped,
+                    )
+                });
+        record_flows_ended(
+            &removal_reports,
+            &ended,
+            &new_bundles,
+            turn.events,
+            audit_log,
+        )
+        .await;
+        record_connection_ends(&ended, audit_log).await;
+        let dropped_events = turn.events.take_unlogged_drops();
+        if dropped_events > 0 {
+            warn!(
+                dropped_events,
+                "connection events dropped unsent - counted as lost"
+            );
+            if let Err(error) = audit_log
+                .record(AuditEvent::ConnectionEventsDropped {
+                    count: dropped_events,
+                })
+                .await
+            {
+                error!(%error, "failed to write connection-events-dropped audit entry");
+            }
         }
     }
 
@@ -658,12 +978,51 @@ fn collect_endpoint_hosts(bundles: &[PolicyBundle]) -> Vec<String> {
 /// all. Deduplicated and sorted *before* the cache lookups (review finding #5) - the same
 /// unresolved host commonly appears on more than one gateway's endpoint list, and there is no
 /// reason to take `dns_cache`'s lock more than once per distinct host.
+///
+/// Capped at the first `MAX_UNRESOLVED_ENDPOINT_HOSTS` in that sorted order, as the Agent caps it
+/// (TT-2250 review, spec §B.22 point 5): the heartbeat's size budget counts on it.
 fn unresolved_hosts_in(bundles: &[PolicyBundle], dns_cache: &dns_cache::DnsCache) -> Vec<String> {
     let mut hosts = collect_endpoint_hosts(bundles);
+    // As the Agent cleans the list before its cap: no blank names, none over 255 characters.
+    hosts.retain(|host| {
+        !host.trim().is_empty() && host.len() <= dto::MAX_UNRESOLVED_ENDPOINT_HOST_LENGTH
+    });
     hosts.sort();
     hosts.dedup();
     hosts.retain(|host| dns_cache.resolve(host).is_none());
+    hosts.truncate(dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
     hosts
+}
+
+/// TT-2250 review (spec §B.22 point 5): how many of `events`, from the front, fit `request` within
+/// `budget` bytes once serialised - the whole request, unresolved hosts and lost report included.
+/// Without this, 200 events and a long host list could exceed the Agent's body limit, which refuses
+/// the whole heartbeat, its policy and snapshot refresh included, and the same batch would be sent
+/// again on every heartbeat. A prefix keeps the batch's order rules: every end stays right after
+/// its establishment and every follow-up after its first denial.
+fn connection_events_within_body_limit(
+    request: &dto::ConnectorHeartbeatRequest,
+    events: &[connection_events::ConnectionEvent],
+    budget: usize,
+) -> usize {
+    debug_assert!(request.connection_events.is_empty());
+    let Ok(base) = serde_json::to_vec(request) else {
+        return 0;
+    };
+    // `,"connection_events":[]` around the events, and a comma between two.
+    let mut size = base.len() + r#","connection_events":[]"#.len();
+    let mut fitting = 0;
+    for (index, event) in events.iter().enumerate() {
+        let Ok(bytes) = serde_json::to_vec(event) else {
+            break;
+        };
+        size += bytes.len() + usize::from(index > 0);
+        if size > budget {
+            break;
+        }
+        fitting += 1;
+    }
+    fitting
 }
 
 /// Tears down every already-admitted flow whose device dropped out of its gateway's entitlement
@@ -1001,7 +1360,7 @@ async fn dial_new_nodes(
     wg_socket: &UdpSocket,
     nodes: &[HeartbeatNode],
     flow_table: &std::sync::Mutex<FlowTable>,
-) {
+) -> Vec<(String, usize)> {
     let mut handshakes_to_send = Vec::new();
     let dropped = {
         let mut manager = tunnel_manager.lock().await;
@@ -1024,11 +1383,15 @@ async fn dial_new_nodes(
     // A node this Connector no longer has a tunnel for can't have its flows released cleanly by
     // Gatekeeper either - evict them here instead of leaving permanent ghost entries (TT-1732
     // review, Tasneem, TT-1847 finding #1).
+    // TT-2250: returned with the number of flows each eviction ended, for the local audit log and
+    // the connection events (spec §B.22 point 4).
+    let mut evicted = Vec::new();
     if !dropped.is_empty() {
         let mut table = flow_table.lock().expect("flow table lock poisoned");
         for node_id in &dropped {
             info!(%node_id, "node no longer present in heartbeat's node list - evicting its admitted flows");
-            table.evict_node(node_id);
+            let ended = table.evict_node(node_id);
+            evicted.push((node_id.clone(), ended));
         }
     }
 
@@ -1037,6 +1400,7 @@ async fn dial_new_nodes(
             error!(%error, %node_id, %addr, "failed to send WireGuard handshake initiation");
         }
     }
+    evicted
 }
 
 /// Decides what to do with one decrypted packet, and does the address rewrite in place if
@@ -1562,6 +1926,7 @@ mod tests {
                 )),
                 flow_table: Arc::new(std::sync::Mutex::new(FlowTable::new())),
                 recovered_packet_tx: tokio::sync::mpsc::unbounded_channel().0,
+                connection_events: None,
             },
         )
     }
@@ -2721,6 +3086,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -2793,6 +3159,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -2889,6 +3256,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -2934,6 +3302,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -3002,6 +3371,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -3071,6 +3441,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -3140,6 +3511,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -3225,6 +3597,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -3483,6 +3856,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await
         .unwrap();
@@ -3501,6 +3875,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await
         .unwrap();
@@ -3597,6 +3972,7 @@ mod tests {
                     &dns_cache,
                     &mut admission_pollers,
                     &gateway_end_queue,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -3660,6 +4036,268 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// TT-2250: a heartbeat reply that accepts every connection event the request carried.
+    fn accepting_heartbeat(
+        agent_identity: &crypto::KeyPair,
+        bundles_json: &'static str,
+    ) -> impl Fn(&wiremock::Request) -> ResponseTemplate + use<> {
+        let signing_key = agent_identity.signing_key.clone();
+        move |request: &wiremock::Request| {
+            let sent: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let results: serde_json::Map<String, serde_json::Value> = sent["connection_events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| {
+                    (
+                        e["report_id"].as_str().unwrap().to_string(),
+                        "accepted".into(),
+                    )
+                })
+                .collect();
+            let body = format!(
+                r#"{{"connector_id":"c-1","connector_public_key":"pk-1","generated_at":"2026-08-27T10:00:00Z","expires_at":"2099-01-01T00:00:00Z","nonce":"{}","policy_bundles":{bundles_json},"node_list":[],"connection_event_results":{}}}"#,
+                gateway_end::new_report_id(),
+                serde_json::Value::Object(results)
+            );
+            let signature = crypto::sign_to_base64(&signing_key, body.as_bytes());
+            ResponseTemplate::new(200)
+                .set_body_raw(body, "application/json")
+                .insert_header("X-Signature", signature.as_str())
+        }
+    }
+
+    /// TT-2250 (spec §B.22), end to end through run_heartbeat: an admitted connection is sent as
+    /// `established`; a revoke ends it with a removal end (flows_ended 1) instead of a gateway-end
+    /// report, the `FlowsEnded` entry names that end, and once accepted nothing is left queued. An
+    /// off-schedule heartbeat sends no connection events.
+    #[tokio::test]
+    async fn run_heartbeat_sends_connection_events_and_a_revoke_ends_the_connection() {
+        let agent_identity = crypto::generate_keypair();
+        let entitled = r#"[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-7","device_public_key":"dev-A"}]}]"#;
+        let revoked = r#"[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[]}]"#;
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(accepting_heartbeat(&agent_identity, entitled))
+            .up_to_n_times(2)
+            .mount(&agent_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(accepting_heartbeat(&agent_identity, revoked))
+            .mount(&agent_server)
+            .await;
+
+        let config = config(registry_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_server.uri()).await;
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let gateway_end_queue =
+            gateway_end::GatewayEndQueue::load(dir.path().join("pending-gateway-end-reports.json"))
+                .await;
+        let events =
+            connection_events::ConnectionEvents::load(dir.path().join("connection-events.json"))
+                .await;
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
+        let mut admission_pollers = admission_pollers();
+
+        macro_rules! heartbeat {
+            ($carry:expr) => {
+                run_heartbeat(
+                    "pk-1",
+                    &agent_directory,
+                    &registry_client,
+                    &heartbeat_client,
+                    &policy_store,
+                    &audit_log,
+                    &tunnel_manager,
+                    &wg_socket,
+                    &flow_table,
+                    &dns_cache,
+                    &mut admission_pollers,
+                    &gateway_end_queue,
+                    Some(ConnectionEventsTurn {
+                        events: &events,
+                        carry: $carry,
+                    }),
+                )
+                .await
+                .unwrap()
+            };
+        }
+
+        heartbeat!(true);
+        flow_table.lock().unwrap().admit(
+            "n-1".to_string(),
+            40001,
+            "gw-1".to_string(),
+            "flow-1".to_string(),
+            "dev-A".to_string(),
+            vec![],
+        );
+        events.flow_admitted(
+            "gw-1",
+            "dev-A",
+            None,
+            "u-7",
+            "n-1",
+            chrono::Utc::now().timestamp_millis(),
+        );
+
+        heartbeat!(false); // off schedule: carries nothing
+        heartbeat!(true); // carries the establishment (accepted), and the revoke ends the connection
+        assert!(
+            gateway_end_queue
+                .pending(chrono::Utc::now().timestamp_millis())
+                .await
+                .is_empty(),
+            "a Connector with connection events queues no gateway-end report"
+        );
+        heartbeat!(true); // carries the removal end (accepted)
+
+        let requests = agent_server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert!(
+            bodies[1].get("connection_events").is_none(),
+            "off schedule sends none"
+        );
+        assert_eq!(bodies[2]["connection_events"][0]["kind"], "established");
+        let end = &bodies[3]["connection_events"][0];
+        assert_eq!(end["kind"], "ended");
+        assert_eq!(end["observation"], "entitlement_removed");
+        assert_eq!(end["flows_ended"], 1);
+        assert!(bodies.iter().all(|b| b.get("ended_flows").is_none()));
+
+        let audit = read_audit_lines(&dir);
+        let flows_ended: Vec<_> = audit
+            .iter()
+            .filter(|e| e["event"] == "flows_ended")
+            .collect();
+        assert_eq!(flows_ended.len(), 1);
+        assert_eq!(flows_ended[0]["report_id"], end["report_id"]);
+        assert!(audit.iter().any(|e| e["event"] == "connection_ended"));
+
+        assert!(
+            events.batch(i64::MAX / 2).events.is_empty(),
+            "every event was accepted"
+        );
+    }
+
+    /// TT-2250 (spec §B.22 point 5): after an upgrade, gateway-end reports still queued go first and
+    /// the heartbeat carries no connection events until that queue is empty.
+    #[tokio::test]
+    async fn run_heartbeat_drains_old_gateway_end_reports_before_connection_events() {
+        let agent_identity = crypto::generate_keypair();
+        let entitled = r#"[{"gateway_id":"gw-1","location":"Amsterdam","hostname":"crm.example.com","access_mode":"SELECTED_USERS","endpoints":[],"entitlement_list":[{"user_id":"u-7","device_public_key":"dev-A"}]}]"#;
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/agents/10.0.0.5/permitted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ip_address": "10.0.0.5",
+                "permitted_key": agent_identity.public_key_hex
+            })))
+            .mount(&registry_server)
+            .await;
+        let agent_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connectors/heartbeat"))
+            .respond_with(accepting_heartbeat(&agent_identity, entitled))
+            .mount(&agent_server)
+            .await;
+        let config = config(registry_server.uri());
+        let http = reqwest::Client::new();
+        let registry_client = RegistryClient::new(http.clone(), config.registry_base_url.clone());
+        let heartbeat_client = HeartbeatClient::new(http);
+        let (agent_directory, _agents_json) = test_agent_directory(agent_server.uri()).await;
+        let policy_store = PolicyStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let gateway_end_queue =
+            gateway_end::GatewayEndQueue::load(dir.path().join("pending-gateway-end-reports.json"))
+                .await;
+        gateway_end_queue
+            .enqueue(vec![gateway_end::GatewayEndReport {
+                report_id: gateway_end::new_report_id(),
+                gateway_id: "gw-1".to_string(),
+                user_id: "u-7".to_string(),
+                device_public_key: "dev-B".to_string(),
+                ended_at: chrono::Utc::now().timestamp_millis(),
+                flows_ended: 1,
+            }])
+            .await
+            .unwrap();
+        let events =
+            connection_events::ConnectionEvents::load(dir.path().join("connection-events.json"))
+                .await;
+        events.flow_admitted(
+            "gw-1",
+            "dev-A",
+            None,
+            "u-7",
+            "n-1",
+            chrono::Utc::now().timestamp_millis(),
+        );
+        let tunnel_manager = Mutex::new(TunnelManager::new(
+            boringtun::x25519::StaticSecret::random_from_rng(rand_core::OsRng),
+        ));
+        let wg_socket = wg_socket().await;
+        let flow_table = std::sync::Mutex::new(FlowTable::new());
+        let dns_cache = dns_cache::DnsCache::new();
+        let mut admission_pollers = admission_pollers();
+        for _ in 0..2 {
+            run_heartbeat(
+                "pk-1",
+                &agent_directory,
+                &registry_client,
+                &heartbeat_client,
+                &policy_store,
+                &audit_log,
+                &tunnel_manager,
+                &wg_socket,
+                &flow_table,
+                &dns_cache,
+                &mut admission_pollers,
+                &gateway_end_queue,
+                Some(ConnectionEventsTurn {
+                    events: &events,
+                    carry: true,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let requests = agent_server.received_requests().await.unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(first["ended_flows"].as_array().unwrap().len(), 1);
+        assert!(first.get("connection_events").is_none());
+        assert!(second.get("ended_flows").is_none());
+        assert_eq!(second["connection_events"][0]["kind"], "established");
     }
 
     /// A heartbeat that fails must not drop the reports it was carrying - they go out again on
@@ -3726,6 +4364,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &gateway_end_queue,
+            None,
         )
         .await;
 
@@ -3776,6 +4415,8 @@ mod tests {
                 connector_public_key: "pk-1".to_string(),
                 unresolved_endpoint_hosts: None,
                 ended_flows: vec![],
+                connection_events: Vec::new(),
+                connection_events_lost: None,
             }))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -3794,6 +4435,8 @@ mod tests {
                 connector_public_key: "pk-1".to_string(),
                 unresolved_endpoint_hosts: Some(vec!["erp.internal.example.com".to_string()]),
                 ended_flows: vec![],
+                connection_events: Vec::new(),
+                connection_events_lost: None,
             }))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -3835,6 +4478,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await
         .unwrap();
@@ -3852,6 +4496,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -4626,6 +5271,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await
         .unwrap();
@@ -4661,6 +5307,7 @@ mod tests {
             &dns_cache,
             &mut admission_pollers,
             &test_gateway_end_queue(),
+            None,
         )
         .await;
 
@@ -4757,6 +5404,7 @@ mod tests {
                 &dns_cache,
                 &mut admission_pollers,
                 &gateway_end_queue,
+                None,
             )
             .await
             .unwrap();
@@ -4964,6 +5612,7 @@ mod tests {
                 &dns_cache,
                 &mut admission_pollers,
                 &gateway_end_queue,
+                None,
             )
             .await
             .unwrap();
@@ -5046,5 +5695,229 @@ mod tests {
         assert_eq!(gw_1_applied.len(), 3, "heartbeats 1, 2 and 4 changed it");
         assert!(gw_1_applied[0].get("gateway_address").is_none());
         assert_eq!(gw_1_applied[2]["gateway_address"], "100.64.5.11");
+    }
+
+    /// TT-2250 review (spec §B.22 point 5): the list is capped at the Agent's 500 names, the first
+    /// in sorted order after deduplication.
+    #[test]
+    fn unresolved_endpoint_hosts_are_capped_at_the_agents_limit_in_sorted_order() {
+        let hosts: Vec<String> = (0..dto::MAX_UNRESOLVED_ENDPOINT_HOSTS + 100)
+            .rev()
+            .map(|i| format!("host-{i:04}.internal.example.com"))
+            .collect();
+        let host_refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
+        let bundles = vec![
+            bundle_with_endpoints("gw-1", &host_refs),
+            bundle_with_endpoints("gw-2", &host_refs),
+        ];
+        let unresolved = unresolved_hosts_in(&bundles, &dns_cache::DnsCache::new());
+        assert_eq!(unresolved.len(), dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
+        assert_eq!(unresolved[0], "host-0000.internal.example.com");
+        assert_eq!(
+            unresolved.last().unwrap(),
+            &format!(
+                "host-{:04}.internal.example.com",
+                dto::MAX_UNRESOLVED_ENDPOINT_HOSTS - 1
+            )
+        );
+        assert!(unresolved.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn blank_and_overlong_host_names_are_dropped_before_the_cap_as_the_agent_does() {
+        let too_long = format!("{}.example.com", "a".repeat(250));
+        let bundles = vec![bundle_with_endpoints(
+            "gw-1",
+            &["  ", too_long.as_str(), "erp.internal.example.com"],
+        )];
+        assert_eq!(
+            unresolved_hosts_in(&bundles, &dns_cache::DnsCache::new()),
+            vec!["erp.internal.example.com".to_string()]
+        );
+    }
+
+    fn heartbeat_request_with_hosts(count: usize) -> dto::ConnectorHeartbeatRequest {
+        dto::ConnectorHeartbeatRequest {
+            connector_public_key: "pk-1".to_string(),
+            // The longest names the Agent accepts (255 characters).
+            unresolved_endpoint_hosts: Some(
+                (0..count)
+                    .map(|i| format!("{i:05}{}", "h".repeat(250)))
+                    .collect(),
+            ),
+            ended_flows: Vec::new(),
+            connection_events: Vec::new(),
+            connection_events_lost: Some(connection_events::LostReport {
+                report_id: gateway_end::new_report_id(),
+                count: 7,
+                first_at: 1,
+                last_at: 2,
+            }),
+        }
+    }
+
+    fn queued_establishments(
+        count: usize,
+        key_len: usize,
+    ) -> Vec<connection_events::ConnectionEvent> {
+        let mut state = connection_events::State::default();
+        for i in 0..count {
+            state.flow_admitted(
+                "0b0c6f1e-5d1a-4c55-9a39-6f3b2a7d9e10",
+                &format!("{i:05}{}", "k".repeat(key_len)),
+                Some(&live_sessions::token_digest("token")),
+                "6c1b8f7e-2a3d-4e5f-8a9b-0c1d2e3f4a5b",
+                "node-1",
+                1_700_000_000_000,
+            );
+        }
+        state.batch(1_700_000_000_001).events
+    }
+
+    /// TT-2250 review (spec §B.22 point 5): with the longest host list, 200 ordinary connection
+    /// events fit the Agent's body limit, as the spec sizes it.
+    #[test]
+    fn a_full_batch_fits_beside_the_longest_unresolved_host_list() {
+        let mut request = heartbeat_request_with_hosts(dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
+        let events = queued_establishments(connection_events::MAX_PER_HEARTBEAT, 44);
+        assert_eq!(events.len(), connection_events::MAX_PER_HEARTBEAT);
+        let fitting = connection_events_within_body_limit(
+            &request,
+            &events,
+            dto::HEARTBEAT_BODY_BUDGET_BYTES,
+        );
+        assert_eq!(fitting, events.len());
+        request.connection_events = events;
+        assert!(serde_json::to_vec(&request).unwrap().len() <= dto::HEARTBEAT_BODY_BUDGET_BYTES);
+    }
+
+    /// TT-2250 review: events that would take the request over the limit stay queued; the request
+    /// sent, lost report included, stays under it.
+    #[test]
+    fn connection_events_over_the_body_limit_are_held_for_the_next_heartbeat() {
+        let mut request = heartbeat_request_with_hosts(dto::MAX_UNRESOLVED_ENDPOINT_HOSTS);
+        // Unusually long keys: 200 of these would not fit.
+        let events = queued_establishments(connection_events::MAX_PER_HEARTBEAT, 1_000);
+        let fitting = connection_events_within_body_limit(
+            &request,
+            &events,
+            dto::HEARTBEAT_BODY_BUDGET_BYTES,
+        );
+        assert!(fitting > 0 && fitting < events.len(), "{fitting}");
+        request.connection_events = events[..fitting].to_vec();
+        let size = serde_json::to_vec(&request).unwrap().len();
+        assert!(size <= dto::HEARTBEAT_BODY_BUDGET_BYTES, "{size}");
+        request.connection_events = events[..=fitting].to_vec();
+        assert!(
+            serde_json::to_vec(&request).unwrap().len() > dto::HEARTBEAT_BODY_BUDGET_BYTES,
+            "the count is exact: one more does not fit"
+        );
+    }
+
+    fn open_connection(node_id: &str, digest: Option<&str>) -> connection_events::OpenConnection {
+        let mut state = connection_events::State::default();
+        state.flow_admitted("gw-1", "dev-A", digest, "u-1", node_id, 1);
+        state.open_connections()[0].clone()
+    }
+
+    fn snapshot(digests: &[&str]) -> live_sessions::LiveSessions {
+        let sessions = live_sessions::LiveSessions::new(Default::default());
+        sessions.update(
+            Some(true),
+            Some(std::collections::HashMap::from([(
+                "dev-A".to_string(),
+                digests.iter().map(ToString::to_string).collect(),
+            )])),
+            std::time::Instant::now(),
+        );
+        sessions
+    }
+
+    /// TT-2250 review (spec §B.22 point 2): `session_ended` when the accepted snapshot no longer
+    /// holds the connection's session; nothing while it does, or when no snapshot was accepted.
+    #[test]
+    fn a_connection_whose_session_left_the_snapshot_ends_as_session_ended() {
+        use connection_events::Observation;
+        let connection = open_connection("n-1", Some("d1"));
+        let bundles = vec![bundle("gw-1", &["dev-A"])];
+        let no_removals = std::collections::HashMap::new();
+        let no_drops = std::collections::HashSet::new();
+        let live = snapshot(&["d1"]);
+        let gone = snapshot(&["d2"]);
+        assert_eq!(
+            observe_connection_end(&connection, &bundles, &no_removals, Some(&live), &no_drops),
+            None
+        );
+        assert_eq!(
+            observe_connection_end(&connection, &bundles, &no_removals, None, &no_drops),
+            None,
+            "no snapshot accepted this heartbeat"
+        );
+        assert_eq!(
+            observe_connection_end(&connection, &bundles, &no_removals, Some(&gone), &no_drops),
+            Some((Observation::SessionEnded, 0))
+        );
+    }
+
+    /// TT-2250 review (spec §B.22 point 2): `node_removed` when the node of the connection's last
+    /// admitted flow left the node list; another node leaving ends nothing.
+    #[test]
+    fn a_connection_whose_node_left_the_node_list_ends_as_node_removed() {
+        use connection_events::Observation;
+        let connection = open_connection("n-1", Some("d1"));
+        let bundles = vec![bundle("gw-1", &["dev-A"])];
+        let no_removals = std::collections::HashMap::new();
+        let live = snapshot(&["d1"]);
+        assert_eq!(
+            observe_connection_end(
+                &connection,
+                &bundles,
+                &no_removals,
+                Some(&live),
+                &std::collections::HashSet::from(["n-2"])
+            ),
+            None
+        );
+        assert_eq!(
+            observe_connection_end(
+                &connection,
+                &bundles,
+                &no_removals,
+                Some(&live),
+                &std::collections::HashSet::from(["n-1"])
+            ),
+            Some((Observation::NodeRemoved, 0))
+        );
+    }
+
+    /// TT-2250 review (spec §B.22 point 2): when one heartbeat gives a connection several
+    /// observations, the first of gateway_removed > entitlement_removed > session_ended >
+    /// node_removed counts; a removal carries the flows the refresh ended.
+    #[test]
+    fn the_first_observation_in_the_specs_order_counts() {
+        use connection_events::Observation;
+        let connection = open_connection("n-1", Some("d1"));
+        let removals =
+            std::collections::HashMap::from([(("gw-1".to_string(), "dev-A".to_string()), 3)]);
+        let gone = snapshot(&["d2"]);
+        let node_gone = std::collections::HashSet::from(["n-1"]);
+        let observe = |bundles: &[PolicyBundle]| {
+            observe_connection_end(&connection, bundles, &removals, Some(&gone), &node_gone)
+        };
+        assert_eq!(
+            observe(&[bundle("gw-2", &["dev-A"])]),
+            Some((Observation::GatewayRemoved, 3)),
+            "all four apply"
+        );
+        assert_eq!(
+            observe(&[bundle("gw-1", &["dev-B"])]),
+            Some((Observation::EntitlementRemoved, 3)),
+            "all but the gateway removal apply"
+        );
+        assert_eq!(
+            observe(&[bundle("gw-1", &["dev-A"])]),
+            Some((Observation::SessionEnded, 0)),
+            "session and node apply"
+        );
     }
 }

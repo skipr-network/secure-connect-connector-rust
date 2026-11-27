@@ -10,7 +10,7 @@
 //! event). A report that still hasn't been delivered after the 24-hour serving window is dropped
 //! unsent - the event could no longer be shown by then anyway.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -144,27 +144,10 @@ impl GatewayEndQueue {
     }
 }
 
-/// Writes to a temporary file and renames it over the queue file, so a crash mid-write never
-/// leaves a truncated queue behind.
+/// Writes the queue whole through the shared atomic writer (TT-2250 review: one writer for both
+/// state files, `state_file`).
 async fn persist(path: &Path, reports: &[GatewayEndReport]) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::create_dir_all(parent).await.with_context(|| {
-            format!(
-                "failed to create the gateway-end queue directory: {}",
-                parent.display()
-            )
-        })?;
-    }
-    let bytes =
-        serde_json::to_vec(reports).context("failed to serialize the gateway-end report queue")?;
-    let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, bytes)
-        .await
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .with_context(|| format!("failed to replace {}", path.display()))?;
-    Ok(())
+    crate::state_file::write_json(path, reports, "gateway-end report queue").await
 }
 
 #[cfg(test)]

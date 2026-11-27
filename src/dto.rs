@@ -7,6 +7,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The Agent refuses a heartbeat body larger than this (`ConnectorHeartbeatBodySizeFilter`,
+/// 256 KiB) - the whole heartbeat, policy and live-session refresh included (spec §B.22 point 5).
+pub const AGENT_HEARTBEAT_BODY_LIMIT_BYTES: usize = 256 * 1024;
+/// What the Connector lets a heartbeat body reach: the Agent's limit less a margin, so a request
+/// sized here stays clear of it (TT-2250 review).
+pub const HEARTBEAT_BODY_BUDGET_BYTES: usize = AGENT_HEARTBEAT_BODY_LIMIT_BYTES - 16 * 1024;
+/// The most `unresolved_endpoint_hosts` one heartbeat carries - the Agent's own cap
+/// (`MAX_UNRESOLVED_ENDPOINT_HOSTS`), which the heartbeat's size budget counts on (spec §B.22
+/// point 5).
+pub const MAX_UNRESOLVED_ENDPOINT_HOSTS: usize = 500;
+/// The longest unresolved host name the Agent keeps (a DNS name is at most 255 characters).
+pub const MAX_UNRESOLVED_ENDPOINT_HOST_LENGTH: usize = 255;
+
 /// The heartbeat request body (TT-2069) - previously an empty `POST`, now carrying this
 /// Connector's own identity and observed state back to Agent/Portal. Unsigned, same as the rest of
 /// this request: the endpoint has never had per-request authentication (see `heartbeat`'s module
@@ -43,6 +56,14 @@ pub struct ConnectorHeartbeatRequest {
     /// what it was before this field existed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ended_flows: Vec<crate::gateway_end::GatewayEndReport>,
+    /// TT-2250 (spec §B.22 point 5): the Private Gateway connection events of this heartbeat, in
+    /// the order `connection_events::State::batch` chose. Omitted when empty, like `ended_flows`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connection_events: Vec<crate::connection_events::ConnectionEvent>,
+    /// TT-2250: the frozen count of connection events this Connector had to drop, until the
+    /// Portal answers it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_events_lost: Option<crate::connection_events::LostReport>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -72,6 +93,11 @@ pub struct ConnectorHeartbeatResponse {
     /// entitlement lists; see `live_sessions`. `None` when the reply carries none.
     #[serde(default)]
     pub live_sessions: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// TT-2250 (spec §B.22 point 6): the Portal's result per connection event `report_id`
+    /// (`accepted`, `rejected` or `retry`), inside the signed body. `None` from an Agent or Portal
+    /// that predates it: every report sent is then kept, as on `retry`.
+    #[serde(default, deserialize_with = "lenient_results")]
+    pub connection_event_results: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -296,6 +322,28 @@ pub struct AgentPermittedKeyResponse {
     pub x25519_public_key: Option<String>,
 }
 
+/// TT-2250: a `connection_event_results` of any other shape than an object of strings is read as
+/// absent (every report is kept, as on `retry`) and logged, instead of failing the whole signed reply
+/// and with it the policy refresh.
+fn lenient_results<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::collections::HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match serde_json::from_value(value) {
+        Ok(results) => Ok(Some(results)),
+        Err(error) => {
+            tracing::warn!(%error, "connection_event_results has an unexpected shape - every connection event is kept");
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +354,8 @@ mod tests {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: Some(vec!["crm.internal.example.com".to_string()]),
             ended_flows: vec![],
+            connection_events: Vec::new(),
+            connection_events_lost: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -325,6 +375,8 @@ mod tests {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: Some(vec![]),
             ended_flows: vec![],
+            connection_events: Vec::new(),
+            connection_events_lost: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -341,11 +393,32 @@ mod tests {
             connector_public_key: "pk-1".to_string(),
             unresolved_endpoint_hosts: None,
             ended_flows: vec![],
+            connection_events: Vec::new(),
+            connection_events_lost: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
 
         assert_eq!(json, r#"{"connector_public_key":"pk-1"}"#);
+    }
+
+    /// TT-2250: an unexpected shape of the results does not fail the reply; it reads as absent.
+    #[test]
+    fn connection_event_results_of_another_shape_read_as_absent() {
+        let base = r#"{"connector_id":"c","connector_virtual_ip":null,"generated_at":"g","expires_at":"e","nonce":"n","policy_bundles":[],"node_list":[]"#;
+        let good: ConnectorHeartbeatResponse = serde_json::from_str(&format!(
+            r#"{base},"connection_event_results":{{"r-1":"accepted"}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(good.connection_event_results.unwrap()["r-1"], "accepted");
+        let odd: ConnectorHeartbeatResponse = serde_json::from_str(&format!(
+            r#"{base},"connection_event_results":[{{"report_id":"r-1","result":"accepted"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(odd.connection_event_results, None);
+        let missing: ConnectorHeartbeatResponse =
+            serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert_eq!(missing.connection_event_results, None);
     }
 
     /// TT-2464: the field names Agent relays and Portal reads (spec §B.18 point 1).
@@ -362,6 +435,8 @@ mod tests {
                 ended_at: 1_234,
                 flows_ended: 2,
             }],
+            connection_events: Vec::new(),
+            connection_events_lost: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -380,6 +455,8 @@ mod tests {
                 connector_public_key: String::new(),
                 unresolved_endpoint_hosts: None,
                 ended_flows: vec![],
+                connection_events: Vec::new(),
+                connection_events_lost: None,
             }
         );
     }

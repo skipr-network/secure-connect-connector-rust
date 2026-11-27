@@ -139,6 +139,9 @@ pub struct ControlPlaneState {
     /// this from an `unbounded_channel()` and just drop the receiver half - sending into a channel
     /// with no live receiver is a harmless no-op error this code ignores.
     pub recovered_packet_tx: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
+    /// TT-2250 (spec §B.22): where admissions record connections and denials. `None` in tests that
+    /// do not exercise connection events.
+    pub connection_events: Option<Arc<crate::connection_events::ConnectionEvents>>,
 }
 
 /// What `authenticate_and_decide` resolves to - shared between flow admission and DNS admission,
@@ -148,6 +151,8 @@ pub struct ControlPlaneState {
 enum AdmissionOutcome {
     Allowed {
         device_public_key: String,
+        /// TT-2250: from the matched entitlement row, never from the caller.
+        user_id: String,
         rules: Vec<PortRule>,
         /// TT-3770: the digest of the session token the signed data carried, if any.
         session_digest: Option<String>,
@@ -297,6 +302,7 @@ async fn authenticate_and_decide(
     signed_data: Option<String>,
     kind: AdmissionKind,
     slot: &mut Option<AdmissionSlot>,
+    events: Option<&crate::connection_events::ConnectionEvents>,
 ) -> AdmissionOutcome {
     let arrived = std::time::Instant::now();
     // TT-2145: a null signature triple is a normal, anticipated input (spec
@@ -385,9 +391,11 @@ async fn authenticate_and_decide(
     // the current entitlement list for the named gateway_id specifically -
     // this only removes a same-Connector restriction the spec never called
     // for.
+    // TT-3770: the session the signed data was made for; TT-2250 reports it with a denial too.
+    let session_digest = live_sessions::session_digest(&signed_message);
     let decision = decide_access(policy_store, gateway_id, &user_public_key);
-    let rules = match &decision {
-        AccessDecision::Allowed { rules, .. } => rules.clone(),
+    let (rules, user_id) = match &decision {
+        AccessDecision::Allowed { rules, user_id } => (rules.clone(), user_id.clone()),
         AccessDecision::Refused(reason) => {
             let reason = *reason;
             record_access_decision(
@@ -398,6 +406,13 @@ async fn authenticate_and_decide(
                 Some(reason.as_audit_str()),
             )
             .await;
+            record_denial(
+                events,
+                gateway_id,
+                &user_public_key,
+                session_digest.as_deref(),
+                reason.as_audit_str(),
+            );
             return AdmissionOutcome::Refused(reason.as_wire_str());
         }
     };
@@ -405,7 +420,6 @@ async fn authenticate_and_decide(
     // TT-3770 (spec §B.9 point 1): with the Zero Trust module on, the proof counts only while the
     // lease of the session it was signed for lives. Checked after the entitlement, so an unknown
     // digest only ever costs a heartbeat for a key that is entitled; audited once decided.
-    let session_digest = live_sessions::session_digest(&signed_message);
     let lease = lease_decision(
         policy_store,
         &user_public_key,
@@ -426,6 +440,7 @@ async fn authenticate_and_decide(
             record_access_decision(audit_log, gateway_id, &user_public_key, &decision, None).await;
             AdmissionOutcome::Allowed {
                 device_public_key: user_public_key,
+                user_id,
                 rules,
                 session_digest,
             }
@@ -439,9 +454,37 @@ async fn authenticate_and_decide(
                 Some(reason),
             )
             .await;
+            record_denial(
+                events,
+                gateway_id,
+                &user_public_key,
+                session_digest.as_deref(),
+                reason,
+            );
             AdmissionOutcome::Refused(lease_wire_reason(reason))
         }
         LeaseOutcome::Undecided(reason) => AdmissionOutcome::Undecided(reason),
+    }
+}
+
+/// TT-2250 (spec §B.22 point 3): an entitlement or lease refusal becomes a denied connection event.
+/// A signature refusal never reaches here: its key is unproven. Memory only (TT-2514): the
+/// refusal's reply never waits for the disk; the state's background writer saves it.
+fn record_denial(
+    events: Option<&crate::connection_events::ConnectionEvents>,
+    gateway_id: &str,
+    device_public_key: &str,
+    session_digest: Option<&str>,
+    reason: &str,
+) {
+    if let Some(events) = events {
+        events.denied(
+            gateway_id,
+            device_public_key,
+            session_digest,
+            reason,
+            chrono::Utc::now().timestamp_millis(),
+        );
     }
 }
 
@@ -456,7 +499,15 @@ pub(crate) async fn handle_flow_admission(
     flow_table: &Mutex<FlowTable>,
     request: FlowAdmissionRequest,
 ) -> FlowAdmissionResponse {
-    handle_flow_admission_in_slot(policy_store, audit_log, flow_table, request, &mut None).await
+    handle_flow_admission_in_slot(
+        policy_store,
+        audit_log,
+        flow_table,
+        request,
+        &mut None,
+        None,
+    )
+    .await
 }
 
 /// `handle_flow_admission`, holding the node's admission `slot` (`admission_poller`), which it drops
@@ -467,6 +518,7 @@ pub(crate) async fn handle_flow_admission_in_slot(
     flow_table: &Mutex<FlowTable>,
     request: FlowAdmissionRequest,
     slot: &mut Option<AdmissionSlot>,
+    events: Option<&crate::connection_events::ConnectionEvents>,
 ) -> FlowAdmissionResponse {
     let dialled = request.dialled();
     let outcome = authenticate_and_decide(
@@ -478,12 +530,14 @@ pub(crate) async fn handle_flow_admission_in_slot(
         request.signed_data,
         AdmissionKind::Flow,
         slot,
+        events,
     )
     .await;
 
     match outcome {
         AdmissionOutcome::Allowed {
             device_public_key,
+            user_id,
             rules,
             session_digest,
         } => {
@@ -504,6 +558,7 @@ pub(crate) async fn handle_flow_admission_in_slot(
             // The lock is scoped to this block: its guard must not be held across an await.
             // TT-2514: the rule this flow's packets will be forwarded by, named in the log below.
             let admitted_device_key = device_public_key.clone();
+            let admitted_session = session_digest.clone();
             let (recorded, rule) = {
                 let mut table = flow_table.lock().expect("flow table lock poisoned");
                 // TT-2514 review: a heartbeat may have changed the gateway's rules since they were
@@ -581,9 +636,44 @@ pub(crate) async fn handle_flow_admission_in_slot(
                     }
                 });
             }
+            // TT-2250 (spec §B.22 point 1): the first flow of a connection entered in the table
+            // establishes it. Memory only (TT-2514): the state's background writer saves it.
+            if let Some(events) = events
+                && matches!(
+                    recorded,
+                    Recorded::Admitted | Recorded::AdmittedWithoutDialledIdentity
+                )
+                && let Some(connection_id) = events.flow_admitted(
+                    &request.gateway_id,
+                    &admitted_device_key,
+                    admitted_session.as_deref(),
+                    &user_id,
+                    &request.node_id,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            {
+                let audit_log = audit_log.clone();
+                let event = AuditEvent::ConnectionEstablished {
+                    connection_id,
+                    gateway_id: request.gateway_id.clone(),
+                    device_public_key: admitted_device_key.clone(),
+                };
+                tokio::spawn(async move {
+                    if let Err(error) = audit_log.record(event).await {
+                        tracing::error!(%error, "failed to write connection-established audit entry");
+                    }
+                });
+            }
             match recorded {
                 Recorded::SessionEnded => {
                     tracing::info!(flow_id = %request.flow_id, "the flow's session ended while it was being admitted - not admitting it");
+                    record_denial(
+                        events,
+                        &request.gateway_id,
+                        &admitted_device_key,
+                        admitted_session.as_deref(),
+                        live_sessions::REASON_NOT_IN_SNAPSHOT,
+                    );
                     let audit_log = audit_log.clone();
                     let event = AuditEvent::AccessRefused {
                         gateway_id: request.gateway_id.clone(),
@@ -662,7 +752,7 @@ pub(crate) async fn handle_dns_admission(
     audit_log: &AuditLog,
     request: DnsAdmissionRequest,
 ) -> Option<DnsAdmissionResponse> {
-    handle_dns_admission_in_slot(policy_store, audit_log, request, &mut None).await
+    handle_dns_admission_in_slot(policy_store, audit_log, request, &mut None, None).await
 }
 
 /// `handle_dns_admission` holding the node's admission `slot`, which it gives back while it waits
@@ -672,6 +762,7 @@ pub(crate) async fn handle_dns_admission_in_slot(
     audit_log: &AuditLog,
     request: DnsAdmissionRequest,
     slot: &mut Option<AdmissionSlot>,
+    events: Option<&crate::connection_events::ConnectionEvents>,
 ) -> Option<DnsAdmissionResponse> {
     let outcome = authenticate_and_decide(
         policy_store,
@@ -682,6 +773,7 @@ pub(crate) async fn handle_dns_admission_in_slot(
         request.signed_data,
         AdmissionKind::Dns,
         slot,
+        events,
     )
     .await;
 
@@ -764,6 +856,7 @@ mod tests {
                 node_list: vec![],
                 zero_trust_enabled: None,
                 live_sessions: None,
+                connection_event_results: None,
             })
             .unwrap();
         store
@@ -1148,6 +1241,7 @@ mod tests {
                 node_list: vec![],
                 zero_trust_enabled: None,
                 live_sessions: None,
+                connection_event_results: None,
             })
             .unwrap();
         let audit_log = AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
@@ -1643,6 +1737,7 @@ mod tests {
                         digests.to_vec(),
                     )])
                 }),
+                connection_event_results: None,
             })
             .unwrap();
     }
@@ -2043,6 +2138,7 @@ mod tests {
                     &flow_table(),
                     request,
                     &mut slot,
+                    None,
                 )
                 .await;
                 (response, semaphore.available_permits())
@@ -2084,7 +2180,8 @@ mod tests {
                     AuditLog::new(tempfile::tempdir().unwrap().path().join("audit.log"));
                 let mut slot = Some(AdmissionSlot::new(semaphore.clone(), permit));
                 let response =
-                    handle_dns_admission_in_slot(&store, &audit_log, request, &mut slot).await;
+                    handle_dns_admission_in_slot(&store, &audit_log, request, &mut slot, None)
+                        .await;
                 (response, semaphore.available_permits())
             })
         };
@@ -2129,6 +2226,204 @@ mod tests {
             node_list: vec![],
             zero_trust_enabled: Some(true),
             live_sessions: None,
+            connection_event_results: None,
         }
+    }
+
+    async fn connection_events(
+        dir: &std::path::Path,
+    ) -> crate::connection_events::ConnectionEvents {
+        crate::connection_events::ConnectionEvents::load(dir.join("connection-events.json")).await
+    }
+
+    /// The connection events the next heartbeat would carry.
+    fn queued(
+        events: &crate::connection_events::ConnectionEvents,
+    ) -> Vec<crate::connection_events::ConnectionEvent> {
+        events.batch(chrono::Utc::now().timestamp_millis()).events
+    }
+
+    /// TT-2250 review (spec §B.22 points 1 and 4): an admitted flow entered in the table establishes
+    /// the connection, with the user from the entitlement row and the flow's node; a second flow of
+    /// it adds nothing.
+    #[tokio::test]
+    async fn an_admitted_flow_establishes_its_connection_once() {
+        use crate::connection_events::Kind;
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let events = connection_events(dir.path()).await;
+        let table = flow_table();
+        for flow_id in ["flow-1", "flow-2"] {
+            let request = FlowAdmissionRequest {
+                flow_id: flow_id.to_string(),
+                ..admission_request(
+                    "gw-1",
+                    &device.signing_key,
+                    &device.public_key_hex,
+                    "session-nonce-1",
+                )
+            };
+            let response = handle_flow_admission_in_slot(
+                &store,
+                &audit_log,
+                &table,
+                request,
+                &mut None,
+                Some(&events),
+            )
+            .await;
+            assert_eq!(response.decision, "admit");
+        }
+
+        let queued = queued(&events);
+        assert_eq!(queued.len(), 1, "one connection, however many flows");
+        assert_eq!(queued[0].kind, Kind::Established);
+        assert_eq!(queued[0].gateway_id, "gw-1");
+        assert_eq!(queued[0].device_public_key, device.public_key_hex);
+        assert_eq!(queued[0].user_id.as_deref(), Some("u-1"));
+        assert!(queued[0].connection_id.is_some());
+    }
+
+    /// TT-2250 review (spec §B.22 point 1): a DNS admission establishes no connection.
+    #[tokio::test]
+    async fn an_admitted_dns_request_establishes_no_connection() {
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let events = connection_events(dir.path()).await;
+        let request = dns_admission_request(
+            "gw-1",
+            "app.internal",
+            &device.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        let response =
+            handle_dns_admission_in_slot(&store, &audit_log, request, &mut None, Some(&events))
+                .await;
+
+        assert_eq!(response.unwrap().decision, "admit");
+        assert!(queued(&events).is_empty());
+    }
+
+    /// TT-2250 review (spec §B.22 points 3 and 4): an entitlement refusal of a flow and of a DNS
+    /// request are one decision - one denied row at once, the second refusal only counted.
+    #[tokio::test]
+    async fn a_refused_flow_and_dns_request_make_one_denied_event() {
+        use crate::connection_events::Kind;
+        let device = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", "some-other-device-key");
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let events = connection_events(dir.path()).await;
+
+        let response = handle_flow_admission_in_slot(
+            &store,
+            &audit_log,
+            &flow_table(),
+            admission_request(
+                "gw-1",
+                &device.signing_key,
+                &device.public_key_hex,
+                "session-nonce-1",
+            ),
+            &mut None,
+            Some(&events),
+        )
+        .await;
+        assert_eq!(response.decision, "refuse");
+        let response = handle_dns_admission_in_slot(
+            &store,
+            &audit_log,
+            dns_admission_request(
+                "gw-1",
+                "app.internal",
+                &device.signing_key,
+                &device.public_key_hex,
+                "session-nonce-1",
+            ),
+            &mut None,
+            Some(&events),
+        )
+        .await;
+        assert_eq!(response.unwrap().decision, "refuse");
+
+        let queued = queued(&events);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].kind, Kind::Denied);
+        assert_eq!(queued[0].device_public_key, device.public_key_hex);
+        assert_eq!(queued[0].reason.as_deref(), Some("not_entitled"));
+        assert_eq!(queued[0].count, Some(1));
+        assert_eq!(queued[0].user_id, None, "a denial never names a user");
+    }
+
+    /// TT-2250 review (spec §B.22 point 3): a lease refusal is a denial too, with its reason.
+    #[tokio::test]
+    async fn a_lease_refusal_makes_a_denied_event() {
+        let device = crypto::generate_keypair();
+        let store = lease_store(std::time::Duration::from_secs(5));
+        apply_snapshot(&store, &device.public_key_hex, true, &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let events = connection_events(dir.path()).await;
+        let request = admission_request(
+            "gw-1",
+            &device.signing_key,
+            &device.public_key_hex,
+            &signed_request(None),
+        );
+
+        let response = handle_flow_admission_in_slot(
+            &store,
+            &audit_log,
+            &flow_table(),
+            request,
+            &mut None,
+            Some(&events),
+        )
+        .await;
+
+        assert_eq!(response.decision, "refuse");
+        let queued = queued(&events);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].reason.as_deref(),
+            Some(crate::live_sessions::REASON_NO_TOKEN)
+        );
+    }
+
+    /// TT-2250 review (spec §B.22 point 3): a refusal for the signature makes no denied event - the
+    /// key is unproven.
+    #[tokio::test]
+    async fn a_signature_refusal_makes_no_denied_event() {
+        let device = crypto::generate_keypair();
+        let impostor = crypto::generate_keypair();
+        let store = store_with_entitled_device("gw-1", "u-1", &device.public_key_hex);
+        let dir = tempfile::tempdir().unwrap();
+        let audit_log = AuditLog::new(dir.path().join("audit.log"));
+        let events = connection_events(dir.path()).await;
+        let request = admission_request(
+            "gw-1",
+            &impostor.signing_key,
+            &device.public_key_hex,
+            "session-nonce-1",
+        );
+
+        let response = handle_flow_admission_in_slot(
+            &store,
+            &audit_log,
+            &flow_table(),
+            request,
+            &mut None,
+            Some(&events),
+        )
+        .await;
+
+        assert_eq!(response.reason.as_deref(), Some("invalid_signature"));
+        assert!(queued(&events).is_empty());
     }
 }

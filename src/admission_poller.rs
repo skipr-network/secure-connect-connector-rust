@@ -533,6 +533,7 @@ async fn handle_admission(
         &state.flow_table,
         request,
         &mut slot,
+        state.connection_events.as_deref(),
     )
     .await;
 
@@ -617,9 +618,14 @@ async fn handle_dns(
     };
     let correlation_id = request.correlation_id.clone();
     // TT-3770: no decision yet - post nothing, so the node answers SERVFAIL on its own timeout.
-    let Some(response): Option<DnsAdmissionResponse> =
-        handle_dns_admission_in_slot(&state.policy_store, &state.audit_log, request, &mut slot)
-            .await
+    let Some(response): Option<DnsAdmissionResponse> = handle_dns_admission_in_slot(
+        &state.policy_store,
+        &state.audit_log,
+        request,
+        &mut slot,
+        state.connection_events.as_deref(),
+    )
+    .await
     else {
         return;
     };
@@ -706,6 +712,7 @@ mod tests {
                 audit_log: Arc::new(AuditLog::new(dir.path().join("audit.log"))),
                 flow_table: Arc::new(Mutex::new(FlowTable::new())),
                 recovered_packet_tx: tx,
+                connection_events: None,
             },
             rx,
         )
@@ -1335,6 +1342,7 @@ mod tests {
                 node_list: vec![],
                 zero_trust_enabled: None,
                 live_sessions: None,
+                connection_event_results: None,
             })
             .unwrap();
         let signature = crate::crypto::sign_to_base64(&device.signing_key, b"session-nonce-1");
